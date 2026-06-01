@@ -1,291 +1,792 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import dataclasses
 import json
-import math
-import os
 import random
 import shutil
-import statistics
 import time
 import zipfile
 from pathlib import Path
+from typing import Iterable, Iterator
 
-EN_DIRS = [
-    "docs", "images", "build", "cache", "config", "source", "assets", "logs",
-    "release", "debug", "reports", "temp", "scripts", "vendor", "public",
+
+ASCII_WORDS = [
+    "src",
+    "build",
+    "bin",
+    "obj",
+    "out",
+    "dist",
+    "docs",
+    "doc",
+    "test",
+    "tests",
+    "tmp",
+    "temp",
+    "cache",
+    "logs",
+    "log",
+    "config",
+    "configs",
+    "settings",
+    "scripts",
+    "script",
+    "tools",
+    "vendor",
+    "thirdparty",
+    "patch",
+    "bugfix",
+    "release",
+    "debug",
+    "backup",
+    "archive",
+    "draft",
+    "notes",
+    "asset",
+    "assets",
+    "pkg",
+    "packages",
+    "module",
+    "modules",
+    "service",
+    "client",
+    "server",
+    "worker",
+    "api",
+    "core",
+    "common",
+    "shared",
+    "public",
+    "private",
+    "internal",
+    "feature",
+    "hotfix",
+    "legacy",
+    "report",
+    "data",
+    "dataset",
+    "sample",
+    "demo",
+    "workspace",
+    "project",
+    "repo",
+    "branch",
+    "commit",
+    "merge",
+    "review",
+    "prototype",
+    "experiment",
+    "benchmark",
+    "profile",
+    "trace",
+    "dump",
+    "snapshot",
+    "index",
+    "manifest",
+    "schema",
+    "migration",
+    "fixture",
+    "mock",
+    "stub",
+    "driver",
+    "firmware",
+    "device",
+    "board",
+    "sensor",
+    "gateway",
+    "cloud",
+    "docker",
+    "k8s",
+    "deploy",
+    "pipeline",
+    "ci",
+    "coverage",
+    "artifact",
+    "export",
+    "import",
+    "sync",
+    "queue",
+    "job",
+    "task",
+    "event",
+    "metrics",
+    "audit",
+    "billing",
+    "invoice",
+    "meeting",
+    "todo",
+    "readme",
+    "manual",
+    "design",
+    "spec",
+    "plan",
+    "ops",
 ]
-ZH_DIRS = [
-    "文档", "图片", "配置", "缓存", "源码", "资源", "日志", "发布",
-    "调试", "报表", "脚本", "下载", "上传", "归档", "测试",
+
+ASCII_EXTS = [
+    ".txt",
+    ".log",
+    ".json",
+    ".ini",
+    ".cfg",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".md",
+    ".csv",
+    ".py",
+    ".cs",
+    ".cpp",
+    ".h",
+    ".sql",
+    ".bat",
+    ".ps1",
+    ".ts",
+    ".js",
+    ".sh",
+    ".java",
+    ".go",
+    ".rs",
+    ".kt",
+    ".swift",
+    ".lua",
+    ".rb",
+    ".php",
+    ".toml",
+    ".lock",
+    ".env",
+    ".conf",
+    ".properties",
+    ".proto",
+    ".graphql",
+    ".html",
+    ".css",
+    ".scss",
+    ".less",
+    ".map",
+    ".dmp",
+    ".trace",
+    ".dump",
+    ".bak",
 ]
-EN_STEMS = [
-    "report", "summary", "sample", "record", "entry", "image", "build", "asset",
-    "index", "detail", "config", "output", "result", "trace", "module",
+
+CN_WORDS = [
+    "源码",
+    "构建",
+    "输出",
+    "文档",
+    "测试",
+    "临时",
+    "缓存",
+    "日志",
+    "配置",
+    "脚本",
+    "工具",
+    "依赖",
+    "补丁",
+    "修复",
+    "发布",
+    "调试",
+    "备份",
+    "归档",
+    "草稿",
+    "笔记",
+    "资源",
+    "资产",
+    "包",
+    "模块",
+    "服务",
+    "客户端",
+    "服务端",
+    "任务",
+    "接口",
+    "核心",
+    "公共",
+    "共享",
+    "内部",
+    "特性",
+    "热修复",
+    "历史",
+    "报告",
+    "数据",
+    "样本",
+    "示例",
+    "工作区",
+    "项目",
+    "仓库",
+    "分支",
+    "提交",
+    "合并",
+    "评审",
+    "原型",
+    "实验",
+    "基准",
+    "性能",
+    "追踪",
+    "转储",
+    "快照",
+    "索引",
+    "清单",
+    "结构",
+    "迁移",
+    "夹具",
+    "模拟",
+    "桩件",
+    "驱动",
+    "固件",
+    "设备",
+    "板卡",
+    "传感器",
+    "网关",
+    "云端",
+    "容器",
+    "集群",
+    "部署",
+    "流水线",
+    "集成",
+    "覆盖率",
+    "制品",
+    "导出",
+    "导入",
+    "同步",
+    "队列",
+    "作业",
+    "事件",
+    "指标",
+    "审计",
+    "账单",
+    "会议",
+    "待办",
+    "说明",
+    "手册",
+    "设计",
+    "规格",
+    "计划",
+    "运维",
+    "客户",
+    "资源历史",
+    "现场",
+    "验收",
+    "排查",
+    "诊断",
+    "监控",
 ]
-ZH_STEMS = [
-    "说明", "记录", "样本", "条目", "截图", "索引", "配置", "输出",
-    "结果", "细节", "模块", "归档", "清单", "资源", "测试",
+
+# Chinese base names still use ASCII-only suffixes to match normal Windows file associations.
+CN_EXTS = [
+    ".txt",
+    ".log",
+    ".json",
+    ".ini",
+    ".cfg",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".md",
+    ".csv",
+    ".py",
+    ".cs",
+    ".cpp",
+    ".h",
+    ".sql",
+    ".bat",
+    ".ps1",
+    ".ts",
+    ".js",
+    ".sh",
+    ".conf",
+    ".properties",
+    ".toml",
+    ".proto",
+    ".bak",
+    ".dump",
 ]
-TEXT_EXTS = ["txt", "md", "json", "csv", "log", "xml", "ini"]
-BIN_EXTS = ["bin", "dat", "cache", "blob", "pak"]
-TEXT_WORDS = [
-    "alpha", "delta", "index", "sample", "archive", "entry", "random",
-    "payload", "trace", "module", "render", "window", "token", "metric",
-]
-ZH_WORDS = ["测试", "数据", "中文", "样本", "条目", "目录", "结果", "内容", "压缩", "归档"]
+
+RESERVED_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+INVALID_CHARS = '<>:"/\\|?*'
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate EveryZip zip test dataset.")
-    parser.add_argument("--output-root", required=True, help="Output directory, for example G:\\EveryZipTestData")
-    parser.add_argument("--zip-count", type=int, required=True, help="Number of zip files to create")
-    parser.add_argument("--entry-count", type=int, required=True, help="Total entries across all zip files")
-    parser.add_argument("--seed", type=int, default=20260531, help="Random seed")
-    parser.add_argument("--batch-size", type=int, default=250, help="Subdirectory fanout per batch")
-    parser.add_argument("--sample-ratio-zh", type=float, default=0.30, help="Approximate Chinese name ratio")
-    parser.add_argument("--min-text", type=int, default=6, help="Minimum text payload bytes")
-    parser.add_argument("--max-text", type=int, default=28, help="Maximum text payload bytes")
-    parser.add_argument("--min-bin", type=int, default=10, help="Minimum binary payload bytes")
-    parser.add_argument("--max-bin", type=int, default=28, help="Maximum binary payload bytes")
-    parser.add_argument("--binary-ratio", type=float, default=0.05, help="Approximate binary payload ratio")
-    parser.add_argument("--progress-every", type=int, default=500, help="Print progress every N zip files")
-    parser.add_argument("--report-json", default="", help="Optional JSON report output path")
-    parser.add_argument("--clean", action="store_true", help="Delete output directory before generation")
-    parser.add_argument("--verify-only", action="store_true", help="Only verify an existing dataset")
-    parser.add_argument("--compact-names", action="store_true", help="Use short names to reduce ZIP metadata overhead")
-    return parser.parse_args()
+@dataclasses.dataclass(slots=True)
+class Config:
+    output_root: Path
+    zip_count: int
+    entry_count: int
+    chinese_ratio: float
+    zip_chinese_ratio: float
+    compression: str
+    compresslevel: int
+    max_total_bytes: int
+    seed: int
+    clean: bool
+    dry_run: bool
+    verify_only: bool
+    report_json: Path | None
+    progress_every: int
+    zip_name_max_len: int
+    file_name_max_len: int
+    content_min_bytes: int
+    content_max_bytes: int
+    jobs: int
 
 
-def allocate_entries(zip_count: int, total_entries: int, rng: random.Random) -> list[int]:
-    base = total_entries // zip_count
-    counts: list[int] = []
-    for _ in range(zip_count):
-        delta = rng.randint(-28, 28)
-        counts.append(max(1, base + delta))
-    current = sum(counts)
-    diff = total_entries - current
-    index = 0
-    step = 1 if diff > 0 else -1
-    while diff != 0:
-        slot = index % zip_count
-        next_value = counts[slot] + step
-        if next_value >= 1:
-            counts[slot] = next_value
-            diff -= step
-        index += 1
-    return counts
+@dataclasses.dataclass(frozen=True, slots=True)
+class WriteTask:
+    output_root: Path
+    zip_index: int
+    zip_count: int
+    entry_start: int
+    entry_count: int
+    seed: int
+    chinese_ratio: float
+    zip_chinese_ratio: float
+    zip_name_max_len: int
+    file_name_max_len: int
+    content_min_bytes: int
+    content_max_bytes: int
+    compression: str
+    compresslevel: int
 
 
-def choose_name(rng: random.Random, zh_ratio: float, kind: str) -> tuple[str, bool]:
-    use_zh = rng.random() < zh_ratio
-    if kind == "dir":
-        pool = ZH_DIRS if use_zh else EN_DIRS
-    else:
-        pool = ZH_STEMS if use_zh else EN_STEMS
-    return rng.choice(pool), use_zh
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(
+        description="Generate EveryZip test zip archives with realistic programmer-style names."
+    )
+    parser.add_argument("--output-root", type=Path, default=Path(r"E:\EveryZipTestData"))
+    parser.add_argument("--zip-count", type=int, default=10_000)
+    parser.add_argument("--entry-count", type=int, default=5_300_000)
+    parser.add_argument("--chinese-ratio", type=float, default=0.30)
+    parser.add_argument("--zip-chinese-ratio", type=float, default=0.30)
+    parser.add_argument("--compression", choices=("deflate", "store"), default="deflate")
+    parser.add_argument("--compresslevel", type=int, default=6)
+    parser.add_argument("--max-total-bytes", type=int, default=4 * 1024 * 1024 * 1024)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--report-json", type=Path)
+    parser.add_argument("--progress-every", type=int, default=1000)
+    parser.add_argument("--zip-name-max-len", type=int, default=48)
+    parser.add_argument("--file-name-max-len", type=int, default=64)
+    parser.add_argument("--content-min-bytes", type=int, default=48)
+    parser.add_argument("--content-max-bytes", type=int, default=160)
+    parser.add_argument("--jobs", type=int, default=1, help="Parallel zip writers. Use 4 or 8 for faster generation.")
+    ns = parser.parse_args()
+
+    if ns.zip_count <= 0:
+        raise SystemExit("--zip-count must be positive")
+    if ns.entry_count <= 0:
+        raise SystemExit("--entry-count must be positive")
+    if not (0.0 <= ns.chinese_ratio <= 1.0):
+        raise SystemExit("--chinese-ratio must be between 0 and 1")
+    if not (0.0 <= ns.zip_chinese_ratio <= 1.0):
+        raise SystemExit("--zip-chinese-ratio must be between 0 and 1")
+    if ns.max_total_bytes <= 0:
+        raise SystemExit("--max-total-bytes must be positive")
+    if ns.compresslevel < 0 or ns.compresslevel > 9:
+        raise SystemExit("--compresslevel must be between 0 and 9")
+    if ns.content_min_bytes <= 0 or ns.content_max_bytes < ns.content_min_bytes:
+        raise SystemExit("--content-min-bytes and --content-max-bytes are invalid")
+    if ns.progress_every <= 0:
+        raise SystemExit("--progress-every must be positive")
+    if ns.jobs <= 0:
+        raise SystemExit("--jobs must be positive")
+
+    return Config(
+        output_root=ns.output_root,
+        zip_count=ns.zip_count,
+        entry_count=ns.entry_count,
+        chinese_ratio=ns.chinese_ratio,
+        zip_chinese_ratio=ns.zip_chinese_ratio,
+        compression=ns.compression,
+        compresslevel=ns.compresslevel,
+        max_total_bytes=ns.max_total_bytes,
+        seed=ns.seed,
+        clean=ns.clean,
+        dry_run=ns.dry_run,
+        verify_only=ns.verify_only,
+        report_json=ns.report_json,
+        progress_every=ns.progress_every,
+        zip_name_max_len=ns.zip_name_max_len,
+        file_name_max_len=ns.file_name_max_len,
+        content_min_bytes=ns.content_min_bytes,
+        content_max_bytes=ns.content_max_bytes,
+        jobs=ns.jobs,
+    )
 
 
-def build_entry_path(rng: random.Random, zh_ratio: float, index: int, compact: bool) -> tuple[str, int, int]:
-    if compact:
-        return build_compact_entry_path(rng, zh_ratio, index)
+def clamp_name(text: str, max_len: int) -> str:
+    cleaned = "".join(ch for ch in text if ch not in INVALID_CHARS)
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        cleaned = "file"
+    if cleaned.lower() in RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" ._")
+    if not cleaned:
+        cleaned = "file"
+    return cleaned
 
-    depth = rng.randint(1, 3)
+
+def build_dir_parts(rng: random.Random, chinese: bool, min_parts: int = 1, max_parts: int = 3) -> list[str]:
+    pool = CN_WORDS if chinese else ASCII_WORDS
+    count = rng.randint(min_parts, max_parts)
     parts: list[str] = []
-    zh_hits = 0
-    total_parts = 0
-    for _ in range(depth):
-        name, is_zh = choose_name(rng, zh_ratio, "dir")
-        parts.append(f"{name}_{rng.randint(0, 9999):04d}")
-        zh_hits += 1 if is_zh else 0
-        total_parts += 1
-    stem, is_zh = choose_name(rng, zh_ratio, "file")
-    zh_hits += 1 if is_zh else 0
-    total_parts += 1
-    ext = rng.choice(TEXT_EXTS) if rng.random() < 0.78 else rng.choice(BIN_EXTS)
-    filename = f"{stem}_{index:07d}_{rng.randint(0, 999999):06d}.{ext}"
-    parts.append(filename)
-    return "/".join(parts), zh_hits, total_parts
+    for _ in range(count):
+        part = rng.choice(pool)
+        if not chinese:
+            part = clamp_name(part, 24)
+        parts.append(part)
+    return parts
 
 
-def build_compact_entry_path(rng: random.Random, zh_ratio: float, index: int) -> tuple[str, int, int]:
-    dir_is_zh = rng.random() < zh_ratio
-    file_is_zh = rng.random() < zh_ratio
-    dir_prefix = "中" if dir_is_zh else "d"
-    file_prefix = "名" if file_is_zh else "f"
-    ext = rng.choice(TEXT_EXTS if rng.random() < 0.9 else BIN_EXTS[:2])
-    dirname = f"{dir_prefix}{rng.randint(0, 999):03d}"
-    filename = f"{file_prefix}{index:07d}.{ext}"
-    zh_hits = (1 if dir_is_zh else 0) + (1 if file_is_zh else 0)
-    return f"{dirname}/{filename}", zh_hits, 2
+def normalize_ext(ext: str, chinese: bool) -> str:
+    if chinese:
+        return ext if ext.startswith(".") else f".{ext}"
+    if ext and ext[0] == "." and all(ord(ch) < 128 for ch in ext):
+        return ext
+    return ".txt"
 
 
-def make_text_payload(rng: random.Random, min_size: int, max_size: int) -> bytes:
-    target = rng.randint(min_size, max_size)
-    chunks: list[str] = []
-    while len(" ".join(chunks).encode("utf-8")) < target:
-        token = rng.choice(TEXT_WORDS)
-        if rng.random() < 0.18:
-            token += rng.choice(ZH_WORDS)
-        if rng.random() < 0.35:
-            token += str(rng.randint(100, 99999))
-        chunks.append(token)
-    return " ".join(chunks).encode("utf-8")
+def zip_compression_name(compression: str) -> int:
+    if compression == "store":
+        return zipfile.ZIP_STORED
+    return zipfile.ZIP_DEFLATED
 
 
-def make_binary_payload(rng: random.Random, min_size: int, max_size: int) -> bytes:
-    target = rng.randint(min_size, max_size)
-    block_len = rng.randint(8, 24)
-    block = bytearray()
-    while len(block) < block_len:
-        block.extend(rng.randbytes(min(4, block_len - len(block))))
-    repeats = math.ceil(target / len(block))
-    return (bytes(block) * repeats)[:target]
+def zip_compression(config: Config) -> int:
+    return zip_compression_name(config.compression)
 
 
-def ensure_clean_dir(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+def make_rng(seed: int) -> random.Random:
+    return random.Random(seed)
 
 
-def dir_size_bytes(root: Path) -> int:
-    total = 0
-    for base, _, files in os.walk(root):
-        for name in files:
-            total += (Path(base) / name).stat().st_size
+def choose_ratio(rng: random.Random, ratio: float) -> bool:
+    return rng.random() < ratio
+
+
+def build_ascii_zip_name(rng: random.Random, idx: int, max_len: int) -> str:
+    parts = [rng.choice(ASCII_WORDS) for _ in range(rng.randint(2, 4))]
+    parts.append(f"{idx:05d}")
+    ext = rng.choice([".zip", ".ZIP"])
+    name = "_".join(parts) + ext
+    return clamp_name(name, max_len)
+
+
+def build_cn_zip_name(rng: random.Random, idx: int, max_len: int) -> str:
+    parts = [rng.choice(CN_WORDS) for _ in range(rng.randint(2, 4))]
+    parts.append(f"{idx:05d}")
+    ext = rng.choice([".zip", ".ZIP"])
+    name = "".join(parts) + ext
+    return clamp_name(name, max_len)
+
+
+def build_ascii_file_name(rng: random.Random, idx: int, max_len: int) -> str:
+    prefix = rng.choice(ASCII_WORDS)
+    middle = rng.choice(ASCII_WORDS)
+    suffix = rng.choice(ASCII_WORDS)
+    ext = rng.choice(ASCII_EXTS)
+    serial = f"{idx % 100000:05d}"
+    templates = [
+        f"{prefix}_{middle}_{suffix}_{serial}{ext}",
+        f"{prefix}-{middle}-{serial}{ext}",
+        f"{prefix}.{middle}.{suffix}.{serial}{ext}",
+        f"{prefix}_{serial}{ext}",
+        f"{prefix}_{middle}_{serial}{ext}",
+    ]
+    return clamp_name(rng.choice(templates), max_len)
+
+
+def build_cn_file_name(rng: random.Random, idx: int, max_len: int) -> str:
+    prefix = rng.choice(CN_WORDS)
+    middle = rng.choice(CN_WORDS)
+    suffix = rng.choice(CN_WORDS)
+    ext = normalize_ext(rng.choice(CN_EXTS), True)
+    serial = f"{idx % 100000:05d}"
+    templates = [
+        f"{prefix}_{middle}_{suffix}_{serial}{ext}",
+        f"{prefix}-{middle}-{serial}{ext}",
+        f"{prefix}{middle}{suffix}{serial}{ext}",
+        f"{prefix}_{serial}{ext}",
+        f"{prefix}_{middle}_{serial}{ext}",
+    ]
+    return clamp_name(rng.choice(templates), max_len)
+
+
+def build_ascii_file_path(rng: random.Random, idx: int, max_len: int) -> str:
+    dirs = build_dir_parts(rng, chinese=False, min_parts=1, max_parts=3)
+    file_name = build_ascii_file_name(rng, idx, max_len)
+    return "/".join(dirs + [file_name])
+
+
+def build_cn_file_path(rng: random.Random, idx: int, max_len: int) -> str:
+    dirs = build_dir_parts(rng, chinese=True, min_parts=1, max_parts=3)
+    file_name = build_cn_file_name(rng, idx, max_len)
+    return "/".join(dirs + [file_name])
+
+
+def build_ascii_zip_relpath(rng: random.Random, idx: int, max_len: int) -> str:
+    dirs = build_dir_parts(rng, chinese=False, min_parts=1, max_parts=2)
+    zip_name = build_ascii_zip_name(rng, idx, max_len)
+    return "/".join(dirs + [zip_name])
+
+
+def build_cn_zip_relpath(rng: random.Random, idx: int, max_len: int) -> str:
+    dirs = build_dir_parts(rng, chinese=True, min_parts=1, max_parts=2)
+    zip_name = build_cn_zip_name(rng, idx, max_len)
+    return "/".join(dirs + [zip_name])
+
+
+def make_content(rng: random.Random, zip_index: int, entry_index: int, chinese: bool, min_size: int, max_size: int) -> bytes:
+    size = rng.randint(min_size, max_size)
+    if chinese:
+        base = f"测试数据|zip={zip_index}|entry={entry_index}|构建|日志|配置|脚本|".encode("utf-8")
+    else:
+        base = f"test-data|zip={zip_index}|entry={entry_index}|build|log|config|script|".encode("utf-8")
+    if len(base) >= size:
+        return base[:size]
+    filler = (b"0" if not chinese else "零".encode("utf-8"))
+    repeat = (size - len(base) + len(filler) - 1) // len(filler)
+    return (base + filler * repeat)[:size]
+
+
+def iter_write_tasks(config: Config) -> Iterator[WriteTask]:
+    base = config.entry_count // config.zip_count
+    remainder = config.entry_count % config.zip_count
+    entry_start = 0
+    for zip_index in range(config.zip_count):
+        per_zip = base + (1 if zip_index < remainder else 0)
+        yield WriteTask(
+            output_root=config.output_root,
+            zip_index=zip_index,
+            zip_count=config.zip_count,
+            entry_start=entry_start,
+            entry_count=per_zip,
+            seed=config.seed,
+            chinese_ratio=config.chinese_ratio,
+            zip_chinese_ratio=config.zip_chinese_ratio,
+            zip_name_max_len=config.zip_name_max_len,
+            file_name_max_len=config.file_name_max_len,
+            content_min_bytes=config.content_min_bytes,
+            content_max_bytes=config.content_max_bytes,
+            compression=config.compression,
+            compresslevel=config.compresslevel,
+        )
+        entry_start += per_zip
+
+
+def make_task_rng(task: WriteTask) -> random.Random:
+    return make_rng(task.seed + task.zip_index * 1_000_003)
+
+
+def write_one_archive(task: WriteTask) -> tuple[int, int, int, str]:
+    rng = make_task_rng(task)
+    zip_is_cn = choose_ratio(rng, task.zip_chinese_ratio)
+    zip_relpath = (
+        build_cn_zip_relpath(rng, task.zip_index, task.zip_name_max_len)
+        if zip_is_cn
+        else build_ascii_zip_relpath(rng, task.zip_index, task.zip_name_max_len)
+    )
+    zip_path = task.output_root / Path(zip_relpath)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    compression = zip_compression_name(task.compression)
+    with zipfile.ZipFile(
+        zip_path,
+        mode="w",
+        compression=compression,
+        compresslevel=task.compresslevel if compression == zipfile.ZIP_DEFLATED else None,
+        allowZip64=True,
+    ) as zf:
+        for offset in range(task.entry_count):
+            entry_index = task.entry_start + offset
+            is_cn = choose_ratio(rng, task.chinese_ratio)
+            internal_name = (
+                build_cn_file_path(rng, entry_index, task.file_name_max_len)
+                if is_cn
+                else build_ascii_file_path(rng, entry_index, task.file_name_max_len)
+            )
+            zf.writestr(
+                internal_name,
+                make_content(
+                    rng,
+                    zip_index=task.zip_index,
+                    entry_index=entry_index,
+                    chinese=is_cn,
+                    min_size=task.content_min_bytes,
+                    max_size=task.content_max_bytes,
+                ),
+            )
+    return task.zip_index, task.entry_count, zip_path.stat().st_size, str(zip_path)
+
+
+def estimate_archive_bytes(config: Config) -> int:
+    avg_filename_bytes = (
+        max(16, config.file_name_max_len // 2)
+        if config.chinese_ratio < 0.5
+        else max(20, int(config.file_name_max_len * 1.6))
+    )
+    avg_content_bytes = (config.content_min_bytes + config.content_max_bytes) // 2
+    compressed_guess = max(24, avg_content_bytes // 3)
+    per_entry = 120 + avg_filename_bytes + compressed_guess
+    total = config.entry_count * per_entry
+    total += config.zip_count * 128
     return total
 
 
-def generate_dataset(args: argparse.Namespace) -> dict:
-    rng = random.Random(args.seed)
-    output_root = Path(args.output_root)
-    if args.clean:
-        ensure_clean_dir(output_root)
-    else:
-        output_root.mkdir(parents=True, exist_ok=True)
+def ensure_output_root(config: Config) -> None:
+    if config.clean or config.verify_only:
+        return
+    config.output_root.mkdir(parents=True, exist_ok=True)
 
-    counts = allocate_entries(args.zip_count, args.entry_count, rng)
-    start = time.time()
-    total_entries = 0
-    total_name_parts = 0
-    total_zh_parts = 0
-    zip_sizes: list[int] = []
 
-    for zip_index, entry_target in enumerate(counts):
-        batch_dir = output_root / f"batch_{(zip_index // args.batch_size) + 1:04d}"
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = batch_dir / f"archive_{zip_index + 1:05d}.zip"
-        zip_rng = random.Random(args.seed ^ ((zip_index + 1) * 0x9E3779B1))
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-            for entry_offset in range(entry_target):
-                global_index = total_entries + entry_offset
-                entry_name, zh_hits, part_count = build_entry_path(
-                    zip_rng,
-                    args.sample_ratio_zh,
-                    global_index,
-                    args.compact_names,
-                )
-                total_zh_parts += zh_hits
-                total_name_parts += part_count
-                if zip_rng.random() < args.binary_ratio or entry_name.rsplit(".", 1)[-1] in BIN_EXTS:
-                    payload = make_binary_payload(zip_rng, args.min_bin, args.max_bin)
-                else:
-                    payload = make_text_payload(zip_rng, args.min_text, args.max_text)
-                info = zipfile.ZipInfo(entry_name)
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.date_time = (2026, 5, 31, zip_rng.randint(0, 23), zip_rng.randint(0, 59), zip_rng.randint(0, 59))
-                info.flag_bits |= 0x800
-                zf.writestr(info, payload)
-        total_entries += entry_target
-        zip_sizes.append(zip_path.stat().st_size)
-        if (zip_index + 1) % args.progress_every == 0 or (zip_index + 1) == args.zip_count:
-            elapsed = max(time.time() - start, 0.001)
-            written_bytes = sum(zip_sizes)
-            bytes_per_entry = written_bytes / max(total_entries, 1)
-            predicted_total = bytes_per_entry * args.entry_count
-            zh_ratio_now = total_zh_parts / max(total_name_parts, 1)
-            print(
-                f"[progress] zip={zip_index + 1}/{args.zip_count} "
-                f"entries={total_entries}/{args.entry_count} "
-                f"size_mb={written_bytes / (1024 * 1024):.2f} "
-                f"predict_mb={predicted_total / (1024 * 1024):.2f} "
-                f"zh_ratio={zh_ratio_now:.4f} "
-                f"elapsed_s={elapsed:.1f}",
-                flush=True,
+def safe_clean(output_root: Path) -> None:
+    resolved = output_root.resolve()
+    if not resolved.exists():
+        return
+    if len(resolved.parts) < 2:
+        raise SystemExit(f"Refusing to clean unsafe path: {resolved}")
+    shutil.rmtree(resolved)
+
+
+def write_archives(config: Config) -> dict[str, object]:
+    total_written = 0
+    zip_written = 0
+    entry_written = 0
+    started = time.time()
+    next_progress = config.progress_every
+
+    def handle_result(result: tuple[int, int, int, str]) -> None:
+        nonlocal total_written, zip_written, entry_written, next_progress
+        zip_index, entries, archive_bytes, zip_path = result
+        zip_written += 1
+        entry_written += entries
+        total_written += archive_bytes
+        if total_written > config.max_total_bytes:
+            raise SystemExit(
+                f"Exceeded budget after {zip_written} zip files: "
+                f"{total_written} > {config.max_total_bytes}"
             )
+        if entry_written >= next_progress or zip_written == config.zip_count:
+            elapsed = max(time.time() - started, 0.001)
+            print(
+                f"[progress] zips={zip_written}/{config.zip_count} "
+                f"entries={entry_written}/{config.entry_count} "
+                f"bytes={total_written} elapsed={elapsed:.1f}s"
+            )
+            next_progress += config.progress_every
+        if zip_written % max(1, config.progress_every) == 0:
+            print(f"[zip] wrote {zip_written}/{config.zip_count}: {Path(zip_path).name}")
 
-    final_size = dir_size_bytes(output_root)
+    tasks = list(iter_write_tasks(config))
+    if config.jobs == 1:
+        for task in tasks:
+            handle_result(write_one_archive(task))
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=config.jobs) as executor:
+            future_to_zip = {executor.submit(write_one_archive, task): task.zip_index for task in tasks}
+            for future in concurrent.futures.as_completed(future_to_zip):
+                handle_result(future.result())
+
+    elapsed = max(time.time() - started, 0.001)
     return {
-        "output_root": str(output_root),
-        "zip_count": args.zip_count,
+        "zip_count": zip_written,
+        "entry_count": entry_written,
+        "total_bytes": total_written,
+        "elapsed_seconds": elapsed,
+    }
+
+
+def verify_archives(config: Config) -> dict[str, object]:
+    if not config.output_root.exists():
+        raise SystemExit(f"Output root does not exist: {config.output_root}")
+    zip_files = sorted({path.resolve() for path in config.output_root.rglob("*") if path.suffix.lower() == ".zip"})
+    total_entries = 0
+    total_bytes = 0
+    for path in zip_files:
+        total_bytes += path.stat().st_size
+        with zipfile.ZipFile(path, "r") as zf:
+            total_entries += len(zf.infolist())
+            bad = zf.testzip()
+            if bad is not None:
+                raise SystemExit(f"Corrupted entry in {path}: {bad}")
+    return {
+        "zip_count": len(zip_files),
         "entry_count": total_entries,
-        "size_bytes": final_size,
-        "size_mb": final_size / (1024 * 1024),
-        "zh_ratio": total_zh_parts / max(total_name_parts, 1),
-        "elapsed_seconds": time.time() - start,
-        "avg_zip_size_bytes": statistics.mean(zip_sizes) if zip_sizes else 0,
-        "median_zip_size_bytes": statistics.median(zip_sizes) if zip_sizes else 0,
-        "min_zip_size_bytes": min(zip_sizes) if zip_sizes else 0,
-        "max_zip_size_bytes": max(zip_sizes) if zip_sizes else 0,
-        "seed": args.seed,
-        "params": {
-            "sample_ratio_zh": args.sample_ratio_zh,
-            "min_text": args.min_text,
-            "max_text": args.max_text,
-            "min_bin": args.min_bin,
-            "max_bin": args.max_bin,
-            "binary_ratio": args.binary_ratio,
-            "batch_size": args.batch_size,
-            "compact_names": args.compact_names,
-        },
+        "total_bytes": total_bytes,
     }
 
 
-def verify_dataset(output_root: Path, expected_zips: int, expected_entries: int, sample_verify: int = 8) -> dict:
-    zip_paths = sorted(output_root.rglob("*.zip"))
-    actual_entries = 0
-    zh_parts = 0
-    total_parts = 0
-    sample_results = []
-    for i, zip_path in enumerate(zip_paths):
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            names = zf.namelist()
-            actual_entries += len(names)
-            if i < sample_verify:
-                sample_results.append({"zip": str(zip_path), "entries": len(names), "first": names[:3]})
-            for name in names:
-                parts = [p for p in name.split("/") if p]
-                total_parts += len(parts)
-                zh_parts += sum(1 for p in parts if any("\u4e00" <= ch <= "\u9fff" for ch in p))
-    size_bytes = dir_size_bytes(output_root)
-    return {
-        "zip_count": len(zip_paths),
-        "entry_count": actual_entries,
-        "size_bytes": size_bytes,
-        "size_mb": size_bytes / (1024 * 1024),
-        "zh_ratio": zh_parts / max(total_parts, 1),
-        "zip_count_ok": len(zip_paths) == expected_zips,
-        "entry_count_ok": actual_entries == expected_entries,
-        "sample_results": sample_results,
-    }
+def write_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> int:
-    args = parse_args()
-    output_root = Path(args.output_root)
-    if args.verify_only:
-        report = verify_dataset(output_root, args.zip_count, args.entry_count)
-    else:
-        report = generate_dataset(args)
-        report["verify"] = verify_dataset(output_root, args.zip_count, args.entry_count)
+    config = parse_args()
 
-    text = json.dumps(report, ensure_ascii=False, indent=2)
-    print(text)
-    if args.report_json:
-        Path(args.report_json).write_text(text, encoding="utf-8")
+    if config.clean:
+        if config.output_root.exists():
+            safe_clean(config.output_root)
+
+    if config.verify_only:
+        report = verify_archives(config)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if config.report_json:
+            write_report(config.report_json, report)
+        return 0
+
+    ensure_output_root(config)
+
+    estimated = estimate_archive_bytes(config)
+
+    report: dict[str, object] = {
+        "output_root": str(config.output_root),
+        "zip_count": config.zip_count,
+        "entry_count": config.entry_count,
+        "chinese_ratio": config.chinese_ratio,
+        "zip_chinese_ratio": config.zip_chinese_ratio,
+        "compression": config.compression,
+        "compresslevel": config.compresslevel,
+        "max_total_bytes": config.max_total_bytes,
+        "estimated_total_bytes": estimated,
+        "dry_run": config.dry_run,
+        "seed": config.seed,
+        "jobs": config.jobs,
+    }
+
+    if estimated > config.max_total_bytes:
+        report["status"] = "rejected"
+        report["reason"] = "estimated archive size exceeds budget"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if config.report_json:
+            write_report(config.report_json, report)
+        return 2
+
+    if config.dry_run:
+        report["status"] = "dry_run"
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if config.report_json:
+            write_report(config.report_json, report)
+        return 0
+
+    result = write_archives(config)
+    report.update(result)
+    report["status"] = "ok"
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if config.report_json:
+        write_report(config.report_json, report)
     return 0
 
 
