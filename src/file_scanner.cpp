@@ -6,6 +6,48 @@
 
 #include <vector>
 
+#include "logger.h"
+
+static std::wstring Win32ErrorMessage(const wchar_t* prefix, DWORD error) {
+    return std::wstring(prefix) + L" (err=" + std::to_wstring(error) + L")";
+}
+
+static bool QueryUsnJournalWithAutoCreate(HANDLE hVol, USN_JOURNAL_DATA_V0* out, std::wstring* err) {
+    DWORD bytes = 0;
+    if (DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, out, sizeof(*out), &bytes, nullptr)) {
+        return true;
+    }
+
+    const DWORD queryErr = GetLastError();
+    if (queryErr == ERROR_JOURNAL_NOT_ACTIVE) {
+        CREATE_USN_JOURNAL_DATA createData{};
+        createData.MaximumSize = 32ull * 1024ull * 1024ull;
+        createData.AllocationDelta = 4ull * 1024ull * 1024ull;
+        bytes = 0;
+        if (DeviceIoControl(hVol, FSCTL_CREATE_USN_JOURNAL,
+                            &createData, sizeof(createData),
+                            nullptr, 0, &bytes, nullptr)) {
+            bytes = 0;
+            if (DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
+                                out, sizeof(*out), &bytes, nullptr)) {
+                return true;
+            }
+        }
+
+        const DWORD createOrRetryErr = GetLastError();
+        if (err) {
+            *err = Win32ErrorMessage(L"FSCTL_QUERY_USN_JOURNAL failed after create/retry",
+                                     createOrRetryErr);
+        }
+        return false;
+    }
+
+    if (err) {
+        *err = Win32ErrorMessage(L"FSCTL_QUERY_USN_JOURNAL failed", queryErr);
+    }
+    return false;
+}
+
 /**
  * 判断给定盘符根路径是否为 NTFS 文件系统，仅 NTFS 才支持 USN Journal。
  * @param driveRoot 盘符根路径，例如 L"C:\\"。
@@ -150,14 +192,12 @@ static bool ScanDriveByUsn(wchar_t driveLetter, std::vector<ArchiveFile_t>* out,
         nullptr);
 
     if (hVol == INVALID_HANDLE_VALUE) {
-        if (err) *err = L"CreateFileW volume failed";
+        if (err) *err = Win32ErrorMessage(L"CreateFileW volume failed", GetLastError());
         return false;
     }
 
     USN_JOURNAL_DATA_V0 journal = {};
-    DWORD bytes = 0;
-    if (!DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &journal, sizeof(journal), &bytes, nullptr)) {
-        if (err) *err = L"FSCTL_QUERY_USN_JOURNAL failed";
+    if (!QueryUsnJournalWithAutoCreate(hVol, &journal, err)) {
         CloseHandle(hVol);
         return false;
     }
@@ -175,7 +215,7 @@ static bool ScanDriveByUsn(wchar_t driveLetter, std::vector<ArchiveFile_t>* out,
             CloseHandle(hVol);
             return true;
         }
-        bytes = 0;
+        DWORD bytes = 0;
         if (!DeviceIoControl(
                 hVol,
                 FSCTL_ENUM_USN_DATA,
@@ -189,7 +229,7 @@ static bool ScanDriveByUsn(wchar_t driveLetter, std::vector<ArchiveFile_t>* out,
             if (e == ERROR_HANDLE_EOF) {
                 break;
             }
-            if (err) *err = L"FSCTL_ENUM_USN_DATA failed";
+            if (err) *err = Win32ErrorMessage(L"FSCTL_ENUM_USN_DATA failed", e);
             CloseHandle(hVol);
             return false;
         }
@@ -250,15 +290,12 @@ bool FileScanner::QueryJournalInfo(wchar_t driveLetter, JournalInfo* out, std::w
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, 0, nullptr);
     if (hVol == INVALID_HANDLE_VALUE) {
-        if (err) *err = L"CreateFileW volume failed";
+        if (err) *err = Win32ErrorMessage(L"CreateFileW volume failed", GetLastError());
         return false;
     }
 
     USN_JOURNAL_DATA_V0 journal{};
-    DWORD bytes = 0;
-    if (!DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
-                         &journal, sizeof(journal), &bytes, nullptr)) {
-        if (err) *err = L"FSCTL_QUERY_USN_JOURNAL failed";
+    if (!QueryUsnJournalWithAutoCreate(hVol, &journal, err)) {
         CloseHandle(hVol);
         return false;
     }
@@ -287,16 +324,13 @@ bool FileScanner::ScanUsnJournal(wchar_t driveLetter, int64_t journalId, USN sta
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, 0, nullptr);
     if (hVol == INVALID_HANDLE_VALUE) {
-        if (err) *err = L"CreateFileW volume failed";
+        if (err) *err = Win32ErrorMessage(L"CreateFileW volume failed", GetLastError());
         return false;
     }
 
     // 查询当前 Journal 状态获取 NextUsn
     USN_JOURNAL_DATA_V0 journal{};
-    DWORD bytes = 0;
-    if (!DeviceIoControl(hVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
-                         &journal, sizeof(journal), &bytes, nullptr)) {
-        if (err) *err = L"FSCTL_QUERY_USN_JOURNAL failed";
+    if (!QueryUsnJournalWithAutoCreate(hVol, &journal, err)) {
         CloseHandle(hVol);
         return false;
     }
@@ -333,7 +367,7 @@ bool FileScanner::ScanUsnJournal(wchar_t driveLetter, int64_t journalId, USN sta
     for (;;) {
         if (cancel && cancel->load()) break;
 
-        bytes = 0;
+        DWORD bytes = 0;
         BOOL ok = DeviceIoControl(hVol, FSCTL_READ_USN_JOURNAL,
             &readData, sizeof(readData),
             buffer.data(), (DWORD)buffer.size(),
@@ -413,6 +447,9 @@ bool FileScanner::Scan(std::vector<ArchiveFile_t>* out, std::wstring* err, std::
     }
 
     const wchar_t* p = drives.c_str();
+    size_t attemptedDriveCount = 0;
+    size_t scannedDriveCount = 0;
+    std::wstring firstScanErr;
     while (*p) {
         std::wstring root = p;
         p += root.size() + 1;
@@ -435,13 +472,24 @@ bool FileScanner::Scan(std::vector<ArchiveFile_t>* out, std::wstring* err, std::
 
         if (cancel && cancel->load()) return true;
 
+        ++attemptedDriveCount;
         std::wstring scanErr;
         if (!ScanDriveByUsn(driveLetter, out, &scanErr, cancel, archiveExtensions_)) {
-            if (err) {
-                *err = scanErr.empty() ? L"ScanDriveByUsn failed" : scanErr;
+            const std::wstring currentErr = scanErr.empty() ? L"ScanDriveByUsn failed" : scanErr;
+            if (firstScanErr.empty()) {
+                firstScanErr = currentErr;
             }
-            return false;
+            LOG_WARN(L"Skip drive %c during initial scan: %s", driveLetter, currentErr.c_str());
+            continue;
         }
+        ++scannedDriveCount;
+    }
+
+    if (attemptedDriveCount > 0 && scannedDriveCount == 0) {
+        if (err) {
+            *err = firstScanErr.empty() ? L"all eligible drives failed to scan" : firstScanErr;
+        }
+        return false;
     }
 
     return true;
