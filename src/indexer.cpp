@@ -362,16 +362,23 @@ void Indexer::Start(HWND hWnd) {
 
         if (!cancel_.load() && scanOk) {
             stage_.store((int)Stage::SyncingDatabase);
+            const auto syncStart = std::chrono::steady_clock::now();
             auto store = CreateIndexStore();
             if (!store->OpenOrCreate(dbPath_, &err)) {
                 LOG_WARN(L"IndexStore::Open failed: %s", err.c_str());
             } else if (!store->EnsureSchema(&err, true)) {
                 LOG_WARN(L"IndexStore::EnsureSchema failed: %s", err.c_str());
             } else {
+                LOG_INFO(L"SyncDB: OpenOrCreate+EnsureSchema %.3f s",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - syncStart).count());
                 std::vector<ArchiveFile_t> old;
+                const auto queryStart = std::chrono::steady_clock::now();
                 if (!store->QueryArchives(L"", &old, &err)) {
                     LOG_WARN(L"QueryArchives failed: %s", err.c_str());
                 } else {
+                    LOG_INFO(L"SyncDB: QueryArchives(%zu old) %.3f s", old.size(),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - queryStart).count());
+
                     static const char kSevenZipSizePolicyKey[] = "sevenzip_size_policy_version";
                     static const char kSevenZipSizePolicyVersion[] = "2";
                     std::string sevenZipPolicyVersion;
@@ -427,6 +434,10 @@ void Indexer::Start(HWND hWnd) {
                         }
                     }
 
+                    LOG_INFO(L"SyncDB: Diff scanned vs old -> upserts=%zu toParse=%zu %.3f s",
+                        upserts.size(), toParse.size(),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - syncStart).count());
+
                     for (const auto& kv : oldMap) {
                         if (cancel_.load()) break;
                         const auto& prev = kv.second.file;
@@ -443,10 +454,18 @@ void Indexer::Start(HWND hWnd) {
                         }
                     }
 
+                    LOG_INFO(L"SyncDB: Delete gone archives %.3f s",
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - syncStart).count());
+
+                    std::vector<int64_t> archiveIds;
+
                     if (!cancel_.load() && !upserts.empty()) {
-                        if (!store->UpsertArchives(upserts, &err)) {
+                        const auto upsertStart = std::chrono::steady_clock::now();
+                        if (!store->UpsertArchives(upserts, &archiveIds, &err)) {
                             LOG_WARN(L"UpsertArchives failed: %s", err.c_str());
                         }
+                        LOG_INFO(L"SyncDB: UpsertArchives(%zu) %.3f s", upserts.size(),
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - upsertStart).count());
                     }
 
                     const size_t parseTotal = toParse.size();
@@ -458,11 +477,8 @@ void Indexer::Start(HWND hWnd) {
                         PostParseProgress(hWnd, 0, parseTotal);
                     }
                     if (!cancel_.load() && parseTotal > 0) {
-                        std::vector<int64_t> archiveIds;
-                        archiveIds.reserve(parseTotal);
-                        for (const auto& a : toParse) {
-                            archiveIds.push_back(store->GetArchiveIdByPath(a.filePath));
-                        }
+                        // archiveIds already obtained from UpsertArchives
+                        // (upserts.size() == toParse.size(), same elements in same order)
 
                         const uint32_t resolvedParseThreads = ResolveParseThreadCount(parseThreadCount_);
                         const size_t workerCount = std::min<size_t>(parseTotal, resolvedParseThreads);
