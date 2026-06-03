@@ -148,12 +148,22 @@ struct ParsedArchiveResult {
 struct ParsedEntryBatch {
     ArchiveFile_t archive;
     int64_t archiveId = -1;
+    size_t taskIndex = 0;
     bool ok = false;
     bool done = false;
+    size_t archiveEntryCount = 0;
+    double parseElapsedMs = 0.0;
     std::vector<ArchiveEntry_t> entries;
 };
 
+struct InitialParseTask {
+    ArchiveFile_t archive;
+    int64_t archiveId = -1;
+    size_t originalIndex = 0;
+};
+
 static constexpr size_t kParsedEntryBatchSize = 4096;
+static constexpr size_t kInitialParsePerfLogInterval = 250;
 
 static ParsedArchiveResult ParseArchiveEntriesOnly(const ArchiveFile_t& a,
                                                    int64_t archiveId,
@@ -477,8 +487,23 @@ void Indexer::Start(HWND hWnd) {
                         PostParseProgress(hWnd, 0, parseTotal);
                     }
                     if (!cancel_.load() && parseTotal > 0) {
-                        // archiveIds already obtained from UpsertArchives
-                        // (upserts.size() == toParse.size(), same elements in same order)
+                        std::vector<InitialParseTask> parseTasks;
+                        parseTasks.reserve(parseTotal);
+                        for (size_t i = 0; i < parseTotal; ++i) {
+                            parseTasks.push_back(InitialParseTask{ toParse[i], archiveIds[i], i });
+                        }
+                        std::stable_sort(parseTasks.begin(), parseTasks.end(),
+                            [](const InitialParseTask& a, const InitialParseTask& b) {
+                                return a.archive.fileSize > b.archive.fileSize;
+                            });
+
+                        const uint64_t largestSize = parseTasks.empty()
+                            ? 0
+                            : static_cast<uint64_t>(parseTasks.front().archive.fileSize);
+                        LOG_INFO(L"Initial archive parsing schedule: policy=file_size_desc parse_total=%zu largest_file_size=%llu largest_path=%s",
+                                 parseTotal,
+                                 (unsigned long long)largestSize,
+                                 parseTasks.empty() ? L"" : parseTasks.front().archive.filePath.c_str());
 
                         const uint32_t resolvedParseThreads = ResolveParseThreadCount(parseThreadCount_);
                         const size_t workerCount = std::min<size_t>(parseTotal, resolvedParseThreads);
@@ -500,8 +525,26 @@ void Indexer::Start(HWND hWnd) {
                             size_t nextIndex = 0;
                             size_t activeWorkers = 0;
                             std::queue<ParsedEntryBatch> ready;
+                            size_t readyPeak = 0;
+                            size_t pushedBatches = 0;
+                            size_t poppedBatches = 0;
                         } work;
                         work.activeWorkers = workerCount;
+
+                        struct InitialParsePerfStats {
+                            size_t lastLogDone = 0;
+                            size_t lastLogEntries = 0;
+                            double parseMs = 0.0;
+                            double beginWriteMs = 0.0;
+                            double appendWriteMs = 0.0;
+                            double finishWriteMs = 0.0;
+                            double maxAppendBatchMs = 0.0;
+                            size_t maxAppendBatchEntries = 0;
+                            size_t maxQueueDepth = 0;
+                            size_t pushedBatches = 0;
+                            size_t poppedBatches = 0;
+                            std::chrono::steady_clock::time_point lastLogTime = std::chrono::steady_clock::now();
+                        } perf;
 
                         const auto rules = archiveFormatRules_;
                         std::vector<std::thread> workers;
@@ -518,19 +561,25 @@ void Indexer::Start(HWND hWnd) {
                                         taskIndex = work.nextIndex++;
                                     }
 
-                                    const ArchiveFile_t archive = toParse[taskIndex];
-                                    const int64_t archiveId = archiveIds[taskIndex];
+                                    const InitialParseTask task = parseTasks[taskIndex];
+                                    const ArchiveFile_t archive = task.archive;
+                                    const int64_t archiveId = task.archiveId;
                                     const std::wstring parserType = GetParserTypeForPath(archive.filePath, rules);
 
                                     auto pushBatch = [&](ParsedEntryBatch batch) {
                                         std::lock_guard<std::mutex> lock(work.mutex);
                                         work.ready.push(std::move(batch));
+                                        ++work.pushedBatches;
+                                        if (work.ready.size() > work.readyPeak) {
+                                            work.readyPeak = work.ready.size();
+                                        }
                                         work.cv.notify_one();
                                     };
 
                                     ParsedEntryBatch begin;
                                     begin.archive = archive;
                                     begin.archiveId = archiveId;
+                                    begin.taskIndex = task.originalIndex;
                                     begin.ok = archiveId >= 0;
                                     begin.done = false;
                                     if (!begin.ok) {
@@ -548,6 +597,7 @@ void Indexer::Start(HWND hWnd) {
                                         ParsedEntryBatch done;
                                         done.archive = archive;
                                         done.archiveId = archiveId;
+                                        done.taskIndex = task.originalIndex;
                                         done.ok = false;
                                         done.done = true;
                                         pushBatch(std::move(done));
@@ -555,14 +605,18 @@ void Indexer::Start(HWND hWnd) {
                                     }
 
                                     std::string perr;
+                                    const auto archiveParseStart = std::chrono::steady_clock::now();
                                     if (!parserPtr->Open(archive.filePath, &perr)) {
                                         LOG_WARN(L"ArchiveParser::Open failed (%s): %s",
                                                  archive.filePath.c_str(), Utf8ToWString(perr.c_str()).c_str());
                                         ParsedEntryBatch done;
                                         done.archive = archive;
                                         done.archiveId = archiveId;
+                                        done.taskIndex = task.originalIndex;
                                         done.ok = false;
                                         done.done = true;
+                                        done.parseElapsedMs = std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - archiveParseStart).count();
                                         pushBatch(std::move(done));
                                         continue;
                                     }
@@ -570,8 +624,10 @@ void Indexer::Start(HWND hWnd) {
                                     ParsedEntryBatch current;
                                     current.archive = archive;
                                     current.archiveId = archiveId;
+                                    current.taskIndex = task.originalIndex;
                                     current.ok = true;
                                     current.entries.reserve(kParsedEntryBatchSize);
+                                    size_t archiveEntryCount = 0;
                                     auto flushBatch = [&]() -> bool {
                                         if (current.entries.empty()) return true;
                                         ParsedEntryBatch out = std::move(current);
@@ -579,6 +635,7 @@ void Indexer::Start(HWND hWnd) {
                                         current = ParsedEntryBatch{};
                                         current.archive = archive;
                                         current.archiveId = archiveId;
+                                        current.taskIndex = task.originalIndex;
                                         current.ok = true;
                                         current.entries.reserve(kParsedEntryBatchSize);
                                         return true;
@@ -599,6 +656,7 @@ void Indexer::Start(HWND hWnd) {
                                         out.originalSize = e.originalSize;
                                         out.modifiedTime = e.modifiedTime;
                                         current.entries.push_back(std::move(out));
+                                        ++archiveEntryCount;
                                         return current.entries.size() < kParsedEntryBatchSize || flushBatch();
                                     }, &perr);
                                     parserPtr->Close();
@@ -612,8 +670,12 @@ void Indexer::Start(HWND hWnd) {
                                     ParsedEntryBatch done;
                                     done.archive = archive;
                                     done.archiveId = archiveId;
+                                    done.taskIndex = task.originalIndex;
                                     done.ok = parseOk;
                                     done.done = true;
+                                    done.archiveEntryCount = archiveEntryCount;
+                                    done.parseElapsedMs = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - archiveParseStart).count();
                                     pushBatch(std::move(done));
                                 }
 
@@ -638,6 +700,12 @@ void Indexer::Start(HWND hWnd) {
                                 if (!work.ready.empty()) {
                                     result = std::move(work.ready.front());
                                     work.ready.pop();
+                                    ++work.poppedBatches;
+                                    if (work.readyPeak > perf.maxQueueDepth) {
+                                        perf.maxQueueDepth = work.readyPeak;
+                                    }
+                                    perf.pushedBatches = work.pushedBatches;
+                                    perf.poppedBatches = work.poppedBatches;
                                     hasResult = true;
                                 } else if (work.activeWorkers == 0) {
                                     break;
@@ -648,15 +716,35 @@ void Indexer::Start(HWND hWnd) {
                             if (!cancel_.load() && result.archiveId >= 0) {
                                 std::wstring entryErr;
                                 if (!result.done && result.entries.empty()) {
+                                    const auto writeStart = std::chrono::steady_clock::now();
                                     if (!store->BeginReplaceArchiveEntriesByArchiveId(result.archiveId, &entryErr)) {
                                         LOG_WARN(L"BeginReplaceArchiveEntriesByArchiveId failed: %s", entryErr.c_str());
                                     }
+                                    perf.beginWriteMs += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - writeStart).count();
                                 } else if (!result.entries.empty()) {
                                     parsedEntryCount += result.entries.size();
+                                    const auto writeStart = std::chrono::steady_clock::now();
                                     if (!store->AppendArchiveEntriesByArchiveId(result.archiveId, result.entries, &entryErr)) {
                                         LOG_WARN(L"AppendArchiveEntriesByArchiveId failed: %s", entryErr.c_str());
                                     }
+                                    const double appendMs = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - writeStart).count();
+                                    perf.appendWriteMs += appendMs;
+                                    if (appendMs > perf.maxAppendBatchMs) {
+                                        perf.maxAppendBatchMs = appendMs;
+                                        perf.maxAppendBatchEntries = result.entries.size();
+                                    }
+                                    if (appendMs >= 250.0) {
+                                        LOG_INFO(L"Initial archive parsing slow append batch: task=%zu archive_id=%lld entries=%zu elapsed_ms=%.3f path=%s",
+                                                 result.taskIndex,
+                                                 (long long)result.archiveId,
+                                                 result.entries.size(),
+                                                 appendMs,
+                                                 result.archive.filePath.c_str());
+                                    }
                                 } else if (result.done) {
+                                    const auto writeStart = std::chrono::steady_clock::now();
                                     if (result.ok) {
                                         if (!store->FinishReplaceArchiveEntriesByArchiveId(result.archiveId, &entryErr)) {
                                             LOG_WARN(L"FinishReplaceArchiveEntriesByArchiveId failed: %s", entryErr.c_str());
@@ -664,10 +752,57 @@ void Indexer::Start(HWND hWnd) {
                                     } else if (!store->AbortReplaceArchiveEntriesByArchiveId(result.archiveId, &entryErr)) {
                                         LOG_WARN(L"AbortReplaceArchiveEntriesByArchiveId failed: %s", entryErr.c_str());
                                     }
+                                    perf.finishWriteMs += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - writeStart).count();
                                 }
                             }
                             if (result.done) {
                                 ++parseDone;
+                                perf.parseMs += result.parseElapsedMs;
+                                if (result.parseElapsedMs >= 1000.0 || result.archiveEntryCount >= 10000) {
+                                    LOG_INFO(L"Initial archive parsing slow archive: task=%zu archive_id=%lld ok=%d entries=%zu parse_ms=%.3f file_size=%llu path=%s",
+                                             result.taskIndex,
+                                             (long long)result.archiveId,
+                                             result.ok ? 1 : 0,
+                                             result.archiveEntryCount,
+                                             result.parseElapsedMs,
+                                             (unsigned long long)result.archive.fileSize,
+                                             result.archive.filePath.c_str());
+                                }
+                                if (parseDone == parseTotal ||
+                                    parseDone - perf.lastLogDone >= kInitialParsePerfLogInterval) {
+                                    const auto now = std::chrono::steady_clock::now();
+                                    const double intervalSec = std::chrono::duration<double>(now - perf.lastLogTime).count();
+                                    const size_t intervalDone = parseDone - perf.lastLogDone;
+                                    const size_t intervalEntries = parsedEntryCount - perf.lastLogEntries;
+                                    const double intervalArchivesPerSec = intervalSec > 0.0
+                                        ? static_cast<double>(intervalDone) / intervalSec
+                                        : 0.0;
+                                    const double intervalEntriesPerSec = intervalSec > 0.0
+                                        ? static_cast<double>(intervalEntries) / intervalSec
+                                        : 0.0;
+                                    LOG_INFO(L"Initial archive parsing perf: done=%zu/%zu interval_archives=%zu interval_entries=%zu interval_sec=%.3f interval_archives_per_sec=%.2f interval_entries_per_sec=%.2f cumulative_entries=%zu parse_worker_ms=%.3f write_begin_ms=%.3f write_append_ms=%.3f write_finish_ms=%.3f queue_peak=%zu batches_pushed=%zu batches_popped=%zu max_append_batch_ms=%.3f max_append_batch_entries=%zu",
+                                             parseDone,
+                                             parseTotal,
+                                             intervalDone,
+                                             intervalEntries,
+                                             intervalSec,
+                                             intervalArchivesPerSec,
+                                             intervalEntriesPerSec,
+                                             parsedEntryCount,
+                                             perf.parseMs,
+                                             perf.beginWriteMs,
+                                             perf.appendWriteMs,
+                                             perf.finishWriteMs,
+                                             perf.maxQueueDepth,
+                                             perf.pushedBatches,
+                                             perf.poppedBatches,
+                                             perf.maxAppendBatchMs,
+                                             perf.maxAppendBatchEntries);
+                                    perf.lastLogDone = parseDone;
+                                    perf.lastLogEntries = parsedEntryCount;
+                                    perf.lastLogTime = now;
+                                }
                                 PostParseProgress(hWnd, parseDone, parseTotal);
                             }
                         }
