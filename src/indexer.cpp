@@ -7,6 +7,7 @@
 #include "parser/zip_archive_parser.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cwctype>
@@ -497,8 +498,11 @@ void Indexer::Start(HWND hWnd) {
                     }
                     if (!cancel_.load() && parseTotal > 0) {
                         const auto rules = archiveFormatRules_;
+                        const uint32_t resolvedParseThreads = ResolveParseThreadCount(parseThreadCount_);
                         std::vector<InitialParseTask> parseTasks;
                         parseTasks.reserve(parseTotal);
+                        std::vector<size_t> zipTaskIndexes;
+                        zipTaskIndexes.reserve(parseTotal);
                         size_t zipEstimateOk = 0;
                         size_t zipEstimateFailed = 0;
                         uint64_t maxEstimatedEntries = 0;
@@ -509,44 +513,74 @@ void Indexer::Start(HWND hWnd) {
                             const std::wstring parserType = GetParserTypeForPath(task.archive.filePath, rules);
                             task.estimatedCost = static_cast<uint64_t>(task.archive.fileSize);
                             if (parserType == L"zip") {
-                                uint64_t estimatedEntries = 0;
-                                std::string estimateErr;
-                                if (EveryZip::ZipArchiveParser::EstimateEntryCount(task.archive.filePath,
-                                                                                   &estimatedEntries,
-                                                                                   &estimateErr)) {
-                                    task.estimatedEntryCount = estimatedEntries;
-                                    task.hasEntryCountEstimate = true;
-                                    ++zipEstimateOk;
-                                    if (estimatedEntries > maxEstimatedEntries) {
-                                        maxEstimatedEntries = estimatedEntries;
-                                        maxEstimatedEntriesPath = task.archive.filePath;
-                                    }
-                                    const uint64_t entryCost = estimatedEntries > UINT64_MAX / kInitialParseEntryCostBytes
-                                        ? UINT64_MAX
-                                        : estimatedEntries * kInitialParseEntryCostBytes;
-                                    task.estimatedCost = entryCost > UINT64_MAX - static_cast<uint64_t>(task.archive.fileSize)
-                                        ? UINT64_MAX
-                                        : entryCost + static_cast<uint64_t>(task.archive.fileSize);
-                                } else {
-                                    ++zipEstimateFailed;
-                                }
+                                zipTaskIndexes.push_back(i);
                             }
                             parseTasks.push_back(std::move(task));
                         }
+
+                        const size_t estimateThreadCount = zipTaskIndexes.empty()
+                            ? 0
+                            : std::min<size_t>(zipTaskIndexes.size(),
+                                std::min<size_t>(12, std::max<size_t>(2, (size_t)resolvedParseThreads * 2u)));
+                        if (estimateThreadCount > 0) {
+                            std::atomic<size_t> nextZipTask{ 0 };
+                            std::vector<std::thread> estimateWorkers;
+                            estimateWorkers.reserve(estimateThreadCount);
+                            for (size_t workerIndex = 0; workerIndex < estimateThreadCount; ++workerIndex) {
+                                estimateWorkers.emplace_back([&]() {
+                                    for (;;) {
+                                        if (cancel_.load()) break;
+                                        const size_t zipIndex = nextZipTask.fetch_add(1, std::memory_order_relaxed);
+                                        if (zipIndex >= zipTaskIndexes.size()) break;
+                                        InitialParseTask& task = parseTasks[zipTaskIndexes[zipIndex]];
+                                        uint64_t estimatedEntries = 0;
+                                        std::string estimateErr;
+                                        if (EveryZip::ZipArchiveParser::EstimateEntryCount(task.archive.filePath,
+                                                                                           &estimatedEntries,
+                                                                                           &estimateErr)) {
+                                            task.estimatedEntryCount = estimatedEntries;
+                                            task.hasEntryCountEstimate = true;
+                                            const uint64_t entryCost = estimatedEntries > UINT64_MAX / kInitialParseEntryCostBytes
+                                                ? UINT64_MAX
+                                                : estimatedEntries * kInitialParseEntryCostBytes;
+                                            task.estimatedCost = entryCost > UINT64_MAX - static_cast<uint64_t>(task.archive.fileSize)
+                                                ? UINT64_MAX
+                                                : entryCost + static_cast<uint64_t>(task.archive.fileSize);
+                                        }
+                                    }
+                                });
+                            }
+                            for (auto& worker : estimateWorkers) {
+                                if (worker.joinable()) {
+                                    worker.join();
+                                }
+                            }
+                        }
+
+                        for (const auto& task : parseTasks) {
+                            if (task.hasEntryCountEstimate) {
+                                ++zipEstimateOk;
+                                if (task.estimatedEntryCount > maxEstimatedEntries) {
+                                    maxEstimatedEntries = task.estimatedEntryCount;
+                                    maxEstimatedEntriesPath = task.archive.filePath;
+                                }
+                            }
+                        }
+                        zipEstimateFailed = zipTaskIndexes.size() - zipEstimateOk;
                         std::stable_sort(parseTasks.begin(), parseTasks.end(),
                             [](const InitialParseTask& a, const InitialParseTask& b) {
                                 return a.estimatedCost > b.estimatedCost;
                             });
 
-                        const uint32_t resolvedParseThreads = ResolveParseThreadCount(parseThreadCount_);
                         const size_t workerCount = std::min<size_t>(parseTotal, resolvedParseThreads);
                         const uint64_t largestSize = parseTasks.empty()
                             ? 0
                             : static_cast<uint64_t>(parseTasks.front().archive.fileSize);
                         const double estimateElapsed = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - estimateStart).count();
-                        LOG_INFO(L"Initial archive parsing schedule: policy=zip_entry_count_then_file_size parse_total=%zu zip_estimate_ok=%zu zip_estimate_failed=%zu estimate_elapsed_sec=%.3f top_estimated_cost=%llu top_estimated_entries=%llu top_file_size=%llu top_path=%s max_estimated_entries=%llu max_estimated_entries_path=%s",
+                        LOG_INFO(L"Initial archive parsing schedule: policy=zip_entry_count_then_file_size parse_total=%zu zip_estimate_threads=%zu zip_estimate_ok=%zu zip_estimate_failed=%zu estimate_elapsed_sec=%.3f top_estimated_cost=%llu top_estimated_entries=%llu top_file_size=%llu top_path=%s max_estimated_entries=%llu max_estimated_entries_path=%s",
                                  parseTotal,
+                                 estimateThreadCount,
                                  zipEstimateOk,
                                  zipEstimateFailed,
                                  estimateElapsed,
