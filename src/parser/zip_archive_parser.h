@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "archive_parser.h"
@@ -56,6 +57,10 @@ public:
     bool ExtractEntry(const std::string& entry_path,
                       const std::wstring& dest_dir,
                       std::string* error) override;
+
+    static bool EstimateEntryCount(const std::wstring& archive_path,
+                                   std::uint64_t* out_entry_count,
+                                   std::string* error);
 
 private:
     void* handle_ = nullptr; // unzFile

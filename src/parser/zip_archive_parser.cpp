@@ -131,6 +131,40 @@ std::wstring ZipArchiveParser::ArchivePath() const {
     return archive_path_;
 }
 
+bool ZipArchiveParser::EstimateEntryCount(const std::wstring& archive_path,
+                                          std::uint64_t* out_entry_count,
+                                          std::string* error) {
+    if (!out_entry_count) {
+        if (error) *error = "out_entry_count is null";
+        return false;
+    }
+    *out_entry_count = 0;
+    if (archive_path.empty()) {
+        if (error) *error = "archive path is empty";
+        return false;
+    }
+
+    zlib_filefunc64_def filefunc{};
+    fill_win32_filefunc64W(&filefunc);
+
+    unzFile uf = unzOpen2_64(archive_path.c_str(), &filefunc);
+    if (!uf) {
+        if (error) *error = "unzOpen2_64 failed";
+        return false;
+    }
+
+    unz_global_info64 info{};
+    const int rc = unzGetGlobalInfo64(uf, &info);
+    unzClose(uf);
+    if (rc != UNZ_OK) {
+        if (error) *error = "unzGetGlobalInfo64 failed";
+        return false;
+    }
+
+    *out_entry_count = static_cast<std::uint64_t>(info.number_entry);
+    return true;
+}
+
 bool ZipArchiveParser::ListEntries(std::vector<ArchiveEntry_t>* out_entries, std::string* error) {
     if (!out_entries) {
         if (error) *error = "out_entries is null";

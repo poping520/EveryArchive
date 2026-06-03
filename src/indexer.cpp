@@ -4,6 +4,7 @@
 #include "resource.h"
 #include "string_utils.h"
 #include "parser/archive_parser_factory.h"
+#include "parser/zip_archive_parser.h"
 
 #include <algorithm>
 #include <chrono>
@@ -67,6 +68,10 @@ void Indexer::SetScanDriveLetters(const std::vector<wchar_t>& drives) {
 
 void Indexer::SetParseThreadCount(uint32_t threads) {
     parseThreadCount_ = threads > 16 ? 16 : threads;
+}
+
+void Indexer::SetAppStartTickMs(uint64_t tickMs) {
+    appStartTickMs_.store(tickMs);
 }
 
 static uint32_t ResolveParseThreadCount(uint32_t configured) {
@@ -160,10 +165,14 @@ struct InitialParseTask {
     ArchiveFile_t archive;
     int64_t archiveId = -1;
     size_t originalIndex = 0;
+    uint64_t estimatedEntryCount = 0;
+    uint64_t estimatedCost = 0;
+    bool hasEntryCountEstimate = false;
 };
 
 static constexpr size_t kParsedEntryBatchSize = 4096;
 static constexpr size_t kInitialParsePerfLogInterval = 250;
+static constexpr uint64_t kInitialParseEntryCostBytes = 64ull * 1024ull;
 
 static ParsedArchiveResult ParseArchiveEntriesOnly(const ArchiveFile_t& a,
                                                    int64_t archiveId,
@@ -487,26 +496,67 @@ void Indexer::Start(HWND hWnd) {
                         PostParseProgress(hWnd, 0, parseTotal);
                     }
                     if (!cancel_.load() && parseTotal > 0) {
+                        const auto rules = archiveFormatRules_;
                         std::vector<InitialParseTask> parseTasks;
                         parseTasks.reserve(parseTotal);
+                        size_t zipEstimateOk = 0;
+                        size_t zipEstimateFailed = 0;
+                        uint64_t maxEstimatedEntries = 0;
+                        std::wstring maxEstimatedEntriesPath;
+                        const auto estimateStart = std::chrono::steady_clock::now();
                         for (size_t i = 0; i < parseTotal; ++i) {
-                            parseTasks.push_back(InitialParseTask{ toParse[i], archiveIds[i], i });
+                            InitialParseTask task{ toParse[i], archiveIds[i], i };
+                            const std::wstring parserType = GetParserTypeForPath(task.archive.filePath, rules);
+                            task.estimatedCost = static_cast<uint64_t>(task.archive.fileSize);
+                            if (parserType == L"zip") {
+                                uint64_t estimatedEntries = 0;
+                                std::string estimateErr;
+                                if (EveryZip::ZipArchiveParser::EstimateEntryCount(task.archive.filePath,
+                                                                                   &estimatedEntries,
+                                                                                   &estimateErr)) {
+                                    task.estimatedEntryCount = estimatedEntries;
+                                    task.hasEntryCountEstimate = true;
+                                    ++zipEstimateOk;
+                                    if (estimatedEntries > maxEstimatedEntries) {
+                                        maxEstimatedEntries = estimatedEntries;
+                                        maxEstimatedEntriesPath = task.archive.filePath;
+                                    }
+                                    const uint64_t entryCost = estimatedEntries > UINT64_MAX / kInitialParseEntryCostBytes
+                                        ? UINT64_MAX
+                                        : estimatedEntries * kInitialParseEntryCostBytes;
+                                    task.estimatedCost = entryCost > UINT64_MAX - static_cast<uint64_t>(task.archive.fileSize)
+                                        ? UINT64_MAX
+                                        : entryCost + static_cast<uint64_t>(task.archive.fileSize);
+                                } else {
+                                    ++zipEstimateFailed;
+                                }
+                            }
+                            parseTasks.push_back(std::move(task));
                         }
                         std::stable_sort(parseTasks.begin(), parseTasks.end(),
                             [](const InitialParseTask& a, const InitialParseTask& b) {
-                                return a.archive.fileSize > b.archive.fileSize;
+                                return a.estimatedCost > b.estimatedCost;
                             });
-
-                        const uint64_t largestSize = parseTasks.empty()
-                            ? 0
-                            : static_cast<uint64_t>(parseTasks.front().archive.fileSize);
-                        LOG_INFO(L"Initial archive parsing schedule: policy=file_size_desc parse_total=%zu largest_file_size=%llu largest_path=%s",
-                                 parseTotal,
-                                 (unsigned long long)largestSize,
-                                 parseTasks.empty() ? L"" : parseTasks.front().archive.filePath.c_str());
 
                         const uint32_t resolvedParseThreads = ResolveParseThreadCount(parseThreadCount_);
                         const size_t workerCount = std::min<size_t>(parseTotal, resolvedParseThreads);
+                        const uint64_t largestSize = parseTasks.empty()
+                            ? 0
+                            : static_cast<uint64_t>(parseTasks.front().archive.fileSize);
+                        const double estimateElapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - estimateStart).count();
+                        LOG_INFO(L"Initial archive parsing schedule: policy=zip_entry_count_then_file_size parse_total=%zu zip_estimate_ok=%zu zip_estimate_failed=%zu estimate_elapsed_sec=%.3f top_estimated_cost=%llu top_estimated_entries=%llu top_file_size=%llu top_path=%s max_estimated_entries=%llu max_estimated_entries_path=%s",
+                                 parseTotal,
+                                 zipEstimateOk,
+                                 zipEstimateFailed,
+                                 estimateElapsed,
+                                 (unsigned long long)(parseTasks.empty() ? 0 : parseTasks.front().estimatedCost),
+                                 (unsigned long long)(parseTasks.empty() ? 0 : parseTasks.front().estimatedEntryCount),
+                                 (unsigned long long)largestSize,
+                                 parseTasks.empty() ? L"" : parseTasks.front().archive.filePath.c_str(),
+                                 (unsigned long long)maxEstimatedEntries,
+                                 maxEstimatedEntriesPath.c_str());
+
                         LOG_INFO(L"Initial archive parsing started: parse_threads=%u parse_total=%zu",
                                  (unsigned)workerCount, parseTotal);
                         bool parseWriteTxnActive = false;
@@ -546,7 +596,6 @@ void Indexer::Start(HWND hWnd) {
                             std::chrono::steady_clock::time_point lastLogTime = std::chrono::steady_clock::now();
                         } perf;
 
-                        const auto rules = archiveFormatRules_;
                         std::vector<std::thread> workers;
                         workers.reserve(workerCount);
                         for (size_t workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
@@ -560,7 +609,6 @@ void Indexer::Start(HWND hWnd) {
                                         }
                                         taskIndex = work.nextIndex++;
                                     }
-
                                     const InitialParseTask task = parseTasks[taskIndex];
                                     const ArchiveFile_t archive = task.archive;
                                     const int64_t archiveId = task.archiveId;
@@ -834,6 +882,15 @@ void Indexer::Start(HWND hWnd) {
                     LOG_INFO(L"Initial archive parsing completed: parse_threads=%u parse_total=%zu parse_done=%zu entries=%zu parse_elapsed_sec=%.3f archives_per_sec=%.2f entries_per_sec=%.2f",
                              (unsigned)(parseTotal > 0 ? std::min<size_t>(parseTotal, ResolveParseThreadCount(parseThreadCount_)) : 0),
                              parseTotal, parseDone, parsedEntryCount, parseElapsed, archivesPerSec, entriesPerSec);
+                    const uint64_t appStartTickMs = appStartTickMs_.load();
+                    if (appStartTickMs != 0) {
+                        const uint64_t nowTickMs = GetTickCount64();
+                        const double appToParseDoneSec = nowTickMs >= appStartTickMs
+                            ? static_cast<double>(nowTickMs - appStartTickMs) / 1000.0
+                            : 0.0;
+                        LOG_INFO(L"Initial archive parsing app elapsed: app_to_parse_done_sec=%.3f",
+                                 appToParseDoneSec);
+                    }
                     if (!cancel_.load()) {
                         stage_.store((int)Stage::SyncingDatabase);
                     }
