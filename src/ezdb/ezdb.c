@@ -378,6 +378,7 @@ struct Ezdb {
     unsigned char* delta_entry_bits;
     size_t delta_entry_bits_cap_bytes;
     EzdbDiskPage* entry_detail_pages;
+    uint64_t entry_arrays_cap; /* preallocated capacity for entry arrays */
     EzdbDiskPage* raw_blob_pages;
     EzdbPageCacheEntry entry_detail_cache[EZDB_ENTRY_DETAIL_CACHE_PAGES];
     EzdbPageCacheEntry raw_blob_cache[EZDB_RAW_BLOB_CACHE_PAGES];
@@ -409,6 +410,8 @@ struct Ezdb {
     size_t txn_start_active_entry_bit_bytes;
     uint64_t txn_start_entry_count;
     uint64_t txn_start_active_entry_count;
+    int batch_index_deferred; /* skip per-entry gram index during bulk import */
+    int batch_index_dirty;    /* true if delta entries need gram index rebuild */
 };
 
 static uint64_t file_size_of(FILE* fp)
@@ -938,7 +941,13 @@ static int bitset_get(const unsigned char* bits, uint32_t id)
 static int resize_entry_arrays(Ezdb* db, uint64_t entry_count)
 {
     if (!db || entry_count > UINT32_MAX) return EZDB_ERR_ARG;
-    size_t count = (size_t)(entry_count ? entry_count : 1u);
+    if (entry_count <= db->entry_arrays_cap) return EZDB_OK;
+    uint64_t next = db->entry_arrays_cap ? db->entry_arrays_cap : 1024u;
+    while (next < entry_count) {
+        if (next > UINT32_MAX / 2u) { next = UINT32_MAX; break; }
+        next *= 2u;
+    }
+    size_t count = (size_t)(next ? next : 1u);
     uint32_t* archive_ids = (uint32_t*)realloc(db->entry_archive_ids, sizeof(uint32_t) * count);
     if (!archive_ids) return EZDB_ERR_MEMORY;
     db->entry_archive_ids = archive_ids;
@@ -955,7 +964,7 @@ static int resize_entry_arrays(Ezdb* db, uint64_t entry_count)
     if (!refs) return EZDB_ERR_MEMORY;
     db->delta_entry_refs = refs;
 
-    size_t bit_bytes = ((size_t)entry_count + 7u) / 8u;
+    size_t bit_bytes = ((size_t)next + 7u) / 8u;
     unsigned char* bits = (unsigned char*)realloc(db->active_entry_bits, bit_bytes ? bit_bytes : 1u);
     if (!bits) return EZDB_ERR_MEMORY;
     db->active_entry_bits = bits;
@@ -964,6 +973,7 @@ static int resize_entry_arrays(Ezdb* db, uint64_t entry_count)
     if (!delta_bits) return EZDB_ERR_MEMORY;
     db->delta_entry_bits = delta_bits;
     db->delta_entry_bits_cap_bytes = bit_bytes ? bit_bytes : 1u;
+    db->entry_arrays_cap = next;
     return EZDB_OK;
 }
 
@@ -4256,6 +4266,7 @@ int ezdb_open(const char* path, Ezdb** out_db)
     db->active_bits = (unsigned char*)malloc(db->active_bits_cap_bytes);
     db->active_entry_bits = (unsigned char*)malloc(db->active_entry_bits_cap_bytes);
     db->delta_entry_bits_cap_bytes = entry_bit_bytes ? entry_bit_bytes : 1u;
+    db->entry_arrays_cap = db->header.entry_count;
     db->delta_entry_bits = (unsigned char*)calloc(db->delta_entry_bits_cap_bytes, 1);
     db->covered_base_bits = (unsigned char*)calloc(base_bit_bytes ? base_bit_bytes : 1u, 1);
     db->dirs = (EzdbDiskDir*)malloc((size_t)db->header.dir_records_raw_size);
@@ -5331,6 +5342,8 @@ int ezdb_begin_write(Ezdb* db, uint32_t flags)
     memcpy(db->txn_start_active_bits, db->active_bits, db->txn_start_active_bit_bytes ? db->txn_start_active_bit_bytes : 1u);
     memcpy(db->txn_start_active_entry_bits, db->active_entry_bits, db->txn_start_active_entry_bit_bytes ? db->txn_start_active_entry_bit_bytes : 1u);
     db->write_txn_active = 1;
+    db->batch_index_deferred = 1;
+    db->batch_index_dirty = 0;
     int rc = append_delta_frame(db, EZDB_DELTA_BATCH_BEGIN);
     if (rc != EZDB_OK) {
         db->write_txn_active = 0;
@@ -5366,6 +5379,8 @@ int ezdb_commit_write(Ezdb* db)
         return rc;
     }
     db->write_txn_active = 0;
+    db->batch_index_deferred = 0;
+    db->batch_index_dirty = 0;
     free(db->txn_start_active_bits);
     db->txn_start_active_bits = NULL;
     free(db->txn_start_active_entry_bits);
@@ -5385,6 +5400,8 @@ int ezdb_rollback_write(Ezdb* db)
     if (!db->write_txn_active) return EZDB_ERR_ARG;
     int rc = restore_txn_snapshot(db);
     db->write_txn_active = 0;
+    db->batch_index_deferred = 0;
+    db->batch_index_dirty = 0;
     free(db->txn_start_active_bits);
     db->txn_start_active_bits = NULL;
     free(db->txn_start_active_entry_bits);
@@ -5614,13 +5631,123 @@ int ezdb_append_archive_entries(Ezdb* db, uint32_t archive_id, const EzdbEntryRe
     if (!db || (!entries && entry_count)) return EZDB_ERR_ARG;
     if (db->read_only) return EZDB_ERR_READ_ONLY;
     if (archive_id >= db->header.file_count || !bitset_get(db->active_bits, archive_id)) return EZDB_ERR_NOT_FOUND;
-    int rc = EZDB_OK;
-    for (uint32_t i = 0; i < entry_count; ++i) {
-        uint32_t id = 0;
-        rc = append_entry_delta_disk(db, archive_id, &entries[i], &id, 0);
-        if (rc != EZDB_OK) break;
+    if (!entry_count) {
+        if (!db->write_txn_active) return write_header(db);
+        return EZDB_OK;
     }
-    if (rc == EZDB_OK && !db->write_txn_active) rc = write_header(db);
+
+    /* Preallocate entry arrays for the entire batch */
+    uint64_t old_entry_count = db->header.entry_count;
+    uint64_t new_entry_count = old_entry_count + entry_count;
+    int rc = resize_entry_arrays(db, new_entry_count);
+    if (rc != EZDB_OK) return rc;
+
+    /* Ensure memory is zeroed and initialized for the new entries */
+    if (new_entry_count > old_entry_count) {
+        size_t add = (size_t)(new_entry_count - old_entry_count);
+        memset(db->entry_archive_ids + old_entry_count, 0, sizeof(uint32_t) * add);
+        memset(db->entry_path_offsets + old_entry_count, 0, sizeof(uint32_t) * add);
+        memset(db->entry_path_lens + old_entry_count, 0, sizeof(uint32_t) * add);
+        for (uint64_t i = old_entry_count; i < new_entry_count; ++i) db->entry_next_in_archive[i] = UINT32_MAX;
+        memset(db->delta_entry_refs + old_entry_count, 0, sizeof(EzdbDeltaEntryRef) * add);
+        /* Zero new bit regions */
+        {
+            size_t old_bb = ((size_t)old_entry_count + 7u) / 8u;
+            size_t new_bb = ((size_t)new_entry_count + 7u) / 8u;
+            if (new_bb > old_bb) {
+                memset(db->active_entry_bits + old_bb, 0, new_bb - old_bb);
+                memset(db->delta_entry_bits + old_bb, 0, new_bb - old_bb);
+            }
+        }
+        if (old_entry_count && (old_entry_count & 7u)) {
+            db->active_entry_bits[old_entry_count >> 3u] &= (unsigned char)((1u << (old_entry_count & 7u)) - 1u);
+            db->delta_entry_bits[old_entry_count >> 3u] &= (unsigned char)((1u << (old_entry_count & 7u)) - 1u);
+        }
+    }
+
+    /* Build in-memory delta buffer for the entire batch */
+    size_t buf_cap = 0;
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        size_t path_len = entries[i].entry_path ? strlen(entries[i].entry_path) : 0;
+        size_t raw_len = entries[i].entry_raw_path ? entries[i].entry_raw_path_len : 0;
+        buf_cap += sizeof(EzdbEntryDeltaDiskHeader) + path_len + raw_len;
+    }
+    unsigned char* buf = (unsigned char*)malloc(buf_cap ? buf_cap : 1u);
+    if (!buf && buf_cap) return EZDB_ERR_MEMORY;
+    size_t buf_pos = 0;
+
+    /* Update header counts and build buffer */
+    db->header.entry_count = new_entry_count;
+    db->header.active_entry_count += entry_count;
+
+    uint64_t append_base = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        uint32_t id = (uint32_t)(old_entry_count + i);
+        size_t path_len_sz = entries[i].entry_path ? strlen(entries[i].entry_path) : 0;
+        uint32_t path_len = (uint32_t)path_len_sz;
+        uint32_t raw_len = entries[i].entry_raw_path ? entries[i].entry_raw_path_len : 0;
+
+        EzdbEntryDeltaDiskHeader eh;
+        memset(&eh, 0, sizeof(eh));
+        eh.magic = EZDB_DELTA_MAGIC;
+        eh.type = EZDB_DELTA_ENTRY_APPEND;
+        eh.id = id;
+        eh.archive_id = archive_id;
+        eh.entry_path_len = path_len;
+        eh.entry_raw_path_len = raw_len;
+        eh.compressed_size = entries[i].compressed_size;
+        eh.original_size = entries[i].original_size;
+        eh.modified_time = entries[i].modified_time;
+
+        memcpy(buf + buf_pos, &eh, sizeof(eh));
+        buf_pos += sizeof(eh);
+        if (path_len) { memcpy(buf + buf_pos, entries[i].entry_path, path_len); buf_pos += path_len; }
+        if (raw_len) { memcpy(buf + buf_pos, entries[i].entry_raw_path, raw_len); buf_pos += raw_len; }
+
+        /* Update in-memory state */
+        uint64_t entry_disk_offset = append_base + (uint64_t)(buf_pos - sizeof(eh) - path_len - raw_len);
+        db->entry_archive_ids[id] = archive_id;
+        db->entry_path_offsets[id] = id;
+        db->entry_path_lens[id] = path_len;
+        db->delta_entry_refs[id].path_offset = entry_disk_offset + sizeof(eh);
+        db->delta_entry_refs[id].path_len = path_len;
+        db->delta_entry_refs[id].raw_offset = entry_disk_offset + sizeof(eh) + path_len;
+        db->delta_entry_refs[id].raw_len = raw_len;
+        db->delta_entry_refs[id].compressed_size = entries[i].compressed_size;
+        db->delta_entry_refs[id].original_size = entries[i].original_size;
+        db->delta_entry_refs[id].modified_time = entries[i].modified_time;
+        bitset_set(db->active_entry_bits, id, 1);
+        bitset_set(db->delta_entry_bits, id, 1);
+        link_entry_to_archive(db, id, archive_id);
+
+        /* Deferred gram index: skip during bulk import */
+        if (path_len && entries[i].entry_path) {
+            rc = delta_entry_index_add_path(db, id, entries[i].entry_path);
+            if (rc != EZDB_OK) break;
+        }
+    }
+
+    /* Single fwrite for the entire batch */
+    if (rc == EZDB_OK && buf_cap > 0) {
+        if (fseek(db->fp, (long)append_base, SEEK_SET) != 0) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK && fwrite(buf, 1, buf_pos, db->fp) != buf_pos) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK) {
+            if (!db->header.delta_offset) db->header.delta_offset = append_base;
+            db->header.delta_size += buf_pos;
+            db->header.reserved_offset = db->header.delta_offset + db->header.delta_size;
+            db->header.reserved_size = 0;
+        }
+    }
+    free(buf);
+
+
+    if (rc != EZDB_OK) {
+        /* Rollback in-memory state on error */
+        db->header.entry_count = old_entry_count;
+        db->header.active_entry_count -= entry_count;
+        return rc;
+    }
+    if (!db->write_txn_active) rc = write_header(db);
     return rc;
 }
 
