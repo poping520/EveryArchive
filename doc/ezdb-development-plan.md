@@ -4,7 +4,7 @@
 
 `ezdb` 是 EveryZip 面向“大量文件路径、归档文件和归档内部条目快速搜索”的自定义数据库格式。它不追求通用 SQL 能力，而是针对 EveryZip 的核心业务数据做紧凑存储、快速构建和低延迟搜索。
 
-当前格式版本为 `EZDB0011`，不兼容 v1-v10。旧 `.ezdb` 文件需要重新构建。
+当前格式版本为 `EZDB0012`，不兼容 v1-v11。旧 `.ezdb` 文件需要重新构建。
 
 核心目标：
 
@@ -102,7 +102,7 @@ name = a.zip
 
 文件头保存：
 
-- magic：固定为 `EZDB0011`。
+- magic：固定为 `EZDB0012`。
 - `file_count` / `active_count`：archive 逻辑记录数和活跃数。
 - `entry_count` / `active_entry_count`：entry 逻辑记录数和活跃数。
 - `base_entry_count`：压缩基座中的 entry 数量；大于该值的 active entry 来自 delta log。
@@ -148,7 +148,7 @@ entry raw/blob page:
 
 `entry_path` 和 `entry_raw_path` 都保存在逻辑 raw/blob 空间中，磁盘上按 256 KiB 原始页独立压缩。搜索最终确认和 `get-entry` 只加载命中的少数 blob page；entry detail page 默认按 4096 条 entry 独立压缩，只有返回结果或回读 entry 时才加载。
 
-v11 中，新解析出来的 entries 可以先写入 delta entry frame。delta entry 的 path/raw bytes 保存在 delta frame 内，打开或追加时建立轻量引用；后台 compact 后再重新写入 entry core、detail pages、raw/blob pages 和压缩 entry postings。
+v12 中，新解析出来的 entries 可以先写入 delta entry frame。delta entry 的 path/raw bytes 保存在 delta frame 内，打开或追加时建立轻量引用；后台 compact 后再重新写入 entry core、detail pages、raw/blob pages 和压缩 entry postings。打开和在线追加时维护 archive -> entry 的内存 ownership 链表，使 archive entry replace/delete 不再扫描全量 entries。
 
 ### 3.3 Index And Postings
 
@@ -270,15 +270,15 @@ SQLite 导入时：
 
 ### 5.2 ezdb CRUD
 
-v11 延续“压缩基座 + append-only delta log + write transaction”，并把 archive entries 替换升级为 C 层增量写入：
+v12 延续“压缩基座 + append-only delta log + write transaction”，并把 archive entries 替换升级为 C 层增量写入：
 
 - build 完成后的 records、dirs、strings、indexes、postings 作为不可变压缩基座。
 - archive insert/update/delete 追加 delta log，不在基座中间移动数据。
 - 单条写入默认保持“调用成功返回前持久化”。
-- 批量写入通过事务延迟 flush，commit 时一次性写 batch frame、更新 header 并落盘。
+- 批量写入通过事务延迟 flush，commit 时一次性写 batch frame、更新 header 并落盘；entry replace/append/finish 在事务内不再逐批 `_commit`。
 - open 时 replay 已提交 delta batch，构建 id 覆盖层和 tombstone。
 - `ezdb_delete_archive_by_ref` 根据 `drive_letter + file_ref_number` 删除 archive，并让其 entries 级联失效。
-- `ezdb_begin_replace_archive_entries` 先写入 archive entry delete delta，旧 entries 立即失效。
+- `ezdb_begin_replace_archive_entries` 先写入 archive entry delete delta，旧 entries 通过 ownership 链表按 archive 失效。
 - `ezdb_append_archive_entries` 按批追加 delta entry frame，并同步维护 active entries、delta entry refs 和 delta entry gram index。
 - `ezdb_finish_replace_archive_entries` 完成该 archive 的 entry 替换；`ezdb_abort_replace_archive_entries` 用于失败时终止未完成批次。
 - `ezdb_replace_archive_entries` 作为一次性包装保留，内部走 begin / append / finish。
@@ -623,6 +623,43 @@ EzdbBench live-entry-append test_data\codex_tmp\live_append_100k_final.ezdb 1000
 - delta entry 查询路径可在 compact 前命中新增 entries；compact 后 entries 被吸收到压缩基座。
 - compact 后 reopen 成本、常驻内存和文件体积明显下降；后续重点转向崩溃恢复、compact 触发阈值和 UI 查询分页。
 
+### 8.7 当前 v12 entry ingest flush / ownership 优化结果
+
+v12 的重点验证是“降低在线 entry delta 入库开销”：entry replace/append/finish 在写事务内延迟 header flush，并在内存中维护 archive -> entry ownership 链表，使 archive entries 替换和删除不再全库扫描 entries。
+
+验证命令：
+
+```text
+cmake --build cmake-build-codex-release --config Release --target EzdbBench TestIndexStore
+ctest --test-dir cmake-build-codex-release -C Release --output-on-failure
+python tools\ezdb_query_syntax_tests.py --bench cmake-build-codex-release\tools\EzdbBench.exe
+EzdbBench live-entry-append test_data\codex_tmp\live_append_v12_txn_100k.ezdb 100000 4096
+EzdbBench compact test_data\codex_tmp\live_append_v12_txn_100k.ezdb
+EzdbBench search-v2 test_data\codex_tmp\live_append_v12_txn_100k.ezdb entry live_file_00099999 5
+```
+
+100k live append smoke：
+
+| 阶段 | 指标 | 数值 |
+| --- | --- | ---: |
+| append 后 | append_ms | 1,080 ms |
+| append 后 | 文件大小 | 7,702,509 bytes / 7.35 MB |
+| append 后 | delta_entries | 100,000 |
+| append 后 | delta_size | 7,700,096 bytes / 7.34 MB |
+| compact | compact_ms | 522 ms |
+| compact 后 | 文件大小 | 1,463,971 bytes / 1.40 MB |
+| compact 后 | base_entries | 100,000 |
+| compact 后 | delta_entries / delta_size | 0 / 0 |
+| compact 后 | reopen open_ms | 2 ms |
+| compact 后 | `live_file_00099999` 查询 | 5 ms |
+| compact 后 | info private | 8.22 MB |
+
+结论：
+
+- 相同 100k append smoke 相对 v11 `2,936 ms` 降至 `1,080 ms`，约 2.7 倍提升。
+- 初始解析路径通过 `IndexStore::BeginWrite` / `CommitWrite` 包裹 archive entry append，可避免每个 archive begin/finish 和每个 append batch 都强制刷盘。
+- ownership 链表把 archive entry replace/delete 的旧 entries 失效从全量扫描改为按 archive 遍历，避免初始解析时随 entry_count 增长出现累积扫描成本。
+
 ## 9. C API
 
 公开接口位于 `src/ezdb/ezdb.h`。
@@ -727,7 +764,7 @@ API 约定：
 
 ## 11. 已知限制
 
-- v11 不兼容 v1-v10 `.ezdb` 文件。
+- v12 不兼容 v1-v11 `.ezdb` 文件。
 - 目录记录、字符串池、entry core 和索引仍在 open 后整体常驻。
 - entry detail 与 raw/blob pool 已按页懒加载，但 entry path 当前没有目录树压缩，主要依赖 page 压缩和 postings 索引。
 - 目录索引基于路径组件，不为任意跨组件子串单独建索引。

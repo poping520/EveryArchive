@@ -484,6 +484,15 @@ void Indexer::Start(HWND hWnd) {
                         const size_t workerCount = std::min<size_t>(parseTotal, resolvedParseThreads);
                         LOG_INFO(L"Initial archive parsing started: parse_threads=%u parse_total=%zu",
                                  (unsigned)workerCount, parseTotal);
+                        bool parseWriteTxnActive = false;
+                        {
+                            std::wstring txnErr;
+                            if (store->BeginWrite(&txnErr)) {
+                                parseWriteTxnActive = true;
+                            } else {
+                                LOG_WARN(L"Initial archive parsing write transaction disabled: %s", txnErr.c_str());
+                            }
+                        }
 
                         struct ParseWorkState {
                             std::mutex mutex;
@@ -666,6 +675,16 @@ void Indexer::Start(HWND hWnd) {
                         for (auto& worker : workers) {
                             if (worker.joinable()) {
                                 worker.join();
+                            }
+                        }
+                        if (parseWriteTxnActive) {
+                            std::wstring txnErr;
+                            if (cancel_.load()) {
+                                if (!store->RollbackWrite()) {
+                                    LOG_WARN(L"Initial archive parsing rollback failed");
+                                }
+                            } else if (!store->CommitWrite(&txnErr)) {
+                                LOG_WARN(L"Initial archive parsing commit failed: %s", txnErr.c_str());
                             }
                         }
                     }

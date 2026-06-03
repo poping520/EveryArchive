@@ -565,7 +565,9 @@ public:
     bool BeginWrite(std::wstring* err) override
     {
         if (txnActive_) { SetErr(err, L"write transaction already active"); return false; }
-        if (!LoadMutable(err)) return false;
+        if (!db_) { SetErr(err, L"store not open"); return false; }
+        int rc = ezdb_begin_write(db_, 0);
+        if (rc != 0) { SetErr(err, Utf8ToWString(ezdb_error_message(rc))); return false; }
         txnActive_ = true;
         dirty_ = false;
         return true;
@@ -574,7 +576,13 @@ public:
     bool CommitWrite(std::wstring* err) override
     {
         if (!txnActive_) { SetErr(err, L"write transaction not active"); return false; }
-        bool ok = (!dirty_ || Rebuild(err)) && ApplyPendingMeta(err);
+        int rc = ezdb_commit_write(db_);
+        bool ok = rc == 0;
+        if (!ok) {
+            SetErr(err, Utf8ToWString(ezdb_error_message(rc)));
+        } else {
+            ok = ApplyPendingMeta(err);
+        }
         txnActive_ = false;
         mutableLoaded_ = false;
         archives_.clear();
@@ -586,6 +594,7 @@ public:
 
     bool RollbackWrite() override
     {
+        if (db_ && txnActive_) (void)ezdb_rollback_write(db_);
         txnActive_ = false;
         mutableLoaded_ = false;
         archives_.clear();
@@ -641,7 +650,7 @@ public:
             if (outIds) outIds->push_back(id);
         }
         dirty_ = true;
-        return txnActive_ || RebuildAndUnload(err);
+        return RebuildAndUnload(err);
     }
 
     bool GetArchiveByRef(wchar_t driveLetter, uint64_t fileRefNumber, ArchiveFile_t* out) override
@@ -687,7 +696,7 @@ public:
             if (entry.archiveId > id) --entry.archiveId;
         }
         dirty_ = true;
-        return txnActive_ || RebuildAndUnload(&err);
+        return RebuildAndUnload(&err);
     }
 
     int64_t GetArchiveCount() override { return db_ ? ezdb_active_archive_count(db_) : 0; }
@@ -724,7 +733,7 @@ public:
             return e.archiveId == archiveId;
         }), entries_.end());
         dirty_ = true;
-        return txnActive_ || RebuildAndUnload(err);
+        return RebuildAndUnload(err);
     }
 
     bool InsertEntries(const std::vector<ArchiveEntry_t>& entries, std::wstring* err) override
@@ -732,7 +741,7 @@ public:
         if (!LoadMutable(err)) return false;
         entries_.insert(entries_.end(), entries.begin(), entries.end());
         dirty_ = true;
-        return txnActive_ || RebuildAndUnload(err);
+        return RebuildAndUnload(err);
     }
 
     bool BeginReplaceArchiveEntriesByArchiveId(int64_t archiveId, std::wstring* err) override

@@ -87,6 +87,24 @@ static int RunStoreCase(const wchar_t* name, std::unique_ptr<IndexStore> store)
 
     if (store->GetArchiveCount() != 1) return Fail("archive count mismatch");
     if (store->GetEntryCount(L"file") != 1) return Fail("entry count mismatch");
+
+    if (std::wstring(name).find(L".ezdb") != std::wstring::npos) {
+        ArchiveEntry_t txnEntryA = entry;
+        txnEntryA.entryPathUtf8 = "folder/txn_a.txt";
+        ArchiveEntry_t txnEntryB = entry;
+        txnEntryB.entryPathUtf8 = "folder/txn_b.txt";
+        std::vector<ArchiveEntry_t> txnBatchA{ txnEntryA };
+        std::vector<ArchiveEntry_t> txnBatchB{ txnEntryB };
+        if (!store->BeginWrite(&err)) return Fail("entry transaction begin failed");
+        if (!store->BeginReplaceArchiveEntriesByArchiveId(archiveId, &err)) return Fail("entry transaction replace begin failed");
+        if (!store->AppendArchiveEntriesByArchiveId(archiveId, txnBatchA, &err)) return Fail("entry transaction append A failed");
+        if (!store->AppendArchiveEntriesByArchiveId(archiveId, txnBatchB, &err)) return Fail("entry transaction append B failed");
+        if (!store->FinishReplaceArchiveEntriesByArchiveId(archiveId, &err)) return Fail("entry transaction replace finish failed");
+        if (!store->CommitWrite(&err)) return Fail("entry transaction commit failed");
+        if (store->GetEntryCount(L"txn_") != 2) return Fail("entry transaction count mismatch");
+        if (store->GetEntryCount(L"file.txt") != 0) return Fail("entry transaction stale entry still searchable");
+    }
+
     if (!store->Compact()) return Fail("compact failed");
 
     store->Close();

@@ -1113,9 +1113,16 @@ static int run_main(int argc, char** argv)
             return 2;
         }
         uint64_t start_size = ezdb_file_size(db);
+        rc = ezdb_begin_write(db, 0);
+        if (rc != 0) {
+            fprintf(stderr, "live-entry-append write transaction begin failed: %s (%d)\n", ezdb_error_message(rc), rc);
+            ezdb_close(db);
+            return 2;
+        }
         rc = ezdb_begin_replace_archive_entries(db, 0);
         if (rc != 0) {
             fprintf(stderr, "live-entry-append begin failed: %s (%d)\n", ezdb_error_message(rc), rc);
+            ezdb_rollback_write(db);
             ezdb_close(db);
             return 2;
         }
@@ -1153,6 +1160,11 @@ static int run_main(int argc, char** argv)
             printf("batch_written: %u file_size: %llu\n", written, (unsigned long long)ezdb_file_size(db));
         }
         if (rc == 0) rc = ezdb_finish_replace_archive_entries(db, 0);
+        if (rc == 0) {
+            rc = ezdb_commit_write(db);
+        } else {
+            ezdb_rollback_write(db);
+        }
         double elapsed = now_ms() - start;
         uint64_t end_size = ezdb_file_size(db);
         free(batch);
