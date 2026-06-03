@@ -53,6 +53,8 @@ public:
 
     void SetParseThreadCount(uint32_t threads);
 
+    void SetAppStartTickMs(uint64_t tickMs);
+
     /**
      * 确保数据库文件存在并创建所需的表。
      * @return 准备成功返回 true，否则返回 false。
@@ -101,6 +103,7 @@ private:
     std::vector<UserConfig::ArchiveFormatRule> archiveFormatRules_;
     std::vector<wchar_t> scanDriveLetters_;
     uint32_t parseThreadCount_ = 0;
+    std::atomic<uint64_t> appStartTickMs_{ 0 };
     std::atomic_bool cancel_{ false };
     std::atomic_bool running_{ false };
     std::atomic<int> stage_{ (int)Stage::IdleMonitoring };

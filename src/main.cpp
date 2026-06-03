@@ -117,6 +117,8 @@ static void CenterWindowOnPrimaryWorkArea(int width, int height, int* outX, int*
  // 参数：hInstance - 当前实例句柄；第二个 HINSTANCE 未使用；PWSTR 未使用；nCmdShow - 初始窗口显示方式。
  // 返回值：进程退出码。
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    const uint64_t appStartTickMs = GetTickCount64();
+
     // 单实例检测：创建命名 Mutex，已存在说明有实例在运行
     static constexpr wchar_t kMutexName[] = L"EveryZip_SingleInstance_Mutex";
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, kMutexName);
@@ -162,6 +164,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     state.indexer.SetArchiveFormatRules(state.userConfig.GetArchiveFormatRules());
     state.indexer.SetScanDriveLetters(state.userConfig.GetScanDriveLetters());
     state.indexer.SetParseThreadCount(state.userConfig.GetParseThreadCount());
+    state.indexer.SetAppStartTickMs(appStartTickMs);
     state.showArchiveFullPath = state.userConfig.GetShowArchiveFullPath();
     state.rowCache.SetDbPath(dbPath);
     state.rowCache.SetIconCache(&state.iconCache);
