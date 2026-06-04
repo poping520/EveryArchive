@@ -32,9 +32,11 @@ static void print_usage(void)
     printf("Usage:\n");
     printf("  EzdbBench build-archives <input.tsv> <output.ezdb>\n");
     printf("  EzdbBench build-entries <combined.tsv> <output.ezdb>\n");
+    printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
+    printf("  EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]\n");
+
     printf("  EzdbBench info <db.ezdb>\n");
     printf("  EzdbBench open <db.ezdb> [limit]\n");
-    printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
     printf("  EzdbBench get <db.ezdb> <id>\n");
     printf("  EzdbBench get-archive <db.ezdb> <id>\n");
     printf("  EzdbBench get-entry <db.ezdb> <id>\n");
@@ -45,7 +47,7 @@ static void print_usage(void)
     printf("  EzdbBench delete <db.ezdb> <id>\n");
     printf("  EzdbBench delete-archive-ref <db.ezdb> <drive> <file_ref_number>\n");
     printf("  EzdbBench compact <db.ezdb>\n");
-    printf("  EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]\n");
+
 }
 
 static void print_memory_usage(const char* prefix)
