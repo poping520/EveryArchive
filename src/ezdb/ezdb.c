@@ -22,11 +22,15 @@
 #include <zlib.h>
 
 #include <ctype.h>
+#include <direct.h>
+#include <errno.h>
 #include <io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <windows.h>
+#include <psapi.h>
 
 #define EZDB_MAGIC "EZDB0012"
 #define EZDB_VERSION 12u
@@ -299,6 +303,70 @@ typedef struct PostingBuilder {
     uint32_t* id_block;
 } PostingBuilder;
 
+typedef struct PostingWriteStats {
+    double sort_ms;
+    double choose_ms;
+    double encode_ms;
+    double compress_ms;
+    double fwrite_ms;
+    double index_meta_ms;
+    uint64_t raw_bytes;
+    uint64_t encoded_bytes;
+    uint32_t array_count;
+    uint32_t range_count;
+    uint32_t bitset_count;
+    uint32_t compressed_count;
+} PostingWriteStats;
+
+typedef struct EzdbBuildOptionsResolved {
+    char temp_dir[1024];
+    uint32_t memory_limit_mb;
+    uint32_t flags;
+    uint32_t log_level;
+} EzdbBuildOptionsResolved;
+
+typedef struct StreamPagedWriter {
+    FILE* out;
+    uint32_t page_size;
+    unsigned char* page;
+    uint32_t page_len;
+    EzdbDiskPage* pages;
+    uint32_t page_count;
+    uint32_t page_cap;
+    uint64_t written;
+    uint64_t raw_size;
+} StreamPagedWriter;
+
+typedef struct PostingEventSorter {
+    const EzdbBuildOptionsResolved* options;
+    uint64_t* buffer;
+    uint32_t buffer_count;
+    uint32_t buffer_cap;
+    char** run_paths;
+    uint32_t run_count;
+    uint32_t run_cap;
+    uint64_t event_count;
+    uint64_t event_bytes;
+    double sort_ms;
+} PostingEventSorter;
+
+typedef struct PostingRunReader {
+    FILE* fp;
+    uint64_t remaining;
+    uint64_t current;
+    int has_current;
+} PostingRunReader;
+
+typedef struct PostingHeapNode {
+    uint64_t value;
+    uint32_t run_id;
+} PostingHeapNode;
+
+typedef struct GramKeyCallback {
+    int (*emit)(uint32_t key, void* user_data);
+    void* user_data;
+} GramKeyCallback;
+
 static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, const void* bytes, uint32_t len, uint32_t extra_nul, uint32_t* out_offset);
 static int entry_is_searchable(Ezdb* db, uint32_t entry_id);
 static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out);
@@ -426,6 +494,15 @@ static uint64_t file_size_of(FILE* fp)
 static double ezdb_now_ms(void)
 {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+static double ezdb_peak_working_set_mb(void)
+{
+    PROCESS_MEMORY_COUNTERS_EX counters;
+    memset(&counters, 0, sizeof(counters));
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&counters, sizeof(counters))) return 0.0;
+    return (double)counters.PeakWorkingSetSize / 1024.0 / 1024.0;
 }
 
 static char* ezdb_strdup_range(const char* text, size_t len)
@@ -1363,6 +1440,96 @@ static int add_text_grams_to_builder(PostingBuilder* builder, const char* text, 
     return EZDB_OK;
 }
 
+static int enumerate_text_gram_keys(const char* text, const GramKeyCallback* callback)
+{
+    if (!text || !callback || !callback->emit) return EZDB_ERR_ARG;
+    uint32_t len = (uint32_t)strlen(text);
+    if (!len) return EZDB_OK;
+    uint32_t stack_offsets[EZDB_STACK_TOKENS];
+    uint32_t stack_lens[EZDB_STACK_TOKENS];
+    uint32_t stack_keys[EZDB_STACK_KEYS];
+    uint32_t* offsets = stack_offsets;
+    uint32_t* lens = stack_lens;
+    uint32_t* keys = stack_keys;
+    uint32_t token_cap = EZDB_STACK_TOKENS;
+    uint32_t key_cap = EZDB_STACK_KEYS;
+    uint32_t token_count = 0;
+    uint32_t key_count = 0;
+    uint32_t pos = 0;
+    while (pos < len) {
+        int token_len = utf8_token_len((const unsigned char*)text + pos, (size_t)(len - pos));
+        if (token_count >= token_cap) {
+            uint32_t next_cap = token_cap * 2u;
+            uint32_t* new_offsets = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)next_cap);
+            uint32_t* new_lens = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)next_cap);
+            if (!new_offsets || !new_lens) {
+                free(new_offsets);
+                free(new_lens);
+                if (offsets != stack_offsets) free(offsets);
+                if (lens != stack_lens) free(lens);
+                return EZDB_ERR_MEMORY;
+            }
+            memcpy(new_offsets, offsets, sizeof(uint32_t) * (size_t)token_count);
+            memcpy(new_lens, lens, sizeof(uint32_t) * (size_t)token_count);
+            if (offsets != stack_offsets) free(offsets);
+            if (lens != stack_lens) free(lens);
+            offsets = new_offsets;
+            lens = new_lens;
+            token_cap = next_cap;
+        }
+        offsets[token_count] = pos;
+        lens[token_count] = (uint32_t)token_len;
+        ++token_count;
+        pos += (uint32_t)token_len;
+    }
+    if (token_count * EZDB_MAX_GRAM_TOKENS > key_cap) {
+        key_cap = token_count * EZDB_MAX_GRAM_TOKENS;
+        keys = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)key_cap);
+        if (!keys) {
+            if (offsets != stack_offsets) free(offsets);
+            if (lens != stack_lens) free(lens);
+            return EZDB_ERR_MEMORY;
+        }
+    }
+    for (uint32_t kind = EZDB_GRAM1; kind <= EZDB_GRAM3; ++kind) {
+        if (token_count < kind) continue;
+        for (uint32_t i = 0; i + kind <= token_count; ++i) {
+            uint32_t byte_start = offsets[i];
+            uint32_t byte_end = offsets[i + kind - 1u] + lens[i + kind - 1u];
+            keys[key_count++] = make_gram_key_from_span(text, byte_start, byte_end - byte_start, kind);
+        }
+    }
+    if (offsets != stack_offsets) free(offsets);
+    if (lens != stack_lens) free(lens);
+    uint32_t seen_stack[EZDB_STACK_KEYS];
+    uint32_t* seen_keys = key_count <= EZDB_STACK_KEYS ? seen_stack : (uint32_t*)malloc(sizeof(uint32_t) * (size_t)key_count);
+    if (!seen_keys) {
+        if (keys != stack_keys) free(keys);
+        return EZDB_ERR_MEMORY;
+    }
+    uint32_t seen_count = 0;
+    for (uint32_t i = 0; i < key_count; ++i) {
+        int duplicate = 0;
+        for (uint32_t j = 0; j < seen_count; ++j) {
+            if (seen_keys[j] == keys[i]) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        seen_keys[seen_count++] = keys[i];
+        int rc = callback->emit(keys[i], callback->user_data);
+        if (rc != EZDB_OK) {
+            if (seen_keys != seen_stack) free(seen_keys);
+            if (keys != stack_keys) free(keys);
+            return rc;
+        }
+    }
+    if (seen_keys != seen_stack) free(seen_keys);
+    if (keys != stack_keys) free(keys);
+    return EZDB_OK;
+}
+
 static int count_text_grams(PostingBuilder* builder, const char* text, uint32_t id)
 {
     return add_text_grams_to_builder(builder, text, id, 1);
@@ -1999,6 +2166,459 @@ static int write_paged_section(FILE* out,
     return EZDB_OK;
 }
 
+static int resolve_build_options(const char* output_ezdb, const EzdbBuildOptions* options, EzdbBuildOptionsResolved* out)
+{
+    if (!output_ezdb || !out) return EZDB_ERR_ARG;
+    memset(out, 0, sizeof(*out));
+    out->memory_limit_mb = options && options->memory_limit_mb ? options->memory_limit_mb : 512u;
+    if (out->memory_limit_mb < 32u) out->memory_limit_mb = 32u;
+    out->flags = options && options->flags ? options->flags : EZDB_BUILD_DEFAULT_FLAGS;
+    out->log_level = options ? options->log_level : 0u;
+    if (options && options->temp_dir && options->temp_dir[0]) {
+        if (snprintf(out->temp_dir, sizeof(out->temp_dir), "%s", options->temp_dir) >= (int)sizeof(out->temp_dir)) return EZDB_ERR_ARG;
+    } else {
+        if (snprintf(out->temp_dir, sizeof(out->temp_dir), "%s.tmp", output_ezdb) >= (int)sizeof(out->temp_dir)) return EZDB_ERR_ARG;
+    }
+    return EZDB_OK;
+}
+
+static int ensure_directory_exists(const char* path)
+{
+    if (!path || !path[0]) return EZDB_ERR_ARG;
+    if (_mkdir(path) == 0 || errno == EEXIST) return EZDB_OK;
+    return EZDB_ERR_IO;
+}
+
+static int stream_paged_writer_init(StreamPagedWriter* writer, FILE* out, uint32_t page_size)
+{
+    if (!writer || !out || !page_size) return EZDB_ERR_ARG;
+    memset(writer, 0, sizeof(*writer));
+    writer->out = out;
+    writer->page_size = page_size;
+    writer->page = (unsigned char*)malloc(page_size);
+    if (!writer->page) return EZDB_ERR_MEMORY;
+    return EZDB_OK;
+}
+
+static void stream_paged_writer_free(StreamPagedWriter* writer)
+{
+    if (!writer) return;
+    free(writer->page);
+    free(writer->pages);
+    memset(writer, 0, sizeof(*writer));
+}
+
+static int stream_paged_writer_flush_page(StreamPagedWriter* writer)
+{
+    if (!writer || !writer->out) return EZDB_ERR_ARG;
+    if (!writer->page_len) return EZDB_OK;
+    if (ensure_capacity((void**)&writer->pages, sizeof(EzdbDiskPage), &writer->page_cap, writer->page_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    unsigned char* payload = NULL;
+    uint64_t payload_size = 0;
+    uint32_t flags = 0;
+    int rc = maybe_compress_section(writer->page, writer->page_len, &payload, &payload_size, &flags);
+    if (rc != EZDB_OK) return rc;
+    EzdbDiskPage* page = &writer->pages[writer->page_count++];
+    page->offset = writer->written;
+    page->encoded_size = (uint32_t)payload_size;
+    page->raw_size = writer->page_len;
+    page->flags = flags;
+    page->reserved = 0;
+    if (payload_size && fwrite(payload, 1, (size_t)payload_size, writer->out) != (size_t)payload_size) rc = EZDB_ERR_IO;
+    free(payload);
+    if (rc != EZDB_OK) return rc;
+    writer->written += payload_size;
+    writer->page_len = 0;
+    return EZDB_OK;
+}
+
+static int stream_paged_writer_write(StreamPagedWriter* writer, const void* data, uint32_t len)
+{
+    if (!writer || (!data && len)) return EZDB_ERR_ARG;
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) {
+        uint32_t room = writer->page_size - writer->page_len;
+        uint32_t take = len < room ? len : room;
+        memcpy(writer->page + writer->page_len, p, take);
+        writer->page_len += take;
+        writer->raw_size += take;
+        p += take;
+        len -= take;
+        if (writer->page_len == writer->page_size) {
+            int rc = stream_paged_writer_flush_page(writer);
+            if (rc != EZDB_OK) return rc;
+        }
+    }
+    return EZDB_OK;
+}
+
+static int stream_paged_writer_finish(StreamPagedWriter* writer)
+{
+    return stream_paged_writer_flush_page(writer);
+}
+
+static int copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_written)
+{
+    if (!dst || !src_path || !out_written) return EZDB_ERR_ARG;
+    *out_written = 0;
+    FILE* src = fopen(src_path, "rb");
+    if (!src) return EZDB_ERR_IO;
+    unsigned char* buf = (unsigned char*)malloc(1024u * 1024u);
+    if (!buf) {
+        fclose(src);
+        return EZDB_ERR_MEMORY;
+    }
+    int rc = EZDB_OK;
+    for (;;) {
+        size_t n = fread(buf, 1, 1024u * 1024u, src);
+        if (n) {
+            if (fwrite(buf, 1, n, dst) != n) {
+                rc = EZDB_ERR_IO;
+                break;
+            }
+            *out_written += (uint64_t)n;
+        }
+        if (n < 1024u * 1024u) {
+            if (ferror(src)) rc = EZDB_ERR_IO;
+            break;
+        }
+    }
+    free(buf);
+    if (fclose(src) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    return rc;
+}
+
+static int u64_compare(const void* a, const void* b)
+{
+    uint64_t av = *(const uint64_t*)a;
+    uint64_t bv = *(const uint64_t*)b;
+    return (av > bv) - (av < bv);
+}
+
+static char* ezdb_strdup_local(const char* text)
+{
+    size_t len = text ? strlen(text) : 0u;
+    char* out = (char*)malloc(len + 1u);
+    if (!out) return NULL;
+    if (len) memcpy(out, text, len);
+    out[len] = '\0';
+    return out;
+}
+
+static int posting_event_sorter_add_run_path(PostingEventSorter* sorter, const char* path)
+{
+    if (ensure_capacity((void**)&sorter->run_paths, sizeof(char*), &sorter->run_cap, sorter->run_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    sorter->run_paths[sorter->run_count] = ezdb_strdup_local(path);
+    if (!sorter->run_paths[sorter->run_count]) return EZDB_ERR_MEMORY;
+    ++sorter->run_count;
+    return EZDB_OK;
+}
+
+static void posting_event_sorter_free(PostingEventSorter* sorter)
+{
+    if (!sorter) return;
+    for (uint32_t i = 0; i < sorter->run_count; ++i) {
+        if (sorter->run_paths[i]) {
+            remove(sorter->run_paths[i]);
+            free(sorter->run_paths[i]);
+        }
+    }
+    free(sorter->run_paths);
+    free(sorter->buffer);
+    memset(sorter, 0, sizeof(*sorter));
+}
+
+static int posting_event_sorter_init(PostingEventSorter* sorter, const EzdbBuildOptionsResolved* options)
+{
+    if (!sorter || !options) return EZDB_ERR_ARG;
+    memset(sorter, 0, sizeof(*sorter));
+    sorter->options = options;
+    uint64_t cap64 = ((uint64_t)options->memory_limit_mb * 1024u * 1024u) / sizeof(uint64_t) / 2u;
+    if (cap64 < 262144u) cap64 = 262144u;
+    if (cap64 > 33554432u) cap64 = 33554432u;
+    sorter->buffer_cap = (uint32_t)cap64;
+    sorter->buffer = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)sorter->buffer_cap);
+    if (!sorter->buffer) return EZDB_ERR_MEMORY;
+    return ensure_directory_exists(options->temp_dir);
+}
+
+static int posting_event_sorter_flush(PostingEventSorter* sorter)
+{
+    if (!sorter || !sorter->buffer) return EZDB_ERR_ARG;
+    if (!sorter->buffer_count) return EZDB_OK;
+    char path[1200];
+    if (snprintf(path, sizeof(path), "%s\\entry_events_%04u.run", sorter->options->temp_dir, sorter->run_count) >= (int)sizeof(path)) return EZDB_ERR_ARG;
+    double start_ms = ezdb_now_ms();
+    qsort(sorter->buffer, sorter->buffer_count, sizeof(uint64_t), u64_compare);
+    sorter->sort_ms += ezdb_now_ms() - start_ms;
+    FILE* fp = fopen(path, "wb");
+    if (!fp) return EZDB_ERR_IO;
+    int rc = EZDB_OK;
+    if (fwrite(sorter->buffer, sizeof(uint64_t), sorter->buffer_count, fp) != sorter->buffer_count) rc = EZDB_ERR_IO;
+    if (fclose(fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    if (rc != EZDB_OK) {
+        remove(path);
+        return rc;
+    }
+    rc = posting_event_sorter_add_run_path(sorter, path);
+    sorter->buffer_count = 0;
+    return rc;
+}
+
+static int posting_event_sorter_emit(PostingEventSorter* sorter, uint32_t key, uint32_t entry_id)
+{
+    if (!sorter || !sorter->buffer) return EZDB_ERR_ARG;
+    if (sorter->buffer_count == sorter->buffer_cap) {
+        int rc = posting_event_sorter_flush(sorter);
+        if (rc != EZDB_OK) return rc;
+    }
+    sorter->buffer[sorter->buffer_count++] = ((uint64_t)key << 32u) | (uint64_t)entry_id;
+    sorter->event_count += 1u;
+    sorter->event_bytes += sizeof(uint64_t);
+    return EZDB_OK;
+}
+
+typedef struct PostingEventEmitContext {
+    PostingEventSorter* sorter;
+    uint32_t entry_id;
+} PostingEventEmitContext;
+
+static int emit_gram_event(uint32_t key, void* user_data)
+{
+    PostingEventEmitContext* ctx = (PostingEventEmitContext*)user_data;
+    return posting_event_sorter_emit(ctx->sorter, key, ctx->entry_id);
+}
+
+static void heap_swap(PostingHeapNode* a, PostingHeapNode* b)
+{
+    PostingHeapNode t = *a;
+    *a = *b;
+    *b = t;
+}
+
+static void heap_push(PostingHeapNode* heap, uint32_t* count, PostingHeapNode node)
+{
+    uint32_t i = (*count)++;
+    heap[i] = node;
+    while (i) {
+        uint32_t parent = (i - 1u) / 2u;
+        if (heap[parent].value <= heap[i].value) break;
+        heap_swap(&heap[parent], &heap[i]);
+        i = parent;
+    }
+}
+
+static PostingHeapNode heap_pop(PostingHeapNode* heap, uint32_t* count)
+{
+    PostingHeapNode out = heap[0];
+    heap[0] = heap[--(*count)];
+    uint32_t i = 0;
+    for (;;) {
+        uint32_t left = i * 2u + 1u;
+        uint32_t right = left + 1u;
+        uint32_t smallest = i;
+        if (left < *count && heap[left].value < heap[smallest].value) smallest = left;
+        if (right < *count && heap[right].value < heap[smallest].value) smallest = right;
+        if (smallest == i) break;
+        heap_swap(&heap[i], &heap[smallest]);
+        i = smallest;
+    }
+    return out;
+}
+
+static int posting_run_reader_next(PostingRunReader* reader, uint64_t* out_value)
+{
+    if (!reader || !out_value || !reader->remaining) return 0;
+    if (fread(out_value, sizeof(uint64_t), 1, reader->fp) != 1) return -1;
+    --reader->remaining;
+    return 1;
+}
+
+static int append_u32(uint32_t** data, uint32_t* count, uint32_t* cap, uint32_t value)
+{
+    if (ensure_capacity((void**)data, sizeof(uint32_t), cap, *count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    (*data)[(*count)++] = value;
+    return EZDB_OK;
+}
+
+static int write_posting_group(FILE* out,
+                               uint32_t key,
+                               uint32_t* ids,
+                               uint32_t count,
+                               uint32_t universe_count,
+                               EzdbDiskIndex** indexes,
+                               uint32_t* index_count,
+                               uint32_t* index_cap,
+                               uint64_t* written,
+                               PostingWriteStats* stats)
+{
+    if (!count) return EZDB_OK;
+    double stage_start_ms = ezdb_now_ms();
+    uint32_t bitset_size = (universe_count + 7u) / 8u;
+    uint32_t array_size = estimate_array_size(ids, count);
+    uint32_t range_count = count_ranges(ids, count);
+    uint32_t range_size = estimate_range_size(ids, count);
+    uint32_t type = EZDB_POSTING_ARRAY;
+    uint32_t encoded_size = array_size;
+    if (range_count <= count / 2u && range_size < encoded_size) {
+        type = EZDB_POSTING_RANGE;
+        encoded_size = range_size;
+    }
+    if (count >= universe_count / EZDB_BITSET_DENSITY_DIVISOR && bitset_size < encoded_size) {
+        type = EZDB_POSTING_BITSET;
+    }
+    if (stats) {
+        if (type == EZDB_POSTING_ARRAY) stats->array_count += 1u;
+        else if (type == EZDB_POSTING_RANGE) stats->range_count += 1u;
+        else stats->bitset_count += 1u;
+        stats->choose_ms += ezdb_now_ms() - stage_start_ms;
+    }
+
+    unsigned char* raw_payload = NULL;
+    uint32_t raw_size = 0;
+    stage_start_ms = ezdb_now_ms();
+    int rc = encode_posting_container(ids, count, universe_count, type, &raw_payload, &raw_size);
+    if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
+    if (rc != EZDB_OK) return rc;
+
+    unsigned char* payload = NULL;
+    uint32_t payload_size = 0;
+    int compressed = 0;
+    stage_start_ms = ezdb_now_ms();
+    rc = maybe_compress_payload(raw_payload, raw_size, &payload, &payload_size, &compressed);
+    if (stats) {
+        stats->compress_ms += ezdb_now_ms() - stage_start_ms;
+        stats->raw_bytes += raw_size;
+        stats->encoded_bytes += payload_size;
+        if (compressed) stats->compressed_count += 1u;
+    }
+    free(raw_payload);
+    if (rc != EZDB_OK) return rc;
+
+    uint64_t local_offset = *written;
+    stage_start_ms = ezdb_now_ms();
+    rc = write_bytes(out, payload, payload_size, written);
+    if (stats) stats->fwrite_ms += ezdb_now_ms() - stage_start_ms;
+    free(payload);
+    if (rc != EZDB_OK) return rc;
+
+    if (ensure_capacity((void**)indexes, sizeof(EzdbDiskIndex), index_cap, *index_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    stage_start_ms = ezdb_now_ms();
+    EzdbDiskIndex* idx = &(*indexes)[(*index_count)++];
+    idx->key = key;
+    idx->count = count;
+    idx->container_type = type | (compressed ? EZDB_POSTING_COMPRESSED : 0u);
+    idx->encoded_size = (uint32_t)(*written - local_offset);
+    idx->raw_size = raw_size;
+    idx->offset = local_offset;
+    if (stats) stats->index_meta_ms += ezdb_now_ms() - stage_start_ms;
+    return EZDB_OK;
+}
+
+static int posting_event_sorter_write_postings(PostingEventSorter* sorter,
+                                               FILE* out,
+                                               uint32_t universe_count,
+                                               EzdbDiskIndex** out_index,
+                                               uint32_t* out_index_count,
+                                               uint64_t* out_written,
+                                               PostingWriteStats* stats,
+                                               double* out_merge_ms)
+{
+    if (!sorter || !out || !out_index || !out_index_count || !out_written) return EZDB_ERR_ARG;
+    *out_index = NULL;
+    *out_index_count = 0;
+    *out_written = 0;
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (out_merge_ms) *out_merge_ms = 0.0;
+    int rc = posting_event_sorter_flush(sorter);
+    if (rc != EZDB_OK) return rc;
+    if (!sorter->run_count) return EZDB_OK;
+
+    double merge_start_ms = ezdb_now_ms();
+    PostingRunReader* readers = (PostingRunReader*)calloc(sorter->run_count, sizeof(PostingRunReader));
+    PostingHeapNode* heap = (PostingHeapNode*)malloc(sizeof(PostingHeapNode) * (size_t)sorter->run_count);
+    EzdbDiskIndex* indexes = NULL;
+    uint32_t index_count = 0;
+    uint32_t index_cap = 0;
+    uint32_t heap_count = 0;
+    uint32_t* ids = NULL;
+    uint32_t id_count = 0;
+    uint32_t id_cap = 0;
+    uint32_t current_key = 0;
+    int has_key = 0;
+    uint64_t last_value = UINT64_MAX;
+    uint64_t written = 0;
+    if (!readers || !heap) rc = EZDB_ERR_MEMORY;
+    for (uint32_t i = 0; rc == EZDB_OK && i < sorter->run_count; ++i) {
+        FILE* fp = fopen(sorter->run_paths[i], "rb");
+        if (!fp) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+        readers[i].fp = fp;
+        if (_fseeki64(fp, 0, SEEK_END) != 0) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+        __int64 size = _ftelli64(fp);
+        if (size < 0 || (size % (int)sizeof(uint64_t)) != 0 || _fseeki64(fp, 0, SEEK_SET) != 0) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+        readers[i].remaining = (uint64_t)size / sizeof(uint64_t);
+        uint64_t value = 0;
+        int n = posting_run_reader_next(&readers[i], &value);
+        if (n < 0) rc = EZDB_ERR_IO;
+        else if (n > 0) heap_push(heap, &heap_count, (PostingHeapNode){ value, i });
+    }
+
+    while (rc == EZDB_OK && heap_count) {
+        PostingHeapNode node = heap_pop(heap, &heap_count);
+        uint64_t value = node.value;
+        uint64_t next_value = 0;
+        int n = posting_run_reader_next(&readers[node.run_id], &next_value);
+        if (n < 0) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+        if (n > 0) heap_push(heap, &heap_count, (PostingHeapNode){ next_value, node.run_id });
+        if (value == last_value) continue;
+        last_value = value;
+        uint32_t key = (uint32_t)(value >> 32u);
+        uint32_t id = (uint32_t)value;
+        if (!has_key) {
+            current_key = key;
+            has_key = 1;
+        } else if (key != current_key) {
+            rc = write_posting_group(out, current_key, ids, id_count, universe_count, &indexes, &index_count, &index_cap, &written, stats);
+            if (rc != EZDB_OK) break;
+            current_key = key;
+            id_count = 0;
+        }
+        rc = append_u32(&ids, &id_count, &id_cap, id);
+    }
+    if (rc == EZDB_OK && has_key) {
+        rc = write_posting_group(out, current_key, ids, id_count, universe_count, &indexes, &index_count, &index_cap, &written, stats);
+    }
+    if (out_merge_ms) *out_merge_ms = ezdb_now_ms() - merge_start_ms;
+
+    for (uint32_t i = 0; i < sorter->run_count; ++i) {
+        if (readers && readers[i].fp) fclose(readers[i].fp);
+    }
+    free(readers);
+    free(heap);
+    free(ids);
+    if (rc != EZDB_OK) {
+        free(indexes);
+        return rc;
+    }
+    *out_index = indexes;
+    *out_index_count = index_count;
+    *out_written = written;
+    if (stats) stats->sort_ms = sorter->sort_ms;
+    return EZDB_OK;
+}
+
 static void page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
 {
     if (!cache) return;
@@ -2462,17 +3082,22 @@ static int append_entry_delta_disk(Ezdb* db, uint32_t archive_id, const EzdbEntr
     return rc;
 }
 
-static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_count, EzdbDiskIndex** out_index, uint32_t* out_index_count, uint64_t* out_written)
+static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_count,
+                          EzdbDiskIndex** out_index, uint32_t* out_index_count,
+                          uint64_t* out_written, PostingWriteStats* stats)
 {
     *out_index = NULL;
     *out_index_count = 0;
     *out_written = 0;
+    if (stats) memset(stats, 0, sizeof(*stats));
     if (!builder->entry_count) return EZDB_OK;
 
+    double stage_start_ms = ezdb_now_ms();
     PostingBuildEntry** sorted = (PostingBuildEntry**)malloc(sizeof(PostingBuildEntry*) * (size_t)builder->entry_count);
     if (!sorted) return EZDB_ERR_MEMORY;
     for (uint32_t i = 0; i < builder->entry_count; ++i) sorted[i] = &builder->entries[i];
     qsort(sorted, builder->entry_count, sizeof(PostingBuildEntry*), posting_entry_key_compare);
+    if (stats) stats->sort_ms = ezdb_now_ms() - stage_start_ms;
 
     EzdbDiskIndex* indexes = NULL;
     uint32_t index_count = 0;
@@ -2488,10 +3113,14 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
         unsigned char* raw_payload = NULL;
         uint32_t raw_size = 0;
         int rc = EZDB_OK;
+        stage_start_ms = ezdb_now_ms();
         if (entry->fill_mode == EZDB_POSTING_BITSET) {
             type = EZDB_POSTING_BITSET;
             encoded_size = bitset_size;
             raw_size = entry->fill_bytes;
+            if (stats) stats->bitset_count += 1u;
+            if (stats) stats->choose_ms += ezdb_now_ms() - stage_start_ms;
+            stage_start_ms = ezdb_now_ms();
             raw_payload = (unsigned char*)malloc(raw_size ? raw_size : 1u);
             if (!raw_payload) {
                 free(sorted);
@@ -2499,6 +3128,7 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
                 return EZDB_ERR_MEMORY;
             }
             if (raw_size) memcpy(raw_payload, entry->ids, raw_size);
+            if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
         } else {
             uint32_t array_size = estimate_array_size(entry->ids, entry->count);
             uint32_t range_count = count_ranges(entry->ids, entry->count);
@@ -2512,7 +3142,15 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
                 type = EZDB_POSTING_BITSET;
                 encoded_size = bitset_size;
             }
+            if (stats) {
+                if (type == EZDB_POSTING_ARRAY) stats->array_count += 1u;
+                else if (type == EZDB_POSTING_RANGE) stats->range_count += 1u;
+                else if (type == EZDB_POSTING_BITSET) stats->bitset_count += 1u;
+                stats->choose_ms += ezdb_now_ms() - stage_start_ms;
+            }
+            stage_start_ms = ezdb_now_ms();
             rc = encode_posting_container(entry->ids, entry->count, universe_count, type, &raw_payload, &raw_size);
+            if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
         }
         if (rc != EZDB_OK) {
             free(sorted);
@@ -2523,7 +3161,14 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
         unsigned char* payload = NULL;
         uint32_t payload_size = 0;
         int compressed = 0;
+        stage_start_ms = ezdb_now_ms();
         rc = maybe_compress_payload(raw_payload, raw_size, &payload, &payload_size, &compressed);
+        if (stats) {
+            stats->compress_ms += ezdb_now_ms() - stage_start_ms;
+            stats->raw_bytes += raw_size;
+            stats->encoded_bytes += payload_size;
+            if (compressed) stats->compressed_count += 1u;
+        }
         free(raw_payload);
         if (rc != EZDB_OK) {
             free(sorted);
@@ -2532,7 +3177,9 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
         }
 
         uint64_t local_offset = written;
+        stage_start_ms = ezdb_now_ms();
         rc = write_bytes(out, payload, payload_size, &written);
+        if (stats) stats->fwrite_ms += ezdb_now_ms() - stage_start_ms;
         free(payload);
         if (rc != EZDB_OK) {
             free(sorted);
@@ -2545,6 +3192,7 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
             free(indexes);
             return EZDB_ERR_MEMORY;
         }
+        stage_start_ms = ezdb_now_ms();
         indexes[index_count].key = entry->key;
         indexes[index_count].count = entry->count;
         indexes[index_count].container_type = type | (compressed ? EZDB_POSTING_COMPRESSED : 0u);
@@ -2552,6 +3200,7 @@ static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_
         indexes[index_count].raw_size = raw_size;
         indexes[index_count].offset = local_offset;
         ++index_count;
+        if (stats) stats->index_meta_ms += ezdb_now_ms() - stage_start_ms;
     }
     free(sorted);
     *out_index = indexes;
@@ -3556,26 +4205,70 @@ static int ezdb_write_entries_from_source(FILE* out,
                                           EzdbEntrySource* source,
                                           uint32_t entry_count,
                                           uint32_t original_archive_count,
-                                          const uint32_t* original_to_final)
+                                          const uint32_t* original_to_final,
+                                          const EzdbBuildOptionsResolved* options)
 {
     if (!out || !header || (!source && entry_count)) return EZDB_ERR_ARG;
     int rc = EZDB_OK;
-    EzdbDiskEntry* disk_entries = NULL;
-    unsigned char* entry_core = NULL;
-    unsigned char* raw = NULL;
-    uint32_t raw_size = 0, raw_cap = 0;
-    PostingBuilder entry_builder;
-    int entry_builder_ready = 0;
+    char core_path[1200];
+    char detail_path[1200];
+    char raw_path[1200];
+    FILE* core_fp = NULL;
+    FILE* detail_fp = NULL;
+    FILE* raw_fp = NULL;
+    StreamPagedWriter detail_writer;
+    StreamPagedWriter raw_writer;
+    PostingEventSorter event_sorter;
+    int detail_writer_ready = 0;
+    int raw_writer_ready = 0;
+    int event_sorter_ready = 0;
     EzdbDiskIndex* entry_index = NULL;
     uint32_t entry_index_count = 0;
     uint64_t entry_postings_size = 0;
-    memset(&entry_builder, 0, sizeof(entry_builder));
-    if (entry_count) {
-        disk_entries = (EzdbDiskEntry*)calloc(entry_count, sizeof(EzdbDiskEntry));
-        entry_core = (unsigned char*)calloc((size_t)entry_count, EZDB_ENTRY_CORE_RECORD_SIZE);
-        if (!disk_entries || !entry_core) rc = EZDB_ERR_MEMORY;
+    double total_start_ms = ezdb_now_ms();
+    double stream_total_ms = 0.0;
+    double write_core_ms = 0.0;
+    double write_detail_ms = 0.0;
+    double write_raw_ms = 0.0;
+    double postings_build_ms = 0.0;
+    double write_postings_ms = 0.0;
+    double merge_ms = 0.0;
+    double write_index_ms = 0.0;
+    double finalize_ms = 0.0;
+    PostingWriteStats entry_posting_stats;
+    memset(&entry_posting_stats, 0, sizeof(entry_posting_stats));
+
+    if (!options) return EZDB_ERR_ARG;
+    memset(&detail_writer, 0, sizeof(detail_writer));
+    memset(&raw_writer, 0, sizeof(raw_writer));
+    memset(&event_sorter, 0, sizeof(event_sorter));
+    if (snprintf(core_path, sizeof(core_path), "%s\\entry_core.tmp", options->temp_dir) >= (int)sizeof(core_path) ||
+        snprintf(detail_path, sizeof(detail_path), "%s\\entry_detail.tmp", options->temp_dir) >= (int)sizeof(detail_path) ||
+        snprintf(raw_path, sizeof(raw_path), "%s\\entry_raw.tmp", options->temp_dir) >= (int)sizeof(raw_path)) {
+        return EZDB_ERR_ARG;
+    }
+    if (rc == EZDB_OK) rc = ensure_directory_exists(options->temp_dir);
+    if (rc == EZDB_OK) {
+        core_fp = fopen(core_path, "wb");
+        detail_fp = fopen(detail_path, "wb");
+        raw_fp = fopen(raw_path, "wb");
+        if (!core_fp || !detail_fp || !raw_fp) rc = EZDB_ERR_IO;
+    }
+    if (rc == EZDB_OK) {
+        rc = stream_paged_writer_init(&detail_writer, detail_fp, sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE);
+        if (rc == EZDB_OK) detail_writer_ready = 1;
+    }
+    if (rc == EZDB_OK) {
+        rc = stream_paged_writer_init(&raw_writer, raw_fp, EZDB_RAW_BLOB_PAGE_SIZE);
+        if (rc == EZDB_OK) raw_writer_ready = 1;
+    }
+    if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
+        rc = posting_event_sorter_init(&event_sorter, options);
+        if (rc == EZDB_OK) event_sorter_ready = 1;
     }
     if (rc == EZDB_OK && source && source->reset) rc = source->reset(source->user_data);
+
+    double stage_start_ms = ezdb_now_ms();
     for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
         EzdbEntryRecord record;
         memset(&record, 0, sizeof(record));
@@ -3592,117 +4285,136 @@ static int ezdb_write_entries_from_source(FILE* out,
             break;
         }
         uint32_t path_len = (uint32_t)strlen(record.entry_path);
-        uint32_t path_offset = 0;
-        rc = append_blob(&raw, &raw_size, &raw_cap, record.entry_path, path_len, 1u, &path_offset);
-        if (rc != EZDB_OK) break;
-        disk_entries[i].archive_id = final_archive_id;
-        disk_entries[i].entry_path_offset = path_offset;
-        disk_entries[i].entry_path_len = path_len;
-        disk_entries[i].compressed_size = record.compressed_size;
-        disk_entries[i].original_size = record.original_size;
-        disk_entries[i].modified_time = record.modified_time;
-        if (record.entry_raw_path && record.entry_raw_path_len) {
-            uint32_t raw_offset = 0;
-            rc = append_blob(&raw, &raw_size, &raw_cap, record.entry_raw_path, record.entry_raw_path_len, 0u, &raw_offset);
-            if (rc != EZDB_OK) break;
-            disk_entries[i].raw_offset = raw_offset;
-            disk_entries[i].raw_len = record.entry_raw_path_len;
+        if (raw_writer.raw_size > UINT32_MAX || raw_writer.raw_size + path_len + 1u > UINT32_MAX) {
+            rc = EZDB_ERR_MEMORY;
+            break;
         }
-        unsigned char* p = entry_core + (size_t)i * EZDB_ENTRY_CORE_RECORD_SIZE;
-        p[0] = (unsigned char)(disk_entries[i].archive_id & 0xffu);
-        p[1] = (unsigned char)((disk_entries[i].archive_id >> 8) & 0xffu);
-        p[2] = (unsigned char)((disk_entries[i].archive_id >> 16) & 0xffu);
-        p[3] = (unsigned char)((disk_entries[i].archive_id >> 24) & 0xffu);
-        p[4] = (unsigned char)(disk_entries[i].entry_path_offset & 0xffu);
-        p[5] = (unsigned char)((disk_entries[i].entry_path_offset >> 8) & 0xffu);
-        p[6] = (unsigned char)((disk_entries[i].entry_path_offset >> 16) & 0xffu);
-        p[7] = (unsigned char)((disk_entries[i].entry_path_offset >> 24) & 0xffu);
-        p[8] = (unsigned char)(disk_entries[i].entry_path_len & 0xffu);
-        p[9] = (unsigned char)((disk_entries[i].entry_path_len >> 8) & 0xffu);
-        p[10] = (unsigned char)((disk_entries[i].entry_path_len >> 16) & 0xffu);
-        p[11] = (unsigned char)((disk_entries[i].entry_path_len >> 24) & 0xffu);
+        uint32_t path_offset = (uint32_t)raw_writer.raw_size;
+        rc = stream_paged_writer_write(&raw_writer, record.entry_path, path_len);
+        if (rc == EZDB_OK) {
+            unsigned char zero = 0;
+            rc = stream_paged_writer_write(&raw_writer, &zero, 1u);
+        }
+        if (rc != EZDB_OK) break;
+        EzdbDiskEntry disk_entry;
+        memset(&disk_entry, 0, sizeof(disk_entry));
+        disk_entry.archive_id = final_archive_id;
+        disk_entry.entry_path_offset = path_offset;
+        disk_entry.entry_path_len = path_len;
+        disk_entry.compressed_size = record.compressed_size;
+        disk_entry.original_size = record.original_size;
+        disk_entry.modified_time = record.modified_time;
+        if (record.entry_raw_path && record.entry_raw_path_len) {
+            if (raw_writer.raw_size > UINT32_MAX || raw_writer.raw_size + record.entry_raw_path_len > UINT32_MAX) {
+                rc = EZDB_ERR_MEMORY;
+                break;
+            }
+            disk_entry.raw_offset = (uint32_t)raw_writer.raw_size;
+            disk_entry.raw_len = record.entry_raw_path_len;
+            rc = stream_paged_writer_write(&raw_writer, record.entry_raw_path, record.entry_raw_path_len);
+            if (rc != EZDB_OK) break;
+        }
+        rc = stream_paged_writer_write(&detail_writer, &disk_entry, sizeof(disk_entry));
+        if (rc != EZDB_OK) break;
+
+        unsigned char core[EZDB_ENTRY_CORE_RECORD_SIZE];
+        core[0] = (unsigned char)(disk_entry.archive_id & 0xffu);
+        core[1] = (unsigned char)((disk_entry.archive_id >> 8) & 0xffu);
+        core[2] = (unsigned char)((disk_entry.archive_id >> 16) & 0xffu);
+        core[3] = (unsigned char)((disk_entry.archive_id >> 24) & 0xffu);
+        core[4] = (unsigned char)(disk_entry.entry_path_offset & 0xffu);
+        core[5] = (unsigned char)((disk_entry.entry_path_offset >> 8) & 0xffu);
+        core[6] = (unsigned char)((disk_entry.entry_path_offset >> 16) & 0xffu);
+        core[7] = (unsigned char)((disk_entry.entry_path_offset >> 24) & 0xffu);
+        core[8] = (unsigned char)(disk_entry.entry_path_len & 0xffu);
+        core[9] = (unsigned char)((disk_entry.entry_path_len >> 8) & 0xffu);
+        core[10] = (unsigned char)((disk_entry.entry_path_len >> 16) & 0xffu);
+        core[11] = (unsigned char)((disk_entry.entry_path_len >> 24) & 0xffu);
+        if (fwrite(core, 1, sizeof(core), core_fp) != sizeof(core)) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+
+        if (event_sorter_ready) {
+            PostingEventEmitContext emit_ctx;
+            GramKeyCallback callback;
+            emit_ctx.sorter = &event_sorter;
+            emit_ctx.entry_id = i;
+            callback.emit = emit_gram_event;
+            callback.user_data = &emit_ctx;
+            rc = enumerate_text_gram_keys(record.entry_path, &callback);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    stream_total_ms = ezdb_now_ms() - stage_start_ms;
+    if (rc == EZDB_OK) {
+        if (stream_paged_writer_finish(&detail_writer) != EZDB_OK) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK && stream_paged_writer_finish(&raw_writer) != EZDB_OK) rc = EZDB_ERR_IO;
+        if (core_fp && fclose(core_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+        core_fp = NULL;
+        if (detail_fp && fclose(detail_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+        detail_fp = NULL;
+        if (raw_fp && fclose(raw_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+        raw_fp = NULL;
     }
 
     if (rc == EZDB_OK) {
+        stage_start_ms = ezdb_now_ms();
         header->entry_records_offset = (uint64_t)ftell(out);
         header->entry_records_raw_size = EZDB_ENTRY_CORE_RECORD_SIZE * (uint64_t)entry_count;
         uint64_t written = 0;
-        rc = write_compressed_section(out, entry_core, header->entry_records_raw_size, &written, &header->entry_records_flags);
+        header->entry_records_flags = 0;
+        rc = copy_file_payload(out, core_path, &written);
         header->entry_records_size = written;
-        free(entry_core);
-        entry_core = NULL;
+        write_core_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
-        EzdbDiskPage* detail_pages = NULL;
-        uint32_t detail_page_count = 0;
+        stage_start_ms = ezdb_now_ms();
         uint64_t detail_written = 0;
         header->entry_detail_offset = (uint64_t)ftell(out);
-        rc = write_paged_section(out,
-                                 (const unsigned char*)disk_entries,
-                                 sizeof(EzdbDiskEntry) * (uint64_t)entry_count,
-                                 sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE,
-                                 &detail_pages,
-                                 &detail_page_count,
-                                 &detail_written);
+        rc = copy_file_payload(out, detail_path, &detail_written);
         header->entry_detail_size = detail_written;
         header->entry_detail_index_offset = (uint64_t)ftell(out);
-        header->entry_detail_page_count = detail_page_count;
+        header->entry_detail_page_count = detail_writer.page_count;
         header->entry_page_size = EZDB_ENTRY_PAGE_SIZE;
-        if (rc == EZDB_OK && detail_page_count &&
-            fwrite(detail_pages, sizeof(EzdbDiskPage), detail_page_count, out) != detail_page_count) rc = EZDB_ERR_IO;
-        free(detail_pages);
+        if (rc == EZDB_OK && detail_writer.page_count &&
+            fwrite(detail_writer.pages, sizeof(EzdbDiskPage), detail_writer.page_count, out) != detail_writer.page_count) rc = EZDB_ERR_IO;
+        write_detail_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
-        EzdbDiskPage* raw_pages = NULL;
-        uint32_t raw_page_count = 0;
+        stage_start_ms = ezdb_now_ms();
         uint64_t raw_written = 0;
         header->raw_blob_offset = (uint64_t)ftell(out);
-        header->raw_blob_raw_size = raw_size;
-        rc = write_paged_section(out,
-                                 raw,
-                                 raw_size,
-                                 EZDB_RAW_BLOB_PAGE_SIZE,
-                                 &raw_pages,
-                                 &raw_page_count,
-                                 &raw_written);
+        header->raw_blob_raw_size = raw_writer.raw_size;
+        rc = copy_file_payload(out, raw_path, &raw_written);
         header->raw_blob_size = raw_written;
         header->raw_blob_index_offset = (uint64_t)ftell(out);
-        header->raw_blob_page_count = raw_page_count;
+        header->raw_blob_page_count = raw_writer.page_count;
         header->raw_blob_page_size = EZDB_RAW_BLOB_PAGE_SIZE;
-        if (rc == EZDB_OK && raw_page_count &&
-            fwrite(raw_pages, sizeof(EzdbDiskPage), raw_page_count, out) != raw_page_count) rc = EZDB_ERR_IO;
-        free(raw_pages);
+        if (rc == EZDB_OK && raw_writer.page_count &&
+            fwrite(raw_writer.pages, sizeof(EzdbDiskPage), raw_writer.page_count, out) != raw_writer.page_count) rc = EZDB_ERR_IO;
+        write_raw_ms = ezdb_now_ms() - stage_start_ms;
     }
-    if (rc == EZDB_OK && entry_count) {
-        rc = posting_builder_init(&entry_builder, 262144u);
-        if (rc == EZDB_OK) entry_builder_ready = 1;
-    }
-    if (rc == EZDB_OK && entry_count) {
-        for (uint32_t i = 0; i < entry_count; ++i) {
-            rc = count_text_grams(&entry_builder, (const char*)(raw + disk_entries[i].entry_path_offset), i);
-            if (rc != EZDB_OK) break;
-        }
-    }
-    if (rc == EZDB_OK && entry_count) rc = posting_builder_prepare_fill_adaptive(&entry_builder, entry_count);
-    if (rc == EZDB_OK && entry_count) {
-        for (uint32_t i = 0; i < entry_count; ++i) {
-            rc = fill_text_grams(&entry_builder, (const char*)(raw + disk_entries[i].entry_path_offset), i);
-            if (rc != EZDB_OK) break;
-        }
-    }
-    if (rc == EZDB_OK && entry_count) {
+    postings_build_ms = event_sorter_ready ? stream_total_ms : 0.0;
+    if (rc == EZDB_OK && entry_count && event_sorter_ready) {
+        stage_start_ms = ezdb_now_ms();
         uint64_t entry_postings_start = (uint64_t)ftell(out);
-        rc = write_postings(out, &entry_builder, entry_count, &entry_index, &entry_index_count, &entry_postings_size);
+        rc = posting_event_sorter_write_postings(&event_sorter, out, entry_count, &entry_index, &entry_index_count,
+                                                 &entry_postings_size, &entry_posting_stats, &merge_ms);
+        write_postings_ms = ezdb_now_ms() - stage_start_ms;
         if (rc == EZDB_OK) {
+            stage_start_ms = ezdb_now_ms();
             uint64_t relative = entry_postings_start - header->postings_offset;
             for (uint32_t i = 0; i < entry_index_count; ++i) entry_index[i].offset += relative;
             header->entry_index_offset = (uint64_t)ftell(out);
             header->entry_index_count = entry_index_count;
             header->entry_postings_size = entry_postings_size;
             if (entry_index_count && fwrite(entry_index, sizeof(EzdbDiskIndex), entry_index_count, out) != entry_index_count) rc = EZDB_ERR_IO;
+            write_index_ms = ezdb_now_ms() - stage_start_ms;
         }
     }
     if (rc == EZDB_OK) {
+        stage_start_ms = ezdb_now_ms();
         header->entry_count = entry_count;
         header->active_entry_count = entry_count;
         header->base_entry_count = entry_count;
@@ -3710,12 +4422,57 @@ static int ezdb_write_entries_from_source(FILE* out,
         header->reserved_size = 0;
         header->delta_offset = header->reserved_offset;
         header->delta_size = 0;
+        finalize_ms = ezdb_now_ms() - stage_start_ms;
     }
-    if (entry_builder_ready) posting_builder_free(&entry_builder);
+    if (rc == EZDB_OK) {
+        double total_ms = ezdb_now_ms() - total_start_ms;
+        printf("entry_collect_seconds: %.3f\n", stream_total_ms / 1000.0);
+        printf("stream_entry_core_seconds: %.3f\n", write_core_ms / 1000.0);
+        printf("stream_entry_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
+        printf("stream_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
+        printf("stream_postings_build_seconds: %.3f\n", postings_build_ms / 1000.0);
+        printf("entry_write_core_seconds: %.3f\n", write_core_ms / 1000.0);
+        printf("entry_write_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
+        printf("entry_write_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
+        printf("entry_index_count_seconds: %.3f\n", 0.0);
+        printf("entry_index_prepare_seconds: %.3f\n", 0.0);
+        printf("entry_index_fill_seconds: %.3f\n", 0.0);
+        printf("entry_write_postings_seconds: %.3f\n", write_postings_ms / 1000.0);
+        printf("spool_event_bytes_mb: %.2f\n", (double)event_sorter.event_bytes / 1024.0 / 1024.0);
+        printf("spool_sort_seconds: %.3f\n", entry_posting_stats.sort_ms / 1000.0);
+        printf("spool_merge_seconds: %.3f\n", merge_ms / 1000.0);
+        printf("stream_peak_memory_mb: %.2f\n", ezdb_peak_working_set_mb());
+        printf("entry_postings_sort_seconds: %.3f\n", entry_posting_stats.sort_ms / 1000.0);
+        printf("entry_postings_choose_seconds: %.3f\n", entry_posting_stats.choose_ms / 1000.0);
+        printf("entry_postings_encode_seconds: %.3f\n", entry_posting_stats.encode_ms / 1000.0);
+        printf("entry_postings_compress_seconds: %.3f\n", entry_posting_stats.compress_ms / 1000.0);
+        printf("entry_postings_fwrite_seconds: %.3f\n", entry_posting_stats.fwrite_ms / 1000.0);
+        printf("entry_postings_index_meta_seconds: %.3f\n", entry_posting_stats.index_meta_ms / 1000.0);
+        printf("entry_write_index_seconds: %.3f\n", write_index_ms / 1000.0);
+        printf("entry_finalize_seconds: %.3f\n", finalize_ms / 1000.0);
+        printf("entry_total_seconds: %.3f\n", total_ms / 1000.0);
+        printf("entry_raw_blob_mb: %.2f\n", (double)raw_writer.raw_size / 1024.0 / 1024.0);
+        printf("entry_records_mb: %.2f\n", (double)header->entry_records_size / 1024.0 / 1024.0);
+        printf("entry_detail_mb: %.2f\n", (double)header->entry_detail_size / 1024.0 / 1024.0);
+        printf("entry_postings_mb: %.2f\n", (double)entry_postings_size / 1024.0 / 1024.0);
+        printf("entry_index_count: %u\n", entry_index_count);
+        printf("entry_postings_raw_mb: %.2f\n", (double)entry_posting_stats.raw_bytes / 1024.0 / 1024.0);
+        printf("entry_postings_encoded_mb: %.2f\n", (double)entry_posting_stats.encoded_bytes / 1024.0 / 1024.0);
+        printf("entry_postings_array_count: %u\n", entry_posting_stats.array_count);
+        printf("entry_postings_range_count: %u\n", entry_posting_stats.range_count);
+        printf("entry_postings_bitset_count: %u\n", entry_posting_stats.bitset_count);
+        printf("entry_postings_compressed_count: %u\n", entry_posting_stats.compressed_count);
+    }
+    if (core_fp) fclose(core_fp);
+    if (detail_fp) fclose(detail_fp);
+    if (raw_fp) fclose(raw_fp);
     free(entry_index);
-    free(entry_core);
-    free(disk_entries);
-    free(raw);
+    if (event_sorter_ready) posting_event_sorter_free(&event_sorter);
+    if (detail_writer_ready) stream_paged_writer_free(&detail_writer);
+    if (raw_writer_ready) stream_paged_writer_free(&raw_writer);
+    remove(core_path);
+    remove(detail_path);
+    remove(raw_path);
     return rc;
 }
 
@@ -3724,7 +4481,8 @@ static int ezdb_write_entries(FILE* out,
                               const EzdbEntryRecord* entries,
                               uint32_t entry_count,
                               uint32_t original_archive_count,
-                              const uint32_t* original_to_final)
+                              const uint32_t* original_to_final,
+                              const EzdbBuildOptionsResolved* options)
 {
     if ((!entries && entry_count)) return EZDB_ERR_ARG;
     EzdbArrayEntrySource array_source;
@@ -3736,7 +4494,7 @@ static int ezdb_write_entries(FILE* out,
     source.user_data = &array_source;
     source.reset = array_entry_source_reset;
     source.next = array_entry_source_next;
-    return ezdb_write_entries_from_source(out, header, &source, entry_count, original_archive_count, original_to_final);
+    return ezdb_write_entries_from_source(out, header, &source, entry_count, original_archive_count, original_to_final, options);
 }
 
 static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
@@ -3745,7 +4503,8 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
                                    uint32_t entry_count,
                                    const char* output_ezdb,
                                    uint32_t* original_to_final,
-                                   EzdbEntrySource* entry_source)
+                                   EzdbEntrySource* entry_source,
+                                   const EzdbBuildOptionsResolved* options)
 {
     if ((!archives && archive_count) || (!entries && !entry_source && entry_count) || !output_ezdb) return EZDB_ERR_ARG;
     double total_start_ms = ezdb_now_ms();
@@ -3951,7 +4710,7 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = write_postings(out, &file_builder, file_count, &file_index, &file_index_count, &file_postings_size);
+            if (rc == EZDB_OK) rc = write_postings(out, &file_builder, file_count, &file_index, &file_index_count, &file_postings_size, NULL);
             if (rc == EZDB_OK) file_index_ms = ezdb_now_ms() - stage_start_ms;
             if (file_builder_ready) {
                 posting_builder_free(&file_builder);
@@ -3975,7 +4734,7 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = write_postings(out, &dir_builder, dir_count, &dir_index, &dir_index_count, &dir_postings_size);
+            if (rc == EZDB_OK) rc = write_postings(out, &dir_builder, dir_count, &dir_index, &dir_index_count, &dir_postings_size, NULL);
             if (rc == EZDB_OK) dir_index_ms = ezdb_now_ms() - stage_start_ms;
             if (dir_builder_ready) {
                 posting_builder_free(&dir_builder);
@@ -3994,9 +4753,9 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
 
             if (rc == EZDB_OK) {
                 if (entry_source) {
-                    rc = ezdb_write_entries_from_source(out, &header, entry_source, entry_count, archive_count, original_to_final);
+                    rc = ezdb_write_entries_from_source(out, &header, entry_source, entry_count, archive_count, original_to_final, options);
                 } else {
-                    rc = ezdb_write_entries(out, &header, entries, entry_count, archive_count, original_to_final);
+                    rc = ezdb_write_entries(out, &header, entries, entry_count, archive_count, original_to_final, options);
                 }
             }
             if (rc == EZDB_OK && (fseek(out, 0, SEEK_SET) != 0 || fwrite(&header, sizeof(header), 1, out) != 1)) rc = EZDB_ERR_IO;
@@ -4019,12 +4778,12 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
     if (dir_builder_ready) posting_builder_free(&dir_builder);
     if (rc == EZDB_OK) {
         double total_ms = ezdb_now_ms() - total_start_ms;
-        printf("build_build_tree_ms: %.2f\n", build_tree_ms);
-        printf("build_dfs_ms: %.2f\n", dfs_ms);
-        printf("build_write_base_ms: %.2f\n", write_base_ms);
-        printf("build_file_index_ms: %.2f\n", file_index_ms);
-        printf("build_dir_index_ms: %.2f\n", dir_index_ms);
-        printf("build_internal_total_ms: %.2f\n", total_ms);
+        printf("build_build_tree_seconds: %.3f\n", build_tree_ms / 1000.0);
+        printf("build_dfs_seconds: %.3f\n", dfs_ms / 1000.0);
+        printf("build_write_base_seconds: %.3f\n", write_base_ms / 1000.0);
+        printf("build_file_index_seconds: %.3f\n", file_index_ms / 1000.0);
+        printf("build_dir_index_seconds: %.3f\n", dir_index_ms / 1000.0);
+        printf("build_internal_total_seconds: %.3f\n", total_ms / 1000.0);
     }
     return rc;
 }
@@ -4157,7 +4916,9 @@ int ezdb_build_snapshot(const EzdbArchiveRecord* archives,
             for (uint32_t i = 0; i < archive_count; ++i) archive_id_map[i] = UINT32_MAX;
         }
     }
-    if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, entries, entry_count, output_ezdb, archive_id_map, NULL);
+    EzdbBuildOptionsResolved options;
+    if (rc == EZDB_OK) rc = resolve_build_options(output_ezdb, NULL, &options);
+    if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, entries, entry_count, output_ezdb, archive_id_map, NULL, &options);
     free(archive_id_map);
     if (rc != EZDB_OK) remove(output_ezdb);
     return rc;
@@ -4169,10 +4930,22 @@ int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
                                        uint32_t entry_count,
                                        const char* output_ezdb)
 {
+    return ezdb_build_snapshot_stream_entries_ex(archives, archive_count, entry_stream, entry_count, output_ezdb, NULL);
+}
+
+int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
+                                          uint32_t archive_count,
+                                          EzdbEntryStream* entry_stream,
+                                          uint32_t entry_count,
+                                          const char* output_ezdb,
+                                          const EzdbBuildOptions* build_options)
+{
     if ((!archives && archive_count) || (!entry_stream && entry_count) || !output_ezdb) return EZDB_ERR_ARG;
     if (entry_count && !entry_stream->next) return EZDB_ERR_ARG;
     int rc = EZDB_OK;
     uint32_t* archive_id_map = NULL;
+    EzdbBuildOptionsResolved options;
+    rc = resolve_build_options(output_ezdb, build_options, &options);
     if (archive_count) {
         archive_id_map = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(archive_count ? archive_count : 1u));
         if (!archive_id_map) {
@@ -4188,7 +4961,7 @@ int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
         source.reset = entry_stream->reset;
         source.next = entry_stream->next;
     }
-    if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, NULL, entry_count, output_ezdb, archive_id_map, entry_count ? &source : NULL);
+    if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, NULL, entry_count, output_ezdb, archive_id_map, entry_count ? &source : NULL, &options);
     free(archive_id_map);
     if (rc != EZDB_OK) remove(output_ezdb);
     return rc;
@@ -5921,7 +6694,11 @@ int ezdb_compact(Ezdb* db)
     if (rc == EZDB_OK) {
         sprintf(tmp_path, "%s.compact.tmp", db->path);
         remove(tmp_path);
-        rc = ezdb_write_archive_base(archives, out_archive_count, NULL, active_entries, tmp_path, archive_id_map, active_entries ? &source : NULL);
+        EzdbBuildOptionsResolved options;
+        rc = resolve_build_options(tmp_path, NULL, &options);
+        if (rc == EZDB_OK) {
+            rc = ezdb_write_archive_base(archives, out_archive_count, NULL, active_entries, tmp_path, archive_id_map, active_entries ? &source : NULL, &options);
+        }
     }
     compact_entry_source_clear_current(&compact_source);
     if (rc == EZDB_OK) {

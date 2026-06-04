@@ -40,6 +40,17 @@ typedef struct EzdbEntryStream {
     int (*next)(void* user_data, EzdbEntryRecord* out_record);
 } EzdbEntryStream;
 
+#define EZDB_BUILD_ENTRY_INDEX 0x01u
+#define EZDB_BUILD_POSTING_COMPRESSION 0x02u
+#define EZDB_BUILD_DEFAULT_FLAGS (EZDB_BUILD_ENTRY_INDEX | EZDB_BUILD_POSTING_COMPRESSION)
+
+typedef struct EzdbBuildOptions {
+    const char* temp_dir;
+    uint32_t memory_limit_mb;
+    uint32_t flags;
+    uint32_t log_level;
+} EzdbBuildOptions;
+
 typedef struct EzdbSearchResult {
     uint32_t id;
     char* path;
@@ -143,6 +154,12 @@ int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
                                        EzdbEntryStream* entry_stream,
                                        uint32_t entry_count,
                                        const char* output_ezdb);
+int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
+                                          uint32_t archive_count,
+                                          EzdbEntryStream* entry_stream,
+                                          uint32_t entry_count,
+                                          const char* output_ezdb,
+                                          const EzdbBuildOptions* options);
 int ezdb_open(const char* path, Ezdb** out_db);
 void ezdb_close(Ezdb* db);
 
