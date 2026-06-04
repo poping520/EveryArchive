@@ -88,7 +88,7 @@ static int RunStoreCase(const wchar_t* name, std::unique_ptr<IndexStore> store)
     if (store->GetArchiveCount() != 1) return Fail("archive count mismatch");
     if (store->GetEntryCount(L"file") != 1) return Fail("entry count mismatch");
 
-    if (std::wstring(name).find(L".ezdb") != std::wstring::npos) {
+    {
         ArchiveEntry_t txnEntryA = entry;
         txnEntryA.entryPathUtf8 = "folder/txn_a.txt";
         ArchiveEntry_t txnEntryB = entry;

@@ -163,7 +163,8 @@ bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, st
     }
     if (entries.empty()) return true;
 
-    if (!BeginTransaction())
+    const bool ownsTransaction = sqlite3_get_autocommit(db_) != 0;
+    if (ownsTransaction && !BeginTransaction())
     {
         if (err) *err = L"BeginTransaction failed";
         return false;
@@ -177,7 +178,7 @@ bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, st
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK || !stmt)
     {
-        RollbackTransaction();
+        if (ownsTransaction) RollbackTransaction();
         if (err)
         {
             const char* em = sqlite3_errmsg(db_);
@@ -192,7 +193,7 @@ bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, st
         if (e.entryPathUtf8.empty())
         {
             sqlite3_finalize(stmt);
-            RollbackTransaction();
+            if (ownsTransaction) RollbackTransaction();
             if (err) *err = L"entry_path is empty";
             return false;
         }
@@ -218,7 +219,7 @@ bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, st
                 *err = em ? Utf8ToWString(em) : L"step failed";
             }
             sqlite3_finalize(stmt);
-            RollbackTransaction();
+            if (ownsTransaction) RollbackTransaction();
             return false;
         }
         sqlite3_reset(stmt);
@@ -226,7 +227,7 @@ bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, st
 
     sqlite3_finalize(stmt);
 
-    if (!CommitTransaction())
+    if (ownsTransaction && !CommitTransaction())
     {
         RollbackTransaction();
         if (err) *err = L"CommitTransaction failed";
