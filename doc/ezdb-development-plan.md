@@ -393,7 +393,6 @@ EveryZip 的解析流程使用 parser `ForEachEntry` 回调边解析边攒小批
 ```text
 EzdbBench build <input.txt> <output.ezdb>
 EzdbBench build-archives <input.tsv> <output.ezdb>
-EzdbBench import-sqlite <everyzip.db> <output.ezdb>
 EzdbBench info <db.ezdb>
 EzdbBench get <db.ezdb> <id>
 EzdbBench get-archive <db.ezdb> <id>
@@ -565,7 +564,7 @@ python tools\ezdb_query_syntax_tests.py --bench cmake-build-codex-release\tools\
 | index section | 114,816 bytes / 0.11 MB |
 | postings section | 1,372,090 bytes / 1.31 MB |
 
-导入阶段 `EzdbBench import-sqlite` 仍一次性加载 SQLite 数据，实测峰值 working set 为 3,688.33 MB；这是导入工具路径的构建峰值，不是运行时打开后的常驻内存。
+旧 SQLite 对照数据不再通过 `EzdbBench` 直接导入；archives + entries 性能验证统一使用合并 TSV 样本。
 
 抽测查询：
 

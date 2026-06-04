@@ -1,5 +1,4 @@
 #include "../src/ezdb/ezdb.h"
-#include "../external/sqlite/sqlite3.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -33,7 +32,6 @@ static void print_usage(void)
     printf("Usage:\n");
     printf("  EzdbBench build <input.txt> <output.ezdb>\n");
     printf("  EzdbBench build-archives <input.tsv> <output.ezdb>\n");
-    printf("  EzdbBench import-sqlite <everyzip.db> <output.ezdb>\n");
     printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
     printf("  EzdbBench info <db.ezdb>\n");
     printf("  EzdbBench get <db.ezdb> <id>\n");
@@ -850,16 +848,6 @@ static int run_delete_once(Ezdb* db, uint32_t id, const char* memory_prefix)
     return 0;
 }
 
-static void free_import_data(EzdbArchiveRecord* archives, uint32_t archive_count)
-{
-    if (archives) {
-        for (uint32_t i = 0; i < archive_count; ++i) free((void*)archives[i].file_path);
-    }
-    free(archives);
-}
-
-
-
 /* --- Combined TSV loading --- */
 
 typedef struct LoadedEntry {
@@ -1207,169 +1195,6 @@ static int run_live_entry_append_batch(const char* combined_tsv, const char* out
     return rc == 0 ? 0 : 2;
 }
 
-typedef struct SqliteEntryStream {
-    sqlite3* db;
-    sqlite3_stmt* stmt;
-    uint32_t* id_map;
-    int max_archive_id;
-    const char* sql;
-} SqliteEntryStream;
-
-static int sqlite_entry_stream_reset(void* user_data)
-{
-    SqliteEntryStream* stream = (SqliteEntryStream*)user_data;
-    if (!stream || !stream->db || !stream->sql) return -1;
-    if (stream->stmt) {
-        sqlite3_finalize(stream->stmt);
-        stream->stmt = NULL;
-    }
-    return sqlite3_prepare_v2(stream->db, stream->sql, -1, &stream->stmt, NULL) == SQLITE_OK ? 0 : -1;
-}
-
-static int sqlite_entry_stream_next(void* user_data, EzdbEntryRecord* out_record)
-{
-    SqliteEntryStream* stream = (SqliteEntryStream*)user_data;
-    if (!stream || !stream->stmt || !out_record) return -1;
-    int rc = sqlite3_step(stream->stmt);
-    if (rc != SQLITE_ROW) return -1;
-
-    int sqlite_archive_id = sqlite3_column_int(stream->stmt, 0);
-    const unsigned char* entry_path = sqlite3_column_text(stream->stmt, 1);
-    if (sqlite_archive_id < 0 || sqlite_archive_id > stream->max_archive_id ||
-        stream->id_map[sqlite_archive_id] == UINT32_MAX || !entry_path) {
-        return -1;
-    }
-
-    memset(out_record, 0, sizeof(*out_record));
-    out_record->archive_id = stream->id_map[sqlite_archive_id];
-    out_record->entry_path = (const char*)entry_path;
-    const void* raw = sqlite3_column_blob(stream->stmt, 2);
-    int raw_len = sqlite3_column_bytes(stream->stmt, 2);
-    if (raw && raw_len > 0) {
-        out_record->entry_raw_path = raw;
-        out_record->entry_raw_path_len = (uint32_t)raw_len;
-    }
-    out_record->compressed_size = (int64_t)sqlite3_column_int64(stream->stmt, 3);
-    out_record->original_size = (uint64_t)sqlite3_column_int64(stream->stmt, 4);
-    out_record->modified_time = (uint64_t)sqlite3_column_int64(stream->stmt, 5);
-    return 0;
-}
-
-static int run_import_sqlite(const char* sqlite_path, const char* output_ezdb)
-{
-    sqlite3* sdb = NULL;
-    sqlite3_stmt* stmt = NULL;
-    EzdbArchiveRecord* archives = NULL;
-    uint32_t archive_count = 0, entry_count = 0;
-    uint32_t* id_map = NULL;
-    int max_archive_id = 0;
-    int rc = sqlite3_open_v2(sqlite_path, &sdb, SQLITE_OPEN_READONLY, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "sqlite open failed: %s\n", sdb ? sqlite3_errmsg(sdb) : sqlite_path);
-        if (sdb) sqlite3_close(sdb);
-        return 2;
-    }
-
-    double start = now_ms();
-    rc = sqlite3_prepare_v2(sdb, "SELECT COUNT(*), COALESCE(MAX(id),0) FROM archives", -1, &stmt, NULL);
-    if (rc != SQLITE_OK || sqlite3_step(stmt) != SQLITE_ROW) goto sqlite_fail;
-    archive_count = (uint32_t)sqlite3_column_int64(stmt, 0);
-    max_archive_id = sqlite3_column_int(stmt, 1);
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-
-    rc = sqlite3_prepare_v2(sdb, "SELECT COUNT(*) FROM entries", -1, &stmt, NULL);
-    if (rc != SQLITE_OK || sqlite3_step(stmt) != SQLITE_ROW) goto sqlite_fail;
-    entry_count = (uint32_t)sqlite3_column_int64(stmt, 0);
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-
-    archives = (EzdbArchiveRecord*)calloc(archive_count ? archive_count : 1u, sizeof(EzdbArchiveRecord));
-    id_map = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(max_archive_id + 1));
-    if (!archives || !id_map) {
-        fprintf(stderr, "out of memory\n");
-        sqlite3_close(sdb);
-        free(id_map);
-        free_import_data(archives, archive_count);
-        return 2;
-    }
-    for (int i = 0; i <= max_archive_id; ++i) id_map[i] = UINT32_MAX;
-
-    rc = sqlite3_prepare_v2(sdb,
-                            "SELECT id, drive_letter, file_ref_number, usn, file_path, file_size, modified_time FROM archives ORDER BY id",
-                            -1, &stmt, NULL);
-    if (rc != SQLITE_OK) goto sqlite_fail;
-    uint32_t ai = 0;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int sqlite_id = sqlite3_column_int(stmt, 0);
-        const unsigned char* drive = sqlite3_column_text(stmt, 1);
-        const unsigned char* path = sqlite3_column_text(stmt, 4);
-        if (ai >= archive_count || sqlite_id < 0 || sqlite_id > max_archive_id || !path) goto sqlite_fail;
-        id_map[sqlite_id] = ai;
-        archives[ai].drive_letter = drive && drive[0] ? (char)drive[0] : 0;
-        archives[ai].file_ref_number = (uint64_t)sqlite3_column_int64(stmt, 2);
-        archives[ai].usn = (int64_t)sqlite3_column_int64(stmt, 3);
-        archives[ai].file_path = _strdup((const char*)path);
-        archives[ai].file_size = (uint64_t)sqlite3_column_int64(stmt, 5);
-        archives[ai].modified_time = (uint64_t)sqlite3_column_int64(stmt, 6);
-        if (!archives[ai].file_path) goto sqlite_fail;
-        ++ai;
-    }
-    if (rc != SQLITE_DONE || ai != archive_count) goto sqlite_fail;
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-
-    double load_elapsed = now_ms() - start;
-    printf("import_sqlite_load_ms: %.2f\n", load_elapsed);
-    printf("import_sqlite_archives: %u\n", archive_count);
-    printf("import_sqlite_entries: %u\n", entry_count);
-    print_memory_usage("import_sqlite_archives_loaded");
-
-    start = now_ms();
-    const char* entry_sql =
-        "SELECT archive_id, entry_path, entry_raw_path, compressed_size, original_size, modified_time "
-        "FROM entries ORDER BY id";
-    SqliteEntryStream stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.db = sdb;
-    stream.id_map = id_map;
-    stream.max_archive_id = max_archive_id;
-    stream.sql = entry_sql;
-    EzdbEntryStream ez_stream;
-    memset(&ez_stream, 0, sizeof(ez_stream));
-    ez_stream.user_data = &stream;
-    ez_stream.reset = sqlite_entry_stream_reset;
-    ez_stream.next = sqlite_entry_stream_next;
-    int ezrc = ezdb_build_snapshot_stream_entries(archives, archive_count, &ez_stream, entry_count, output_ezdb);
-    if (stream.stmt) {
-        sqlite3_finalize(stream.stmt);
-        stream.stmt = NULL;
-    }
-    double build_elapsed = now_ms() - start;
-    if (ezrc != 0) {
-        fprintf(stderr, "ezdb_build_snapshot failed: %s (%d)\n", ezdb_error_message(ezrc), ezrc);
-        sqlite3_close(sdb);
-        free(id_map);
-        free_import_data(archives, archive_count);
-        return 2;
-    }
-    sqlite3_close(sdb);
-    sdb = NULL;
-    printf("import_sqlite_build_ms: %.2f\n", build_elapsed);
-    print_memory_usage("import_sqlite_after_build");
-    free(id_map);
-    free_import_data(archives, archive_count);
-    return 0;
-
-sqlite_fail:
-    fprintf(stderr, "sqlite import failed: %s\n", sdb ? sqlite3_errmsg(sdb) : "unknown");
-    if (stmt) sqlite3_finalize(stmt);
-    if (sdb) sqlite3_close(sdb);
-    free(id_map);
-    free_import_data(archives, archive_count);
-    return 2;
-}
-
 static int run_main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -1423,14 +1248,6 @@ static int run_main(int argc, char** argv)
         printf("build ok: %.2f ms\n", elapsed);
         print_memory_usage("build");
         return 0;
-    }
-
-    if (strcmp(argv[1], "import-sqlite") == 0) {
-        if (argc != 4) {
-            print_usage();
-            return 1;
-        }
-        return run_import_sqlite(argv[2], argv[3]);
     }
 
     if (strcmp(argv[1], "build-entries") == 0) {
