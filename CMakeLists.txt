@@ -30,8 +30,6 @@ if(MSVC)
     target_compile_options(ezdb PRIVATE /utf-8)
 endif()
 
-add_subdirectory(tools)
-
 add_executable(EveryZip WIN32
         src/resource.h
         src/strings.rc
@@ -104,6 +102,8 @@ target_include_directories(minizip PUBLIC
 )
 
 target_link_libraries(minizip PUBLIC zlibstatic)
+
+add_subdirectory(tools)
 
 add_library(sevenzip_c STATIC
         external/7zip/C/7zAlloc.c

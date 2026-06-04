@@ -4,10 +4,15 @@
 #include <psapi.h>
 #include <shellapi.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "ioapi.h"
+#include "iowin32.h"
+#include "unzip.h"
 
 typedef struct SearchStats {
     uint32_t printed;
@@ -24,7 +29,15 @@ static char* trim_ascii(char* text);
 
 static double now_ms(void)
 {
-    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+    static LARGE_INTEGER freq;
+    static int initialized = 0;
+    LARGE_INTEGER now;
+    if (!initialized) {
+        QueryPerformanceFrequency(&freq);
+        initialized = 1;
+    }
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
 static void print_usage(void)
@@ -32,6 +45,7 @@ static void print_usage(void)
     printf("Usage:\n");
     printf("  EzdbBench build-archives <input.tsv> <output.ezdb>\n");
     printf("  EzdbBench build-entries <combined.tsv> <output.ezdb>\n");
+    printf("  EzdbBench build-zip-entries <zip_files.tsv> <output.ezdb> [threads]\n");
     printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
     printf("  EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]\n");
 
@@ -487,6 +501,8 @@ static int run_delete_once(Ezdb* db, uint32_t id, const char* memory_prefix)
 typedef struct LoadedEntry {
     uint32_t archive_index;
     char* entry_path;
+    void* entry_raw_path;
+    uint32_t entry_raw_path_len;
     int64_t compressed_size;
     uint64_t original_size;
     uint64_t modified_time;
@@ -507,7 +523,10 @@ static void free_loaded_entries(LoadedEntries* loaded)
 {
     if (!loaded) return;
     if (loaded->entries) {
-        for (uint32_t i = 0; i < loaded->count; ++i) free(loaded->entries[i].entry_path);
+        for (uint32_t i = 0; i < loaded->count; ++i) {
+            free(loaded->entries[i].entry_path);
+            free(loaded->entries[i].entry_raw_path);
+        }
     }
     free(loaded->entries);
     loaded->entries = NULL;
@@ -643,11 +662,489 @@ static int combined_entry_next(void* user_data, EzdbEntryRecord* out_record)
     memset(out_record, 0, sizeof(*out_record));
     out_record->archive_id = e->archive_index;
     out_record->entry_path = e->entry_path;
+    out_record->entry_raw_path = e->entry_raw_path;
+    out_record->entry_raw_path_len = e->entry_raw_path_len;
     out_record->compressed_size = e->compressed_size;
     out_record->original_size = e->original_size;
     out_record->modified_time = e->modified_time;
     ++stream->pos;
     return 0;
+}
+
+/* --- build-zip-entries command --- */
+
+typedef struct ParsedArchive {
+    LoadedEntries entries;
+    int ok;
+    char error[96];
+    double parse_ms;
+} ParsedArchive;
+
+typedef struct ZipParseJob {
+    const LoadedArchives* archives;
+    ParsedArchive* parsed;
+    uint32_t archive_count;
+    LONG next_index;
+    volatile LONG completed;
+    volatile LONG opened;
+    volatile LONG failed;
+    volatile LONG64 entries;
+} ZipParseJob;
+
+typedef struct ParsedZipEntryStream {
+    const ParsedArchive* parsed;
+    uint32_t archive_count;
+    uint32_t archive_index;
+    uint32_t entry_index;
+} ParsedZipEntryStream;
+
+static wchar_t* utf8_to_wide_alloc(const char* text)
+{
+    if (!text) return NULL;
+    int need = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    wchar_t* out = NULL;
+    if (need <= 0) return NULL;
+    out = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)need);
+    if (!out) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, text, -1, out, need) <= 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+static char* wide_range_to_utf8_alloc(const wchar_t* text, int len)
+{
+    int need = WideCharToMultiByte(CP_UTF8, 0, text, len, NULL, 0, NULL, NULL);
+    char* out = NULL;
+    if (need <= 0) return NULL;
+    out = (char*)malloc((size_t)need + 1u);
+    if (!out) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, text, len, out, need, NULL, NULL) <= 0) {
+        free(out);
+        return NULL;
+    }
+    out[need] = '\0';
+    return out;
+}
+
+static int ends_with_archive_slash(const char* name, size_t len)
+{
+    if (!name || !len) return 0;
+    return name[len - 1u] == '/' || name[len - 1u] == '\\';
+}
+
+static uint64_t zip_tm_to_filetime_value(const tm_unz* t)
+{
+    if (!t || t->tm_year <= 1900 || t->tm_mon < 0 || t->tm_mon > 11 ||
+        t->tm_mday < 1 || t->tm_mday > 31) {
+        return 0;
+    }
+
+    SYSTEMTIME local_st;
+    SYSTEMTIME utc_st;
+    FILETIME ft;
+    ULARGE_INTEGER value;
+    memset(&local_st, 0, sizeof(local_st));
+    memset(&utc_st, 0, sizeof(utc_st));
+    memset(&ft, 0, sizeof(ft));
+    local_st.wYear = (WORD)t->tm_year;
+    local_st.wMonth = (WORD)(t->tm_mon + 1);
+    local_st.wDay = (WORD)t->tm_mday;
+    local_st.wHour = (WORD)t->tm_hour;
+    local_st.wMinute = (WORD)t->tm_min;
+    local_st.wSecond = (WORD)t->tm_sec;
+    if (!TzSpecificLocalTimeToSystemTime(NULL, &local_st, &utc_st)) return 0;
+    if (!SystemTimeToFileTime(&utc_st, &ft)) return 0;
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+static char* decode_zip_name_best_effort(const char* raw, uint32_t raw_len, int is_utf8)
+{
+    wchar_t* wide = NULL;
+    char* utf8 = NULL;
+    int wide_len = 0;
+    if (!raw || raw_len == 0) return NULL;
+
+    if (is_utf8) {
+        wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw, (int)raw_len, NULL, 0);
+        if (wide_len > 0) {
+            utf8 = (char*)malloc((size_t)raw_len + 1u);
+            if (!utf8) return NULL;
+            memcpy(utf8, raw, raw_len);
+            utf8[raw_len] = '\0';
+            return utf8;
+        }
+    }
+
+    wide_len = MultiByteToWideChar(CP_ACP, 0, raw, (int)raw_len, NULL, 0);
+    if (wide_len <= 0) {
+        wide_len = MultiByteToWideChar(CP_UTF8, 0, raw, (int)raw_len, NULL, 0);
+        if (wide_len <= 0) return NULL;
+        wide = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)wide_len);
+        if (!wide) return NULL;
+        if (MultiByteToWideChar(CP_UTF8, 0, raw, (int)raw_len, wide, wide_len) <= 0) {
+            free(wide);
+            return NULL;
+        }
+    } else {
+        wide = (wchar_t*)malloc(sizeof(wchar_t) * (size_t)wide_len);
+        if (!wide) return NULL;
+        if (MultiByteToWideChar(CP_ACP, 0, raw, (int)raw_len, wide, wide_len) <= 0) {
+            free(wide);
+            return NULL;
+        }
+    }
+    utf8 = wide_range_to_utf8_alloc(wide, wide_len);
+    free(wide);
+    return utf8;
+}
+
+static int raw_name_differs_from_utf8(const char* raw, uint32_t raw_len, const char* utf8)
+{
+    size_t utf8_len = utf8 ? strlen(utf8) : 0;
+    return utf8_len != raw_len || (raw_len && memcmp(raw, utf8, raw_len) != 0);
+}
+
+static int push_zip_entry(LoadedEntries* entries,
+                          uint32_t archive_index,
+                          const char* raw_name,
+                          uint32_t raw_name_len,
+                          int is_utf8,
+                          const unz_file_info64* info)
+{
+    LoadedEntry entry;
+    char* decoded = NULL;
+    memset(&entry, 0, sizeof(entry));
+    decoded = decode_zip_name_best_effort(raw_name, raw_name_len, is_utf8);
+    if (!decoded || decoded[0] == '\0') {
+        free(decoded);
+        return 1;
+    }
+    entry.archive_index = archive_index;
+    entry.entry_path = decoded;
+    if (raw_name_differs_from_utf8(raw_name, raw_name_len, decoded)) {
+        entry.entry_raw_path = malloc(raw_name_len ? raw_name_len : 1u);
+        if (!entry.entry_raw_path) {
+            free(decoded);
+            return 0;
+        }
+        memcpy(entry.entry_raw_path, raw_name, raw_name_len);
+        entry.entry_raw_path_len = raw_name_len;
+    }
+    entry.compressed_size = (int64_t)info->compressed_size;
+    entry.original_size = (uint64_t)info->uncompressed_size;
+    entry.modified_time = zip_tm_to_filetime_value(&info->tmu_date);
+    if (!push_loaded_entry(entries, &entry)) {
+        free(entry.entry_path);
+        free(entry.entry_raw_path);
+        return 0;
+    }
+    return 1;
+}
+
+static int parse_zip_archive_entries(const EzdbArchiveRecord* archive,
+                                     uint32_t archive_index,
+                                     ParsedArchive* parsed)
+{
+    wchar_t* wide_path = NULL;
+    zlib_filefunc64_def filefunc;
+    unzFile uf = NULL;
+    int rc = UNZ_OK;
+    double start = now_ms();
+
+    memset(&filefunc, 0, sizeof(filefunc));
+    wide_path = utf8_to_wide_alloc(archive->file_path);
+    if (!wide_path) {
+        strcpy(parsed->error, "path utf8 decode failed");
+        return 0;
+    }
+    fill_win32_filefunc64W(&filefunc);
+    uf = unzOpen2_64(wide_path, &filefunc);
+    free(wide_path);
+    if (!uf) {
+        strcpy(parsed->error, "unzOpen2_64 failed");
+        return 0;
+    }
+
+    rc = unzGoToFirstFile(uf);
+    if (rc == UNZ_END_OF_LIST_OF_FILE) {
+        parsed->ok = 1;
+        parsed->parse_ms = now_ms() - start;
+        unzClose(uf);
+        return 1;
+    }
+    if (rc != UNZ_OK) {
+        strcpy(parsed->error, "unzGoToFirstFile failed");
+        unzClose(uf);
+        return 0;
+    }
+
+    while (rc == UNZ_OK) {
+        unz_file_info64 info;
+        char* name = NULL;
+        memset(&info, 0, sizeof(info));
+        rc = unzGetCurrentFileInfo64(uf, &info, NULL, 0, NULL, 0, NULL, 0);
+        if (rc != UNZ_OK) {
+            strcpy(parsed->error, "unzGetCurrentFileInfo64 failed");
+            unzClose(uf);
+            return 0;
+        }
+        if (info.size_filename > UINT_MAX - 1u) {
+            strcpy(parsed->error, "zip entry name too long");
+            unzClose(uf);
+            return 0;
+        }
+        name = (char*)malloc((size_t)info.size_filename + 1u);
+        if (!name) {
+            strcpy(parsed->error, "out of memory");
+            unzClose(uf);
+            return 0;
+        }
+        rc = unzGetCurrentFileInfo64(uf, &info, name, info.size_filename + 1u, NULL, 0, NULL, 0);
+        if (rc != UNZ_OK) {
+            free(name);
+            strcpy(parsed->error, "unzGetCurrentFileInfo64 name failed");
+            unzClose(uf);
+            return 0;
+        }
+        name[info.size_filename] = '\0';
+        if (!ends_with_archive_slash(name, (size_t)info.size_filename)) {
+            if (!push_zip_entry(&parsed->entries,
+                                archive_index,
+                                name,
+                                (uint32_t)info.size_filename,
+                                (info.flag & 0x800) != 0,
+                                &info)) {
+                free(name);
+                strcpy(parsed->error, "out of memory");
+                unzClose(uf);
+                return 0;
+            }
+        }
+        free(name);
+
+        rc = unzGoToNextFile(uf);
+        if (rc == UNZ_END_OF_LIST_OF_FILE) break;
+        if (rc != UNZ_OK) {
+            strcpy(parsed->error, "unzGoToNextFile failed");
+            unzClose(uf);
+            return 0;
+        }
+    }
+
+    unzClose(uf);
+    parsed->ok = 1;
+    parsed->parse_ms = now_ms() - start;
+    return 1;
+}
+
+static DWORD WINAPI zip_parse_worker(LPVOID param)
+{
+    ZipParseJob* job = (ZipParseJob*)param;
+    for (;;) {
+        LONG index = InterlockedIncrement(&job->next_index) - 1;
+        ParsedArchive* parsed = NULL;
+        int ok = 0;
+        if (index < 0 || (uint32_t)index >= job->archive_count) break;
+        parsed = &job->parsed[index];
+        ok = parse_zip_archive_entries(&job->archives->records[index], (uint32_t)index, parsed);
+        if (ok) {
+            InterlockedIncrement(&job->opened);
+            InterlockedAdd64(&job->entries, (LONG64)parsed->entries.count);
+        } else {
+            InterlockedIncrement(&job->failed);
+        }
+        InterlockedIncrement(&job->completed);
+    }
+    return 0;
+}
+
+static void free_parsed_archives(ParsedArchive* parsed, uint32_t count)
+{
+    if (!parsed) return;
+    for (uint32_t i = 0; i < count; ++i) free_loaded_entries(&parsed[i].entries);
+    free(parsed);
+}
+
+static int parsed_zip_entry_reset(void* user_data)
+{
+    ParsedZipEntryStream* stream = (ParsedZipEntryStream*)user_data;
+    if (!stream) return -1;
+    stream->archive_index = 0;
+    stream->entry_index = 0;
+    return 0;
+}
+
+static int parsed_zip_entry_next(void* user_data, EzdbEntryRecord* out_record)
+{
+    ParsedZipEntryStream* stream = (ParsedZipEntryStream*)user_data;
+    if (!stream || !out_record) return -1;
+    while (stream->archive_index < stream->archive_count) {
+        const ParsedArchive* archive = &stream->parsed[stream->archive_index];
+        if (stream->entry_index < archive->entries.count) {
+            const LoadedEntry* e = &archive->entries.entries[stream->entry_index++];
+            memset(out_record, 0, sizeof(*out_record));
+            out_record->archive_id = e->archive_index;
+            out_record->entry_path = e->entry_path;
+            out_record->entry_raw_path = e->entry_raw_path;
+            out_record->entry_raw_path_len = e->entry_raw_path_len;
+            out_record->compressed_size = e->compressed_size;
+            out_record->original_size = e->original_size;
+            out_record->modified_time = e->modified_time;
+            return 0;
+        }
+        ++stream->archive_index;
+        stream->entry_index = 0;
+    }
+    return -1;
+}
+
+static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, uint32_t thread_count)
+{
+    LoadedArchives archives;
+    ParsedArchive* parsed = NULL;
+    ZipParseJob job;
+    HANDLE* threads = NULL;
+    double load_start = now_ms();
+    double parse_start = 0.0;
+    double build_start = 0.0;
+    uint32_t entry_count = 0;
+    uint32_t created_threads = 0;
+    int exit_code = 0;
+
+    if (thread_count == 0) thread_count = 6;
+    if (thread_count > 64) thread_count = 64;
+
+    memset(&archives, 0, sizeof(archives));
+    if (!load_archive_tsv(zip_tsv, &archives)) {
+        fprintf(stderr, "build-zip-entries: unable to read %s\n", zip_tsv);
+        free_loaded_archives(&archives);
+        return 2;
+    }
+
+    printf("zip_input: %s\n", zip_tsv);
+    printf("zip_archives_loaded: %u\n", archives.count);
+    printf("zip_threads: %u\n", thread_count);
+    printf("zip_load_tsv_ms: %.2f\n", now_ms() - load_start);
+    print_memory_usage("zip_loaded");
+
+    parsed = (ParsedArchive*)calloc(archives.count ? archives.count : 1u, sizeof(ParsedArchive));
+    threads = (HANDLE*)calloc(thread_count, sizeof(HANDLE));
+    if (!parsed || !threads) {
+        free(threads);
+        free_parsed_archives(parsed, archives.count);
+        free_loaded_archives(&archives);
+        return 2;
+    }
+
+    memset(&job, 0, sizeof(job));
+    job.archives = &archives;
+    job.parsed = parsed;
+    job.archive_count = archives.count;
+    parse_start = now_ms();
+    for (uint32_t i = 0; i < thread_count; ++i) {
+        threads[i] = CreateThread(NULL, 0, zip_parse_worker, &job, 0, NULL);
+        if (!threads[i]) {
+            fprintf(stderr, "build-zip-entries: CreateThread failed (%lu)\n", GetLastError());
+            exit_code = 2;
+            break;
+        }
+        ++created_threads;
+    }
+    if (exit_code != 0) {
+        InterlockedExchange(&job.next_index, (LONG)archives.count);
+        if (created_threads) WaitForMultipleObjects(created_threads, threads, TRUE, INFINITE);
+    }
+
+    while (exit_code == 0) {
+        DWORD wait_rc = WaitForMultipleObjects(created_threads, threads, TRUE, 1000);
+        LONG done = job.completed;
+        LONG opened = job.opened;
+        LONG failed = job.failed;
+        LONG64 entries = job.entries;
+        double elapsed = now_ms() - parse_start;
+        printf("zip_parse_progress: %ld/%u opened=%ld failed=%ld entries=%lld elapsed_ms=%.2f archives_per_s=%.2f entries_per_s=%.2f\n",
+               done,
+               archives.count,
+               opened,
+               failed,
+               (long long)entries,
+               elapsed,
+               elapsed > 0.0 ? (double)done * 1000.0 / elapsed : 0.0,
+               elapsed > 0.0 ? (double)entries * 1000.0 / elapsed : 0.0);
+        fflush(stdout);
+        if (wait_rc == WAIT_OBJECT_0) break;
+        if (wait_rc == WAIT_FAILED) {
+            fprintf(stderr, "build-zip-entries: wait failed (%lu)\n", GetLastError());
+            exit_code = 2;
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < created_threads; ++i) {
+        if (threads[i]) CloseHandle(threads[i]);
+    }
+    free(threads);
+    threads = NULL;
+    if (exit_code != 0) {
+        free_parsed_archives(parsed, archives.count);
+        free_loaded_archives(&archives);
+        return exit_code;
+    }
+
+    if (job.entries > UINT32_MAX) {
+        fprintf(stderr, "build-zip-entries: too many entries for ezdb snapshot: %lld\n", (long long)job.entries);
+        free_parsed_archives(parsed, archives.count);
+        free_loaded_archives(&archives);
+        return 2;
+    }
+    entry_count = (uint32_t)job.entries;
+
+    printf("zip_parse_ms: %.2f\n", now_ms() - parse_start);
+    printf("zip_opened_archives: %ld\n", job.opened);
+    printf("zip_failed_archives: %ld\n", job.failed);
+    printf("zip_entries: %u\n", entry_count);
+    for (uint32_t i = 0, printed = 0; i < archives.count && printed < 10; ++i) {
+        if (!parsed[i].ok && parsed[i].error[0]) {
+            printf("zip_parse_error[%u]: %s :: %s\n", i, parsed[i].error, archives.records[i].file_path);
+            ++printed;
+        }
+    }
+    print_memory_usage("zip_parsed");
+
+    DeleteFileA(output_ezdb);
+    ParsedZipEntryStream parsed_stream;
+    EzdbEntryStream ez_stream;
+    memset(&parsed_stream, 0, sizeof(parsed_stream));
+    parsed_stream.parsed = parsed;
+    parsed_stream.archive_count = archives.count;
+    memset(&ez_stream, 0, sizeof(ez_stream));
+    ez_stream.user_data = &parsed_stream;
+    ez_stream.reset = parsed_zip_entry_reset;
+    ez_stream.next = parsed_zip_entry_next;
+
+    build_start = now_ms();
+    {
+        int rc = ezdb_build_snapshot_stream_entries(archives.records,
+                                                    archives.count,
+                                                    entry_count ? &ez_stream : NULL,
+                                                    entry_count,
+                                                    output_ezdb);
+        double build_elapsed = now_ms() - build_start;
+        if (rc != 0) {
+            fprintf(stderr, "build-zip-entries: ezdb_build_snapshot_stream_entries failed: %s (%d)\n", ezdb_error_message(rc), rc);
+            exit_code = 2;
+        }
+        printf("zip_build_ms: %.2f\n", build_elapsed);
+        printf("zip_output_size: %llu\n", (unsigned long long)file_size_of_path(output_ezdb));
+        print_memory_usage("zip_built");
+    }
+
+    free_parsed_archives(parsed, archives.count);
+    free_loaded_archives(&archives);
+    return exit_code;
 }
 
 /* --- build-entries command --- */
@@ -867,6 +1364,15 @@ static int run_main(int argc, char** argv)
         }
         return run_build_entries(argv[2], argv[3]);
     }
+
+    if (strcmp(argv[1], "build-zip-entries") == 0) {
+        if (argc < 4 || argc > 5) {
+            print_usage();
+            return 1;
+        }
+        return run_build_zip_entries(argv[2], argv[3], argc == 5 ? (uint32_t)strtoul(argv[4], NULL, 10) : 6u);
+    }
+
     if (strcmp(argv[1], "live-entry-append-batch") == 0) {
         if (argc < 4 || argc > 5) {
             print_usage();
