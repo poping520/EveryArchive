@@ -30,25 +30,22 @@ static double now_ms(void)
 static void print_usage(void)
 {
     printf("Usage:\n");
-    printf("  EzdbBench build <input.txt> <output.ezdb>\n");
     printf("  EzdbBench build-archives <input.tsv> <output.ezdb>\n");
-    printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
+    printf("  EzdbBench build-entries <combined.tsv> <output.ezdb>\n");
     printf("  EzdbBench info <db.ezdb>\n");
+    printf("  EzdbBench open <db.ezdb> [limit]\n");
+    printf("  EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]\n");
     printf("  EzdbBench get <db.ezdb> <id>\n");
     printf("  EzdbBench get-archive <db.ezdb> <id>\n");
     printf("  EzdbBench get-entry <db.ezdb> <id>\n");
     printf("  EzdbBench search <db.ezdb> <keyword> [limit]\n");
     printf("  EzdbBench search-v2 <db.ezdb> <scope> <keyword> [limit]\n");
-    printf("  EzdbBench open <db.ezdb> [limit]\n");
     printf("  EzdbBench insert <db.ezdb> <path> [size] [mtime]\n");
-    printf("  EzdbBench insert-file <db.ezdb> <input.txt>\n");
     printf("  EzdbBench update <db.ezdb> <id> <path> [size] [mtime]\n");
     printf("  EzdbBench delete <db.ezdb> <id>\n");
     printf("  EzdbBench delete-archive-ref <db.ezdb> <drive> <file_ref_number>\n");
     printf("  EzdbBench compact <db.ezdb>\n");
-    printf("  EzdbBench build-entries <combined.tsv> <output.ezdb>\n");
     printf("  EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]\n");
-    printf("  EzdbBench crud <input.txt> <output.ezdb>\n");
 }
 
 static void print_memory_usage(const char* prefix)
@@ -160,69 +157,10 @@ static int run_search_v2_once(Ezdb* db, const char* keyword, uint32_t scope, uin
     return 0;
 }
 
-typedef struct FindIdStats {
-    uint32_t wanted;
-    uint32_t found;
-} FindIdStats;
-
-static void on_find_id(const EzdbSearchResult* result, void* user_data)
-{
-    FindIdStats* stats = (FindIdStats*)user_data;
-    if (result->id == stats->wanted) stats->found = 1;
-}
-
-static int search_contains_id(Ezdb* db, const char* keyword, uint32_t id, int* out_found)
-{
-    FindIdStats stats;
-    stats.wanted = id;
-    stats.found = 0;
-    int rc = ezdb_search_path(db, keyword, 0, on_find_id, &stats);
-    if (rc != 0) return rc;
-    *out_found = stats.found ? 1 : 0;
-    return 0;
-}
-
-static int expect_search_id(Ezdb* db, const char* keyword, uint32_t id, int expected)
-{
-    int found = 0;
-    int rc = search_contains_id(db, keyword, id, &found);
-    if (rc != 0) return rc;
-    if (found != expected) {
-        fprintf(stderr, "verification failed: keyword '%s' id %u expected %d got %d\n", keyword, id, expected, found);
-        return 3;
-    }
-    return 0;
-}
-
 static uint64_t parse_u64_arg(const char* text, uint64_t fallback)
 {
     if (!text) return fallback;
     return (uint64_t)_strtoui64(text, NULL, 10);
-}
-
-static int parse_record_line(char* line, EzdbFileRecord* out_record)
-{
-    char* mtime_text = NULL;
-    char* size_text = NULL;
-    char* path = NULL;
-
-    mtime_text = strrchr(line, ',');
-    if (!mtime_text) return 0;
-    *mtime_text++ = '\0';
-
-    size_text = strrchr(line, ',');
-    if (!size_text) return 0;
-    *size_text++ = '\0';
-
-    path = trim_ascii(line);
-    size_text = trim_ascii(size_text);
-    mtime_text = trim_ascii(mtime_text);
-    if (!*path) return 0;
-
-    out_record->path = path;
-    out_record->size = parse_u64_arg(size_text, 0);
-    out_record->modified_time = parse_u64_arg(mtime_text, 0);
-    return 1;
 }
 
 static void free_loaded_archives(LoadedArchives* loaded)
@@ -280,28 +218,6 @@ static int parse_archive_tsv_line_for_bench(char* line, EzdbArchiveRecord* out_r
     return 1;
 }
 
-static int load_text_archives(const char* input_txt, LoadedArchives* loaded)
-{
-    FILE* in = fopen(input_txt, "rb");
-    if (!in) return 0;
-    char line[32768];
-    while (fgets(line, sizeof(line), in)) {
-        EzdbFileRecord file_record;
-        EzdbArchiveRecord archive_record;
-        if (!parse_record_line(line, &file_record)) continue;
-        memset(&archive_record, 0, sizeof(archive_record));
-        archive_record.file_path = file_record.path;
-        archive_record.file_size = file_record.size;
-        archive_record.modified_time = file_record.modified_time;
-        if (!push_loaded_archive(loaded, &archive_record)) {
-            fclose(in);
-            return 0;
-        }
-    }
-    fclose(in);
-    return 1;
-}
-
 static int load_archive_tsv(const char* input_tsv, LoadedArchives* loaded)
 {
     FILE* in = fopen(input_tsv, "rb");
@@ -326,147 +242,6 @@ static int build_from_loaded_archives(LoadedArchives* loaded, const char* output
         fprintf(stderr, "%s failed: %s (%d)\n", error_prefix, ezdb_error_message(rc), rc);
         return 2;
     }
-    return 0;
-}
-
-static int run_crud_bench(const char* input_txt, const char* output_ezdb)
-{
-    DeleteFileA(output_ezdb);
-    LoadedArchives loaded;
-    memset(&loaded, 0, sizeof(loaded));
-    if (!load_text_archives(input_txt, &loaded)) {
-        fprintf(stderr, "build failed: unable to read %s\n", input_txt);
-        free_loaded_archives(&loaded);
-        return 2;
-    }
-    double start = now_ms();
-    int rc = build_from_loaded_archives(&loaded, output_ezdb, "build");
-    double build_elapsed = now_ms() - start;
-    free_loaded_archives(&loaded);
-    if (rc != 0) {
-        return rc;
-    }
-    printf("crud_build_ms: %.2f\n", build_elapsed);
-    print_memory_usage("crud_build");
-
-    Ezdb* db = NULL;
-    start = now_ms();
-    rc = ezdb_open(output_ezdb, &db);
-    double open_elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return 2;
-    }
-    printf("crud_open_ms: %.2f\n", open_elapsed);
-    printf("crud_baseline_count: %u\n", ezdb_count(db));
-    printf("crud_baseline_active: %u\n", ezdb_active_count(db));
-    printf("crud_baseline_file_size: %llu\n", (unsigned long long)ezdb_file_size(db));
-    run_search_once(db, "device", 20, "crud_baseline_device");
-    run_search_once(db, "config", 20, "crud_baseline_config");
-    run_search_once(db, "zzznotfoundzzz", 20, "crud_baseline_notfound");
-    run_search_once(db, "a", 20, "crud_baseline_a");
-
-    uint32_t baseline_count = ezdb_count(db);
-    uint32_t baseline_active = ezdb_active_count(db);
-    EzdbFileRecord insert_rec = {"Z:\\EzdbCrud\\new_device_alpha.txt", 123, 456};
-    uint32_t insert_id = 0;
-    start = now_ms();
-    rc = ezdb_insert(db, &insert_rec, &insert_id);
-    printf("crud_insert_ms: %.2f\n", now_ms() - start);
-    if (rc != 0 || insert_id != baseline_count || ezdb_active_count(db) != baseline_active + 1u) {
-        fprintf(stderr, "insert verification failed: %s (%d), id=%u\n", ezdb_error_message(rc), rc, insert_id);
-        ezdb_close(db);
-        return 2;
-    }
-    rc = expect_search_id(db, "new_device_alpha", insert_id, 1);
-    if (rc != 0) {
-        ezdb_close(db);
-        return rc;
-    }
-
-    EzdbFileRecord update_insert_rec = {"Z:\\EzdbCrud\\renamed_config_beta.txt", 789, 987};
-    start = now_ms();
-    rc = ezdb_update(db, insert_id, &update_insert_rec);
-    printf("crud_update_insert_ms: %.2f\n", now_ms() - start);
-    if (rc != 0) {
-        fprintf(stderr, "update inserted failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        ezdb_close(db);
-        return 2;
-    }
-    rc = expect_search_id(db, "new_device_alpha", insert_id, 0);
-    if (rc == 0) rc = expect_search_id(db, "renamed_config_beta", insert_id, 1);
-    if (rc != 0) {
-        ezdb_close(db);
-        return rc;
-    }
-
-    EzdbFileRecord update_base_rec = {"Z:\\EzdbCrud\\base_device_update.txt", 111, 222};
-    start = now_ms();
-    rc = ezdb_update(db, 0, &update_base_rec);
-    printf("crud_update_base_ms: %.2f\n", now_ms() - start);
-    if (rc != 0) {
-        fprintf(stderr, "update base failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        ezdb_close(db);
-        return 2;
-    }
-    rc = expect_search_id(db, "base_device_update", 0, 1);
-    if (rc != 0) {
-        ezdb_close(db);
-        return rc;
-    }
-
-    start = now_ms();
-    rc = ezdb_delete(db, insert_id);
-    printf("crud_delete_ms: %.2f\n", now_ms() - start);
-    if (rc != 0 || ezdb_active_count(db) != baseline_active) {
-        fprintf(stderr, "delete failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        ezdb_close(db);
-        return 2;
-    }
-    EzdbSearchResult result;
-    rc = ezdb_get_by_id(db, insert_id, &result);
-    if (rc != -5) {
-        fprintf(stderr, "deleted get expected not found, got %s (%d)\n", ezdb_error_message(rc), rc);
-        if (rc == 0) ezdb_free_result(&result);
-        ezdb_close(db);
-        return 2;
-    }
-    rc = expect_search_id(db, "renamed_config_beta", insert_id, 0);
-    if (rc != 0) {
-        ezdb_close(db);
-        return rc;
-    }
-
-    printf("crud_after_count: %u\n", ezdb_count(db));
-    printf("crud_after_active: %u\n", ezdb_active_count(db));
-    printf("crud_after_file_size: %llu\n", (unsigned long long)ezdb_file_size(db));
-    print_memory_usage("crud_after");
-    ezdb_close(db);
-
-    start = now_ms();
-    rc = ezdb_open(output_ezdb, &db);
-    printf("crud_reopen_ms: %.2f\n", now_ms() - start);
-    if (rc != 0) {
-        fprintf(stderr, "reopen failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return 2;
-    }
-    if (ezdb_count(db) != baseline_count + 1u || ezdb_active_count(db) != baseline_active) {
-        fprintf(stderr, "reopen count mismatch: count=%u active=%u\n", ezdb_count(db), ezdb_active_count(db));
-        ezdb_close(db);
-        return 2;
-    }
-    rc = expect_search_id(db, "base_device_update", 0, 1);
-    if (rc == 0) rc = expect_search_id(db, "renamed_config_beta", insert_id, 0);
-    if (rc != 0) {
-        ezdb_close(db);
-        return rc;
-    }
-    run_search_once(db, "device", 20, "crud_reopen_device");
-    run_search_once(db, "config", 20, "crud_reopen_config");
-    run_search_once(db, "zzznotfoundzzz", 20, "crud_reopen_notfound");
-    run_search_once(db, "a", 20, "crud_reopen_a");
-    print_memory_usage("crud_reopen");
-    ezdb_close(db);
     return 0;
 }
 
@@ -670,149 +445,6 @@ static int run_insert_once(Ezdb* db, const char* path, uint64_t size, uint64_t m
     printf("insert_id: %u\n", id);
     printf("insert_ms: %.2f\n", elapsed);
     print_memory_usage(memory_prefix);
-    return 0;
-}
-
-static int run_insert_file_bench(const char* db_path, const char* input_txt)
-{
-    Ezdb* db = NULL;
-    FILE* fp = NULL;
-    char* line = NULL;
-    size_t line_cap = 0;
-    uint64_t parsed = 0;
-    uint64_t skipped = 0;
-    EzdbFileRecord* records = NULL;
-    uint32_t record_count = 0;
-    uint32_t record_cap = 0;
-    uint32_t first_id = 0;
-    uint32_t last_id = 0;
-    uint64_t file_size_before = 0;
-    uint64_t file_size_after = 0;
-
-    double total_start = now_ms();
-    double start = total_start;
-    int rc = ezdb_open(db_path, &db);
-    double open_elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return 2;
-    }
-
-    printf("insert_file_open_ms: %.2f\n", open_elapsed);
-    printf("insert_file_before_count: %u\n", ezdb_count(db));
-    printf("insert_file_before_active: %u\n", ezdb_active_count(db));
-    file_size_before = ezdb_file_size(db);
-    printf("insert_file_before_file_size: %llu\n", (unsigned long long)file_size_before);
-    print_memory_usage("insert_file_open");
-
-    fp = fopen(input_txt, "rb");
-    if (!fp) {
-        fprintf(stderr, "failed to open input: %s\n", input_txt);
-        ezdb_close(db);
-        return 2;
-    }
-
-    line_cap = 4096;
-    line = (char*)malloc(line_cap);
-    if (!line) {
-        fclose(fp);
-        ezdb_close(db);
-        return 2;
-    }
-
-    start = now_ms();
-    while (fgets(line, (int)line_cap, fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && line[len - 1] != '\n' && !feof(fp)) {
-            char* grown = NULL;
-            line_cap *= 2;
-            grown = (char*)realloc(line, line_cap);
-            if (!grown) {
-                free(line);
-                fclose(fp);
-                ezdb_close(db);
-                return 2;
-            }
-            line = grown;
-            if (!fgets(line + len, (int)(line_cap - len), fp)) break;
-            len = strlen(line);
-        }
-
-        EzdbFileRecord record;
-        if (!parse_record_line(line, &record)) {
-            ++skipped;
-            continue;
-        }
-        if (record_count >= record_cap) {
-            uint32_t next_cap = record_cap ? record_cap * 2u : 65536u;
-            EzdbFileRecord* grown = (EzdbFileRecord*)realloc(records, sizeof(EzdbFileRecord) * (size_t)next_cap);
-            if (!grown) {
-                free(line);
-                fclose(fp);
-                ezdb_close(db);
-                free(records);
-                return 2;
-            }
-            records = grown;
-            record_cap = next_cap;
-        }
-        records[record_count].path = _strdup(record.path);
-        if (!records[record_count].path) {
-            free(line);
-            fclose(fp);
-            ezdb_close(db);
-            for (uint32_t i = 0; i < record_count; ++i) free((void*)records[i].path);
-            free(records);
-            return 2;
-        }
-        records[record_count].size = record.size;
-        records[record_count].modified_time = record.modified_time;
-        ++record_count;
-        ++parsed;
-    }
-
-    double parse_elapsed = now_ms() - start;
-    free(line);
-    fclose(fp);
-
-    printf("insert_file_parse_ms: %.2f\n", parse_elapsed);
-    printf("insert_file_parsed: %llu\n", (unsigned long long)parsed);
-    printf("insert_file_skipped: %llu\n", (unsigned long long)skipped);
-    print_memory_usage("insert_file_parsed");
-
-    start = now_ms();
-    rc = ezdb_insert_many(db, records, record_count, &first_id);
-    double insert_elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "insert_many failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        for (uint32_t i = 0; i < record_count; ++i) free((void*)records[i].path);
-        free(records);
-        ezdb_close(db);
-        return 2;
-    }
-    if (record_count) last_id = first_id + record_count - 1u;
-
-    file_size_after = ezdb_file_size(db);
-    double total_elapsed = now_ms() - total_start;
-    printf("insert_file_insert_ms: %.2f\n", insert_elapsed);
-    printf("insert_file_insert_s: %.2f\n", insert_elapsed / 1000.0);
-    printf("insert_file_total_ms: %.2f\n", total_elapsed);
-    printf("insert_file_total_s: %.2f\n", total_elapsed / 1000.0);
-    printf("insert_file_inserted: %u\n", record_count);
-    printf("insert_file_first_id: %u\n", first_id);
-    printf("insert_file_last_id: %u\n", last_id);
-    printf("insert_file_after_count: %u\n", ezdb_count(db));
-    printf("insert_file_after_active: %u\n", ezdb_active_count(db));
-    printf("insert_file_after_file_size: %llu\n", (unsigned long long)file_size_after);
-    printf("insert_file_delta_bytes: %llu\n", (unsigned long long)(file_size_after - file_size_before));
-    if (insert_elapsed > 0.0) {
-        printf("insert_file_rows_per_sec: %.2f\n", (double)record_count * 1000.0 / insert_elapsed);
-    }
-    print_memory_usage("insert_file_after");
-
-    for (uint32_t i = 0; i < record_count; ++i) free((void*)records[i].path);
-    free(records);
-    ezdb_close(db);
     return 0;
 }
 
@@ -1200,30 +832,6 @@ static int run_main(int argc, char** argv)
     if (argc < 2) {
         print_usage();
         return 1;
-    }
-
-    if (strcmp(argv[1], "build") == 0) {
-        if (argc != 4) {
-            print_usage();
-            return 1;
-        }
-        LoadedArchives loaded;
-        memset(&loaded, 0, sizeof(loaded));
-        if (!load_text_archives(argv[2], &loaded)) {
-            fprintf(stderr, "build failed: unable to read %s\n", argv[2]);
-            free_loaded_archives(&loaded);
-            return 2;
-        }
-        double start = now_ms();
-        int rc = build_from_loaded_archives(&loaded, argv[3], "build");
-        double elapsed = now_ms() - start;
-        free_loaded_archives(&loaded);
-        if (rc != 0) {
-            return rc;
-        }
-        printf("build ok: %.2f ms\n", elapsed);
-        print_memory_usage("build");
-        return 0;
     }
 
     if (strcmp(argv[1], "build-archives") == 0) {
@@ -1684,14 +1292,6 @@ static int run_main(int argc, char** argv)
         return 0;
     }
 
-    if (strcmp(argv[1], "insert-file") == 0) {
-        if (argc != 4) {
-            print_usage();
-            return 1;
-        }
-        return run_insert_file_bench(argv[2], argv[3]);
-    }
-
     if (strcmp(argv[1], "update") == 0) {
         if (argc < 5 || argc > 7) {
             print_usage();
@@ -1797,14 +1397,6 @@ static int run_main(int argc, char** argv)
         print_memory_usage("compact");
         ezdb_close(db);
         return 0;
-    }
-
-    if (strcmp(argv[1], "crud") == 0) {
-        if (argc != 4) {
-            print_usage();
-            return 1;
-        }
-        return run_crud_bench(argv[2], argv[3]);
     }
 
     print_usage();
