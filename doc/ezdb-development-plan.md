@@ -407,9 +407,23 @@ EzdbBench update <db.ezdb> <id> <path> [size] [mtime]
 EzdbBench delete <db.ezdb> <id>
 EzdbBench delete-archive-ref <db.ezdb> <drive> <file_ref_number>
 EzdbBench crud <input.txt> <output.ezdb>
+EzdbBench build-entries <combined.tsv> <output.ezdb>
 EzdbBench live-entry-append <output.ezdb> <entry_count> [batch_size]
+EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]
 EzdbBench compact <db.ezdb>
 ```
+
+合并 TSV 导入测速：
+
+```text
+python tools\generate_entry_sample.py --output test_data\sample_10k_3m.combined.tsv --archive-count 10000 --entry-count 3000000 --entries-max 500
+EzdbBench build-entries test_data\sample_10k_3m.combined.tsv test_data\bench_10k_3m_build.ezdb
+EzdbBench live-entry-append-batch test_data\sample_10k_3m.combined.tsv test_data\bench_10k_3m_live.ezdb 4096
+EzdbBench info test_data\bench_10k_3m_build.ezdb
+EzdbBench info test_data\bench_10k_3m_live.ezdb
+```
+
+记录 `build_entries_ms`、`live_batch_append_ms`、输出文件大小和 peak working set；`info` 需确认 `records=10000`、`entries=3000000`。
 
 查询语法回归脚本：
 

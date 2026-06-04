@@ -48,8 +48,8 @@ static void print_usage(void)
     printf("  EzdbBench delete <db.ezdb> <id>\n");
     printf("  EzdbBench delete-archive-ref <db.ezdb> <drive> <file_ref_number>\n");
     printf("  EzdbBench compact <db.ezdb>\n");
-    printf("  EzdbBench build-entries <archives.tsv> <entries.tsv> <output.ezdb>\n");
-    printf("  EzdbBench live-entry-append-batch <archives.tsv> <entries.tsv> <output.ezdb> [batch_size]\n");
+    printf("  EzdbBench build-entries <combined.tsv> <output.ezdb>\n");
+    printf("  EzdbBench live-entry-append-batch <combined.tsv> <output.ezdb> [batch_size]\n");
     printf("  EzdbBench crud <input.txt> <output.ezdb>\n");
 }
 
@@ -860,7 +860,7 @@ static void free_import_data(EzdbArchiveRecord* archives, uint32_t archive_count
 
 
 
-/* --- Entry TSV loading and stream --- */
+/* --- Combined TSV loading --- */
 
 typedef struct LoadedEntry {
     uint32_t archive_index;
@@ -876,6 +876,11 @@ typedef struct LoadedEntries {
     uint32_t cap;
 } LoadedEntries;
 
+typedef struct LoadedCombined {
+    LoadedArchives archives;
+    LoadedEntries entries;
+} LoadedCombined;
+
 static void free_loaded_entries(LoadedEntries* loaded)
 {
     if (!loaded) return;
@@ -886,6 +891,13 @@ static void free_loaded_entries(LoadedEntries* loaded)
     loaded->entries = NULL;
     loaded->count = 0;
     loaded->cap = 0;
+}
+
+static void free_loaded_combined(LoadedCombined* combined)
+{
+    if (!combined) return;
+    free_loaded_archives(&combined->archives);
+    free_loaded_entries(&combined->entries);
 }
 
 static int push_loaded_entry(LoadedEntries* loaded, const LoadedEntry* entry)
@@ -902,66 +914,107 @@ static int push_loaded_entry(LoadedEntries* loaded, const LoadedEntry* entry)
     return 1;
 }
 
-static int parse_entry_tsv_line(char* line, LoadedEntry* out_entry)
+static int parse_combined_archive_fields(char* cursor, EzdbArchiveRecord* out_record)
 {
-    size_t len = strlen(line);
-    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-
-    char* fields[5];
-    char* cursor = line;
-    for (int i = 0; i < 5; ++i) {
+    /* cursor points past the 'A\t' prefix; 6 tab-separated fields remain */
+    char* fields[6];
+    for (int i = 0; i < 6; ++i) {
         fields[i] = cursor;
-        if (i < 4) {
+        if (i < 5) {
             char* tab = strchr(cursor, '\t');
             if (!tab) return 0;
             *tab = '\0';
             cursor = tab + 1;
         }
     }
-    if (!fields[1][0]) return 0;
-    memset(out_entry, 0, sizeof(*out_entry));
-    out_entry->archive_index = (uint32_t)strtoul(fields[0], NULL, 10);
-    out_entry->entry_path = _strdup(fields[1]);
-    if (!out_entry->entry_path) return 0;
-    out_entry->compressed_size = (int64_t)_strtoi64(fields[2], NULL, 10);
-    out_entry->original_size = (uint64_t)_strtoui64(fields[3], NULL, 10);
-    out_entry->modified_time = (uint64_t)_strtoui64(fields[4], NULL, 10);
+    if (!fields[3][0]) return 0;
+    memset(out_record, 0, sizeof(*out_record));
+    out_record->drive_letter = fields[0][0] ? fields[0][0] : 0;
+    out_record->file_ref_number = (uint64_t)_strtoui64(fields[1], NULL, 10);
+    out_record->usn = (int64_t)_strtoi64(fields[2], NULL, 10);
+    out_record->file_path = fields[3];
+    out_record->file_size = (uint64_t)_strtoui64(fields[4], NULL, 10);
+    out_record->modified_time = (uint64_t)_strtoui64(fields[5], NULL, 10);
     return 1;
 }
 
-static int load_entries_tsv(const char* input_tsv, LoadedEntries* loaded)
+static int parse_combined_entry_fields(char* cursor, uint32_t archive_index, LoadedEntry* out_entry)
+{
+    /* cursor points past the 'E\t' prefix; 4 tab-separated fields remain */
+    char* fields[4];
+    for (int i = 0; i < 4; ++i) {
+        fields[i] = cursor;
+        if (i < 3) {
+            char* tab = strchr(cursor, '\t');
+            if (!tab) return 0;
+            *tab = '\0';
+            cursor = tab + 1;
+        }
+    }
+    if (!fields[0][0]) return 0;
+    memset(out_entry, 0, sizeof(*out_entry));
+    out_entry->archive_index = archive_index;
+    out_entry->entry_path = _strdup(fields[0]);
+    if (!out_entry->entry_path) return 0;
+    out_entry->compressed_size = (int64_t)_strtoi64(fields[1], NULL, 10);
+    out_entry->original_size = (uint64_t)_strtoui64(fields[2], NULL, 10);
+    out_entry->modified_time = (uint64_t)_strtoui64(fields[3], NULL, 10);
+    return 1;
+}
+
+static int load_combined_tsv(const char* input_tsv, LoadedCombined* combined)
 {
     FILE* in = fopen(input_tsv, "rb");
     if (!in) return 0;
+    memset(combined, 0, sizeof(*combined));
+
     char line[32768];
+    uint32_t current_archive_index = UINT32_MAX;
     while (fgets(line, sizeof(line), in)) {
-        LoadedEntry entry;
-        if (!parse_entry_tsv_line(line, &entry)) continue;
-        if (!push_loaded_entry(loaded, &entry)) {
-            fclose(in);
-            return 0;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+
+        if (line[0] == 'A' && len > 1 && line[1] == '\t') {
+            EzdbArchiveRecord archive_record;
+            if (!parse_combined_archive_fields(line + 2, &archive_record)) continue;
+            current_archive_index = combined->archives.count;
+            if (!push_loaded_archive(&combined->archives, &archive_record)) {
+                fclose(in);
+                free_loaded_combined(combined);
+                return 0;
+            }
+        } else if (line[0] == 'E' && len > 1 && line[1] == '\t') {
+            if (current_archive_index == UINT32_MAX) continue;
+            LoadedEntry entry;
+            if (!parse_combined_entry_fields(line + 2, current_archive_index, &entry)) continue;
+            if (!push_loaded_entry(&combined->entries, &entry)) {
+                fclose(in);
+                free_loaded_combined(combined);
+                return 0;
+            }
         }
     }
     fclose(in);
     return 1;
 }
 
-typedef struct TsvEntryStream {
+typedef struct CombinedEntryStream {
     const LoadedEntries* entries;
     uint32_t pos;
-} TsvEntryStream;
+} CombinedEntryStream;
 
-static int tsv_entry_reset(void* user_data)
+static int combined_entry_reset(void* user_data)
 {
-    TsvEntryStream* stream = (TsvEntryStream*)user_data;
+    CombinedEntryStream* stream = (CombinedEntryStream*)user_data;
     if (!stream) return -1;
     stream->pos = 0;
     return 0;
 }
 
-static int tsv_entry_next(void* user_data, EzdbEntryRecord* out_record)
+static int combined_entry_next(void* user_data, EzdbEntryRecord* out_record)
 {
-    TsvEntryStream* stream = (TsvEntryStream*)user_data;
+    CombinedEntryStream* stream = (CombinedEntryStream*)user_data;
     if (!stream || !stream->entries || !out_record) return -1;
     if (stream->pos >= stream->entries->count) return -1;
     const LoadedEntry* e = &stream->entries->entries[stream->pos];
@@ -977,94 +1030,73 @@ static int tsv_entry_next(void* user_data, EzdbEntryRecord* out_record)
 
 /* --- build-entries command --- */
 
-static int run_build_entries(const char* archives_tsv, const char* entries_tsv, const char* output_ezdb)
+static int run_build_entries(const char* combined_tsv, const char* output_ezdb)
 {
     DeleteFileA(output_ezdb);
 
-    LoadedArchives archives;
-    memset(&archives, 0, sizeof(archives));
-    if (!load_archive_tsv(archives_tsv, &archives)) {
-        fprintf(stderr, "build-entries: unable to read archives %s\n", archives_tsv);
-        free_loaded_archives(&archives);
+    LoadedCombined combined;
+    memset(&combined, 0, sizeof(combined));
+    if (!load_combined_tsv(combined_tsv, &combined)) {
+        fprintf(stderr, "build-entries: unable to read %s\n", combined_tsv);
+        free_loaded_combined(&combined);
         return 2;
     }
-    printf("build_entries_archives: %u\n", archives.count);
-
-    LoadedEntries entries;
-    memset(&entries, 0, sizeof(entries));
-    if (!load_entries_tsv(entries_tsv, &entries)) {
-        fprintf(stderr, "build-entries: unable to read entries %s\n", entries_tsv);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
-        return 2;
-    }
-    printf("build_entries_entries: %u\n", entries.count);
+    printf("build_entries_archives: %u\n", combined.archives.count);
+    printf("build_entries_entries: %u\n", combined.entries.count);
     print_memory_usage("build_entries_loaded");
 
-    TsvEntryStream tstream;
-    memset(&tstream, 0, sizeof(tstream));
-    tstream.entries = &entries;
-    tstream.pos = 0;
+    CombinedEntryStream cstream;
+    memset(&cstream, 0, sizeof(cstream));
+    cstream.entries = &combined.entries;
+    cstream.pos = 0;
 
     EzdbEntryStream ez_stream;
     memset(&ez_stream, 0, sizeof(ez_stream));
-    ez_stream.user_data = &tstream;
-    ez_stream.reset = tsv_entry_reset;
-    ez_stream.next = tsv_entry_next;
+    ez_stream.user_data = &cstream;
+    ez_stream.reset = combined_entry_reset;
+    ez_stream.next = combined_entry_next;
 
     double start = now_ms();
-    int rc = ezdb_build_snapshot_stream_entries(archives.records, archives.count, &ez_stream, entries.count, output_ezdb);
+    int rc = ezdb_build_snapshot_stream_entries(combined.archives.records, combined.archives.count, &ez_stream, combined.entries.count, output_ezdb);
     double elapsed = now_ms() - start;
     if (rc != 0) {
         fprintf(stderr, "build-entries: ezdb_build_snapshot_stream_entries failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
+        free_loaded_combined(&combined);
         return 2;
     }
     printf("build_entries_ms: %.2f\n", elapsed);
     printf("build_entries_output_size: %llu\n", (unsigned long long)file_size_of_path(output_ezdb));
     print_memory_usage("build_entries_after");
 
-    free_loaded_archives(&archives);
-    free_loaded_entries(&entries);
+    free_loaded_combined(&combined);
     return 0;
 }
 
 /* --- live-entry-append-batch command --- */
 
-static int run_live_entry_append_batch(const char* archives_tsv, const char* entries_tsv, const char* output_ezdb, uint32_t batch_size)
+static int run_live_entry_append_batch(const char* combined_tsv, const char* output_ezdb, uint32_t batch_size)
 {
     DeleteFileA(output_ezdb);
 
-    LoadedArchives archives;
-    memset(&archives, 0, sizeof(archives));
-    if (!load_archive_tsv(archives_tsv, &archives)) {
-        fprintf(stderr, "live-entry-append-batch: unable to read archives %s\n", archives_tsv);
-        free_loaded_archives(&archives);
+    LoadedCombined combined;
+    memset(&combined, 0, sizeof(combined));
+    if (!load_combined_tsv(combined_tsv, &combined)) {
+        fprintf(stderr, "live-entry-append-batch: unable to read %s\n", combined_tsv);
+        free_loaded_combined(&combined);
         return 2;
     }
-    printf("live_batch_archives: %u\n", archives.count);
-
-    LoadedEntries entries;
-    memset(&entries, 0, sizeof(entries));
-    if (!load_entries_tsv(entries_tsv, &entries)) {
-        fprintf(stderr, "live-entry-append-batch: unable to read entries %s\n", entries_tsv);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
-        return 2;
-    }
-    printf("live_batch_entries: %u\n", entries.count);
+    printf("live_batch_archives: %u\n", combined.archives.count);
+    printf("live_batch_entries: %u\n", combined.entries.count);
     printf("live_batch_batch_size: %u\n", batch_size);
     print_memory_usage("live_batch_loaded");
 
     /* Build archive-only base */
     double start = now_ms();
-    int rc = ezdb_build_snapshot(archives.records, archives.count, NULL, 0, output_ezdb);
+    int rc = ezdb_build_snapshot(combined.archives.records, combined.archives.count, NULL, 0, output_ezdb);
     double build_elapsed = now_ms() - start;
     if (rc != 0) {
         fprintf(stderr, "live-entry-append-batch: build snapshot failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
+        free_loaded_combined(&combined);
         return 2;
     }
     printf("live_batch_build_ms: %.2f\n", build_elapsed);
@@ -1073,8 +1105,7 @@ static int run_live_entry_append_batch(const char* archives_tsv, const char* ent
     rc = ezdb_open(output_ezdb, &db);
     if (rc != 0) {
         fprintf(stderr, "live-entry-append-batch: open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
+        free_loaded_combined(&combined);
         return 2;
     }
     printf("live_batch_open_ms: %.2f\n", now_ms() - start - build_elapsed);
@@ -1086,8 +1117,7 @@ static int run_live_entry_append_batch(const char* archives_tsv, const char* ent
     if (rc != 0) {
         fprintf(stderr, "live-entry-append-batch: begin_write failed: %s (%d)\n", ezdb_error_message(rc), rc);
         ezdb_close(db);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
+        free_loaded_combined(&combined);
         return 2;
     }
 
@@ -1100,21 +1130,20 @@ static int run_live_entry_append_batch(const char* archives_tsv, const char* ent
         free(path_copies);
         ezdb_rollback_write(db);
         ezdb_close(db);
-        free_loaded_archives(&archives);
-        free_loaded_entries(&entries);
+        free_loaded_combined(&combined);
         return 2;
     }
 
-    while (e_idx < entries.count) {
-        uint32_t arch_id = entries.entries[e_idx].archive_index;
-        if (arch_id >= archives.count) {
-            fprintf(stderr, "live-entry-append-batch: archive_index %u out of range (max %u)\n", arch_id, archives.count);
+    while (e_idx < combined.entries.count) {
+        uint32_t arch_id = combined.entries.entries[e_idx].archive_index;
+        if (arch_id >= combined.archives.count) {
+            fprintf(stderr, "live-entry-append-batch: archive_index %u out of range (max %u)\n", arch_id, combined.archives.count);
             break;
         }
 
         /* Count entries for this archive */
         uint32_t run_start = e_idx;
-        while (e_idx < entries.count && entries.entries[e_idx].archive_index == arch_id) {
+        while (e_idx < combined.entries.count && combined.entries.entries[e_idx].archive_index == arch_id) {
             ++e_idx;
         }
         uint32_t run_count = e_idx - run_start;
@@ -1131,7 +1160,7 @@ static int run_live_entry_append_batch(const char* archives_tsv, const char* ent
             uint32_t n = run_count - written;
             if (n > batch_size) n = batch_size;
             for (uint32_t i = 0; i < n; ++i) {
-                const LoadedEntry* le = &entries.entries[run_start + written + i];
+                const LoadedEntry* le = &combined.entries.entries[run_start + written + i];
                 path_copies[i] = _strdup(le->entry_path);
                 memset(&batch[i], 0, sizeof(batch[i]));
                 batch[i].archive_id = arch_id;
@@ -1174,8 +1203,7 @@ static int run_live_entry_append_batch(const char* archives_tsv, const char* ent
     print_memory_usage("live_batch_after");
 
     ezdb_close(db);
-    free_loaded_archives(&archives);
-    free_loaded_entries(&entries);
+    free_loaded_combined(&combined);
     return rc == 0 ? 0 : 2;
 }
 
@@ -1406,21 +1434,20 @@ static int run_main(int argc, char** argv)
     }
 
     if (strcmp(argv[1], "build-entries") == 0) {
-        if (argc != 5) {
+        if (argc != 4) {
             print_usage();
             return 1;
         }
-        return run_build_entries(argv[2], argv[3], argv[4]);
+        return run_build_entries(argv[2], argv[3]);
     }
-
     if (strcmp(argv[1], "live-entry-append-batch") == 0) {
-        if (argc < 5 || argc > 6) {
+        if (argc < 4 || argc > 5) {
             print_usage();
             return 1;
         }
-        uint32_t lbatch_size = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 4096u;
+        uint32_t lbatch_size = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 10) : 4096u;
         if (!lbatch_size) lbatch_size = 4096u;
-        return run_live_entry_append_batch(argv[2], argv[3], argv[4], lbatch_size);
+        return run_live_entry_append_batch(argv[2], argv[3], lbatch_size);
     }
 
     if (strcmp(argv[1], "live-entry-append") == 0) {

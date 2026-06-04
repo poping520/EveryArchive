@@ -1,16 +1,20 @@
 ﻿#!/usr/bin/env python3
-"""Generate archive TSV + entry TSV sample files for ezdb benchmarking.
+"""Generate a combined TSV sample file for ezdb benchmarking.
 
 Usage:
   python tools/generate_entry_sample.py \
-      --archives test_data/archives_10k.tsv \
-      --entries test_data/entries_100k.tsv \
+      --output test_data/sample_10k_100k.combined.tsv \
       --archive-count 10000 \
       --entry-count 100000 \
       [--seed 42] \
       [--zh-ratio 0.3] \
       [--entries-min 0] \
       [--entries-max 50]
+
+Combined TSV format:
+  A\tdrive\tfile_ref\tusn\tfile_path\tfile_size\tmodified_time
+  E\tentry_path\tcompressed_size\toriginal_size\tmodified_time
+  Entries follow their owning archive; blank lines and # comments are skipped.
 """
 
 import argparse
@@ -66,16 +70,16 @@ DIRS_EN = [
     "Archives", "Work", "Temp", "Backups", "Logs", "Source", "Data",
 ]
 DIRS_ZH = [
-    "文档", "下载", "图片", "视频", "音乐", "项目", "归档",
-    "工作", "临时", "备份", "日志", "源码", "数据",
+    "\u6587\u6863", "\u4e0b\u8f7d", "\u56fe\u7247", "\u89c6\u9891", "\u97f3\u4e50", "\u9879\u76ee", "\u5f52\u6863",
+    "\u5de5\u4f5c", "\u4e34\u65f6", "\u5907\u4efd", "\u65e5\u5fd7", "\u6e90\u7801", "\u6570\u636e",
 ]
 NAMES_EN = [
     "report", "image", "archive", "invoice", "notes", "backup", "photo",
     "dataset", "summary", "config", "readme", "build", "export", "index",
 ]
 NAMES_ZH = [
-    "报告", "图片", "归档", "发票", "笔记", "备份", "照片",
-    "数据集", "汇总", "配置", "说明", "构建", "导出", "索引",
+    "\u62a5\u544a", "\u56fe\u7247", "\u5f52\u6863", "\u53d1\u7968", "\u7b14\u8bb0", "\u5907\u4efd", "\u7167\u7247",
+    "\u6570\u636e\u96c6", "\u6c47\u603b", "\u914d\u7f6e", "\u8bf4\u660e", "\u6784\u5efa", "\u5bfc\u51fa", "\u7d22\u5f15",
 ]
 ARCHIVE_EXTS = ["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "cab", "iso", "wim"]
 
@@ -95,15 +99,6 @@ def _pick(rng, choices, zh_choices, zh_ratio):
     return pool[rng.next_int(len(pool))]
 
 
-def generate_archive_path(rng, index, zh_ratio):
-    drive = chr(ord('C') + rng.next_int(4))
-    dir1 = _pick(rng, DIRS_EN, DIRS_ZH, zh_ratio)
-    dir2 = _pick(rng, DIRS_EN, DIRS_ZH, zh_ratio)
-    name = _pick(rng, NAMES_EN, NAMES_ZH, zh_ratio)
-    ext = ARCHIVE_EXTS[rng.next_int(len(ARCHIVE_EXTS))]
-    return f"{drive}:\\Users\\sample\\{dir1}\\{dir2}\\{name}_{index:08d}.{ext}"
-
-
 def generate_entry_path(rng, zh_ratio):
     d1 = ENTRY_DIRS[rng.next_int(len(ENTRY_DIRS))]
     d2 = ENTRY_DIRS[rng.next_int(len(ENTRY_DIRS))]
@@ -114,9 +109,8 @@ def generate_entry_path(rng, zh_ratio):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate archive + entry TSV samples for ezdb benchmarking")
-    parser.add_argument("--archives", required=True, help="Output archive TSV path")
-    parser.add_argument("--entries", required=True, help="Output entry TSV path")
+    parser = argparse.ArgumentParser(description="Generate combined TSV sample for ezdb benchmarking")
+    parser.add_argument("--output", required=True, help="Output combined TSV path")
     parser.add_argument("--archive-count", type=int, required=True, help="Number of archive records")
     parser.add_argument("--entry-count", type=int, required=True, help="Target total entry count")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed (default: 42)")
@@ -168,32 +162,29 @@ def main():
     total_entries = sum(counts)
     archives_with_entries = sum(1 for c in counts if c > 0)
 
-    for path in (args.archives, args.entries):
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     print(f"Generating {n_archives} archives and {total_entries} entries "
           f"({archives_with_entries} archives with entries)...")
 
-    with open(args.archives, "w", encoding="utf-8", newline="") as f_arch:
-        for i in range(n_archives):
+    with open(args.output, "w", encoding="utf-8", newline="") as f:
+        for arch_idx in range(n_archives):
+            # Write archive line (A prefix)
             drive = chr(ord('C') + rng.next_int(4))
             dir1 = _pick(rng, DIRS_EN, DIRS_ZH, zh_ratio)
             dir2 = _pick(rng, DIRS_EN, DIRS_ZH, zh_ratio)
             name = _pick(rng, NAMES_EN, NAMES_ZH, zh_ratio)
             ext = ARCHIVE_EXTS[rng.next_int(len(ARCHIVE_EXTS))]
-            file_path = f"{drive}:\\Users\\sample\\{dir1}\\{dir2}\\{name}_{i:08d}.{ext}"
-            file_ref = 0x100000000 + i * 17 + (rng.next() & 0xFFFF)
-            usn = 0x400000000 + i * 3 + (rng.next() & 0xFFFF)
+            file_path = f"{drive}:\\Users\\sample\\{dir1}\\{dir2}\\{name}_{arch_idx:08d}.{ext}"
+            file_ref = 0x100000000 + arch_idx * 17 + (rng.next() & 0xFFFF)
+            usn = 0x400000000 + arch_idx * 3 + (rng.next() & 0xFFFF)
             file_size = rng.next() % (512 * 1024 * 1024)
             modified_time = 1577836800 + (rng.next() % 220752000)
-            f_arch.write(f"{drive}\t{file_ref}\t{usn}\t{file_path}\t{file_size}\t{modified_time}\n")
+            f.write(f"A\t{drive}\t{file_ref}\t{usn}\t{file_path}\t{file_size}\t{modified_time}\n")
 
-    archive_size = os.path.getsize(args.archives)
-
-    with open(args.entries, "w", encoding="utf-8", newline="") as f_ent:
-        for arch_idx in range(n_archives):
+            # Write entry lines (E prefix) for this archive
             for e_idx in range(counts[arch_idx]):
                 entry_path = generate_entry_path(rng, zh_ratio)
                 original_size = rng.next() % (50 * 1024 * 1024)
@@ -201,14 +192,13 @@ def main():
                 compressed_size = int(original_size * ratio)
                 if rng.next_int(10) == 0:
                     compressed_size = -1
-                modified_time = 1577836800 + (rng.next() % 220752000)
-                f_ent.write(f"{arch_idx}\t{entry_path}\t{compressed_size}\t{original_size}\t{modified_time}\n")
+                entry_mtime = 1577836800 + (rng.next() % 220752000)
+                f.write(f"E\t{entry_path}\t{compressed_size}\t{original_size}\t{entry_mtime}\n")
 
-    entry_size = os.path.getsize(args.entries)
+    output_size = os.path.getsize(args.output)
 
     print(f"Done.")
-    print(f"  Archives: {args.archives} ({archive_size:,} bytes, {n_archives} records)")
-    print(f"  Entries:  {args.entries} ({entry_size:,} bytes, {total_entries} records)")
+    print(f"  Output: {args.output} ({output_size:,} bytes, {n_archives} archives, {total_entries} entries)")
 
 
 if __name__ == "__main__":
