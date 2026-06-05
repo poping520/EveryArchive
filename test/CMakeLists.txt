@@ -4,6 +4,8 @@ project(EveryZip LANGUAGES C CXX)
 
 enable_testing()
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -153,3 +155,11 @@ everyzip_configure_test_target(QueryDB)
 everyzip_configure_test_target(TestConfig)
 
 add_test(NAME TestIndexStore COMMAND TestIndexStore)
+
+if(Python3_Interpreter_FOUND)
+    add_test(NAME EzdbZipFixtureTests
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/ezdb_zip_fixture_tests.py
+                    --bench $<TARGET_FILE:EzdbBench>
+                    --work-dir ${CMAKE_BINARY_DIR}/ezdb_zip_fixture_tests)
+endif()
