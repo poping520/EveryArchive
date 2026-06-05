@@ -74,6 +74,10 @@ int posting_builder_remove_id(PostingBuilder* builder, uint32_t key, uint32_t id
 int add_text_grams_to_builder(PostingBuilder* builder, const char* text, uint32_t id, int mode);
 int count_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
 int fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
+uint32_t estimate_array_size(const uint32_t* ids, uint32_t count);
+uint32_t count_ranges(const uint32_t* ids, uint32_t count);
+uint32_t estimate_range_size(const uint32_t* ids, uint32_t count);
+int encode_posting_container(const uint32_t* ids, uint32_t count, uint32_t universe_count, uint32_t type, unsigned char** out_data, uint32_t* out_size);
 
 #define utf8_token_len ezdb_postings_utf8_token_len
 #define make_gram_key_from_span ezdb_postings_make_gram_key_from_span
