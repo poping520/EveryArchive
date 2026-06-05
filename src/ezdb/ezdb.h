@@ -49,6 +49,8 @@ typedef struct EzdbBuildOptions {
     uint32_t memory_limit_mb;
     uint32_t flags;
     uint32_t log_level;
+    uint32_t index_threads;
+    uint32_t zip_threads;
 } EzdbBuildOptions;
 
 typedef struct EzdbSearchResult {

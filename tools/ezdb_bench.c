@@ -13,6 +13,7 @@
 #include "ioapi.h"
 #include "iowin32.h"
 #include "unzip.h"
+#include "zip_cd_scanner.h"
 
 typedef struct SearchStats {
     uint32_t printed;
@@ -716,6 +717,7 @@ typedef struct ZipParseJob {
     volatile LONG completed;
     volatile LONG opened;
     volatile LONG failed;
+    volatile LONG fallback;
     volatile LONG64 entries;
     volatile LONG64 spool_bytes;
 } ZipParseJob;
@@ -854,7 +856,9 @@ static int write_zip_spool_entry(ZipSpoolShard* shard,
                                  const char* raw_name,
                                  uint32_t raw_name_len,
                                  int is_utf8,
-                                 const unz_file_info64* info,
+                                 int64_t compressed_size,
+                                 uint64_t original_size,
+                                 uint64_t modified_time,
                                  uint32_t* out_entry_count)
 {
     char* decoded = NULL;
@@ -878,9 +882,9 @@ static int write_zip_spool_entry(ZipSpoolShard* shard,
     memset(&header, 0, sizeof(header));
     header.path_len = (uint32_t)strlen(decoded);
     header.raw_len = raw_len;
-    header.compressed_size = (int64_t)info->compressed_size;
-    header.original_size = (uint64_t)info->uncompressed_size;
-    header.modified_time = zip_tm_to_filetime_value(&info->tmu_date);
+    header.compressed_size = compressed_size;
+    header.original_size = original_size;
+    header.modified_time = modified_time;
     if (fwrite(&header, sizeof(header), 1, shard->fp) != 1 ||
         (header.path_len && fwrite(decoded, 1, header.path_len, shard->fp) != header.path_len) ||
         (raw_len && fwrite(raw_copy, 1, raw_len, shard->fp) != raw_len)) {
@@ -893,6 +897,26 @@ static int write_zip_spool_entry(ZipSpoolShard* shard,
     free(decoded);
     free(raw_copy);
     return 1;
+}
+
+typedef struct ZipCdSpoolContext {
+    ZipSpoolShard* shard;
+    uint32_t entry_count;
+} ZipCdSpoolContext;
+
+static int on_zip_cd_entry(const ZipCdEntry* entry, void* user_data)
+{
+    ZipCdSpoolContext* ctx = (ZipCdSpoolContext*)user_data;
+    if (!entry || !ctx || !ctx->shard) return 0;
+    if (ends_with_archive_slash(entry->raw_name, entry->raw_name_len)) return 1;
+    return write_zip_spool_entry(ctx->shard,
+                                 entry->raw_name,
+                                 entry->raw_name_len,
+                                 (entry->flags & 0x800u) != 0,
+                                 entry->compressed_size,
+                                 entry->original_size,
+                                 entry->modified_time,
+                                 &ctx->entry_count);
 }
 
 static int parse_zip_archive_entries(const EzdbArchiveRecord* archive,
@@ -975,7 +999,9 @@ static int parse_zip_archive_entries(const EzdbArchiveRecord* archive,
                                        name,
                                        (uint32_t)info.size_filename,
                                        (info.flag & 0x800) != 0,
-                                       &info,
+                                       (int64_t)info.compressed_size,
+                                       (uint64_t)info.uncompressed_size,
+                                       zip_tm_to_filetime_value(&info.tmu_date),
                                        &entry_count)) {
                 free(name);
                 strcpy(chunk->error, "write spool failed");
@@ -1004,6 +1030,40 @@ static int parse_zip_archive_entries(const EzdbArchiveRecord* archive,
     return 1;
 }
 
+static int parse_zip_archive_entries_cd(const EzdbArchiveRecord* archive,
+                                        ZipSpoolShard* shard,
+                                        ArchiveEntryChunk* chunk)
+{
+    wchar_t* wide_path = NULL;
+    double start = now_ms();
+    uint64_t start_offset = shard ? shard->written : 0;
+    ZipCdSpoolContext ctx;
+    if (!archive || !shard || !chunk) return 0;
+    memset(chunk, 0, sizeof(*chunk));
+    chunk->shard_id = UINT_MAX;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.shard = shard;
+    wide_path = utf8_to_wide_alloc(archive->file_path);
+    if (!wide_path) {
+        strcpy(chunk->error, "path utf8 decode failed");
+        return 0;
+    }
+    char error[96];
+    memset(error, 0, sizeof(error));
+    int ok = zip_cd_scan_entries(wide_path, on_zip_cd_entry, &ctx, error, (uint32_t)sizeof(error));
+    free(wide_path);
+    if (!ok) {
+        snprintf(chunk->error, sizeof(chunk->error), "zip_cd failed: %s", error[0] ? error : "unknown");
+        return 0;
+    }
+    chunk->offset = start_offset;
+    chunk->byte_size = shard->written - start_offset;
+    chunk->entry_count = ctx.entry_count;
+    chunk->ok = 1;
+    chunk->parse_ms = now_ms() - start;
+    return 1;
+}
+
 static DWORD WINAPI zip_parse_worker(LPVOID param)
 {
     ZipWorkerContext* ctx = (ZipWorkerContext*)param;
@@ -1016,7 +1076,11 @@ static DWORD WINAPI zip_parse_worker(LPVOID param)
         int ok = 0;
         if (index < 0 || (uint32_t)index >= job->archive_count) break;
         chunk = &job->chunks[index];
-        ok = parse_zip_archive_entries(&job->archives->records[index], (uint32_t)index, shard, chunk);
+        ok = parse_zip_archive_entries_cd(&job->archives->records[index], shard, chunk);
+        if (!ok) {
+            InterlockedIncrement(&job->fallback);
+            ok = parse_zip_archive_entries(&job->archives->records[index], (uint32_t)index, shard, chunk);
+        }
         chunk->shard_id = ctx->shard_id;
         if (ok) {
             InterlockedIncrement(&job->opened);
@@ -1235,14 +1299,16 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
         LONG done = job.completed;
         LONG opened = job.opened;
         LONG failed = job.failed;
+        LONG fallback = job.fallback;
         LONG64 entries = job.entries;
         LONG64 spool_bytes = job.spool_bytes;
         double elapsed = now_ms() - parse_start;
-        printf("zip_parse_progress: %ld/%u opened=%ld failed=%ld entries=%lld spool_entry_bytes_mb=%.2f elapsed_seconds=%.3f archives_per_second=%.2f entries_per_second=%.2f\n",
+        printf("zip_parse_progress: %ld/%u opened=%ld failed=%ld fallback=%ld entries=%lld spool_entry_bytes_mb=%.2f elapsed_seconds=%.3f archives_per_second=%.2f entries_per_second=%.2f\n",
                done,
                archives.count,
                opened,
                failed,
+               fallback,
                (long long)entries,
                bytes_to_mb((uint64_t)spool_bytes),
                ms_to_seconds(elapsed),
@@ -1288,6 +1354,8 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
     entry_count = (uint32_t)job.entries;
 
     printf("zip_parse_seconds: %.3f\n", ms_to_seconds(now_ms() - parse_start));
+    printf("zip_cd_scan_seconds: %.3f\n", ms_to_seconds(now_ms() - parse_start));
+    printf("zip_minizip_fallback_count: %ld\n", job.fallback);
     printf("zip_opened_archives: %ld\n", job.opened);
     printf("zip_failed_archives: %ld\n", job.failed);
     printf("zip_entries: %u\n", entry_count);
@@ -1321,6 +1389,8 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
         build_options.temp_dir = temp_dir;
         build_options.memory_limit_mb = 512u;
         build_options.flags = EZDB_BUILD_DEFAULT_FLAGS;
+        build_options.zip_threads = thread_count;
+        build_options.index_threads = thread_count;
         int rc = ezdb_build_snapshot_stream_entries_ex(archives.records,
                                                        archives.count,
                                                        entry_count ? &ez_stream : NULL,

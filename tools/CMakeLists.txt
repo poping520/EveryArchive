@@ -1,5 +1,7 @@
 add_executable(EzdbBench
         ezdb_bench.c
+        zip_cd_scanner.c
+        zip_cd_scanner.h
 )
 
 target_link_libraries(EzdbBench PRIVATE ezdb minizip psapi)

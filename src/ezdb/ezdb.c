@@ -323,6 +323,8 @@ typedef struct EzdbBuildOptionsResolved {
     uint32_t memory_limit_mb;
     uint32_t flags;
     uint32_t log_level;
+    uint32_t index_threads;
+    uint32_t zip_threads;
 } EzdbBuildOptionsResolved;
 
 typedef struct StreamPagedWriter {
@@ -2174,6 +2176,8 @@ static int resolve_build_options(const char* output_ezdb, const EzdbBuildOptions
     if (out->memory_limit_mb < 32u) out->memory_limit_mb = 32u;
     out->flags = options && options->flags ? options->flags : EZDB_BUILD_DEFAULT_FLAGS;
     out->log_level = options ? options->log_level : 0u;
+    out->index_threads = options && options->index_threads ? options->index_threads : 0u;
+    out->zip_threads = options && options->zip_threads ? options->zip_threads : 0u;
     if (options && options->temp_dir && options->temp_dir[0]) {
         if (snprintf(out->temp_dir, sizeof(out->temp_dir), "%s", options->temp_dir) >= (int)sizeof(out->temp_dir)) return EZDB_ERR_ARG;
     } else {
