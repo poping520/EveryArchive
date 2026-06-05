@@ -68,6 +68,7 @@ int ezdb_postings_build_query_keys(const char* keyword, uint32_t** out_keys, uin
 int ezdb_postings_builder_init(PostingBuilder* builder, uint32_t bucket_count);
 void ezdb_postings_builder_free(PostingBuilder* builder);
 int ezdb_postings_builder_add(PostingBuilder* builder, uint32_t key, uint32_t id);
+int ezdb_postings_builder_add_count(PostingBuilder* builder, uint32_t key, uint32_t count);
 PostingBuildEntry* ezdb_postings_builder_find(PostingBuilder* builder, uint32_t key);
 int ezdb_postings_builder_prepare_fill(PostingBuilder* builder);
 int ezdb_postings_builder_prepare_fill_adaptive(PostingBuilder* builder, uint32_t universe_count);

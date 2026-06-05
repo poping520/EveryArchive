@@ -394,6 +394,34 @@ static int ezdb_postings_builder_count_id(PostingBuilder* builder, uint32_t key,
     return EZDB_OK;
 }
 
+int ezdb_postings_builder_add_count(PostingBuilder* builder, uint32_t key, uint32_t count)
+{
+    if (!builder || !builder->buckets || !builder->bucket_count) return EZDB_ERR_ARG;
+    if (!count) return EZDB_OK;
+    uint32_t bucket = posting_bucket_for(key, builder->bucket_count);
+    for (uint32_t i = builder->buckets[bucket]; i != UINT32_MAX; i = builder->entries[i].next) {
+        PostingBuildEntry* entry = &builder->entries[i];
+        if (entry->key == key) {
+            if (UINT32_MAX - entry->count < count) return EZDB_ERR_MEMORY;
+            entry->count += count;
+            entry->cap = 0;
+            return EZDB_OK;
+        }
+    }
+
+    if (ezdb_postings_ensure_capacity((void**)&builder->entries, sizeof(PostingBuildEntry), &builder->entry_cap, builder->entry_count + 1u) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    PostingBuildEntry* entry = &builder->entries[builder->entry_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->key = key;
+    entry->count = count;
+    entry->next = builder->buckets[bucket];
+    builder->buckets[bucket] = builder->entry_count;
+    builder->entry_count += 1u;
+    return EZDB_OK;
+}
+
 int ezdb_postings_builder_prepare_fill(PostingBuilder* builder)
 {
     uint64_t total_ids = 0;

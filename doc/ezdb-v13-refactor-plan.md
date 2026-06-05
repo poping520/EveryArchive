@@ -517,10 +517,12 @@ v13 调整：
 - `EzdbEntryStream` 已增加可选 `open_range` / `close_range`，支持为 archive range 创建独立 reader。
 - `build-zip-entries` 的 spool stream 已实现独立 range reader，后续线程可安全并发读取不同 archive range。
 - entry index 构建日志已输出 `entry_index_threads`、`entry_index_count_parallel_seconds`、`entry_index_reduce_seconds`、`entry_index_fill_parallel_seconds`、`entry_index_write_seconds`。
+- pass 1 parallel count 已接入：每个线程使用独立 range reader 生成本地 count builder，再 reduce 合并到全局 builder。
+- 在 `test_data\all_zip_files.tsv` 上 6 线程实测：`entry_index_count_seconds 4.785s`、`entry_index_reduce_seconds 0.013s`、`entry_index_fill_seconds 14.265s`、总构建 `26.783s`。
 
-- [ ] 设计 per-thread key count map。
-- [ ] 实现 pass 1 parallel count。
-- [ ] 实现 reduce。
+- [x] 设计 per-thread key count map。
+- [x] 实现 pass 1 parallel count。
+- [x] 实现 reduce。
 - [ ] 实现 slice offset prepare。
 - [ ] 实现 pass 2 parallel fill。
 - [ ] 实现 write 阶段复用 postings module。
@@ -555,6 +557,7 @@ v13 调整：
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper。
 - `src/ezdb/ezdb_format.c/.h` 已接管 v13 header 与 section table helper。
 - 阶段 D 已完成独立 archive range reader 准备：核心 stream API 透传 `open_range/close_range`，zip spool stream 可创建 per-range reader。
+- 阶段 D 已完成 pass 1 parallel count 和 reduce，当前剩余最大瓶颈是单线程 pass 2 fill。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -564,8 +567,8 @@ v13 调整：
 下次继续的首要断点：
 
 - 阶段 D 多线程 postings 构建继续。
-- 下一步实现 entry postings 的 per-thread pass 1 count：按 archive range 切分线程，每个线程使用独立 range reader，生成本地 `key -> count`。
-- pass 1 完成后先保留单线程 fill/write，验证搜索结果一致，再继续 reduce/prepare/pass 2。
+- 下一步实现 slice offset prepare 和 pass 2 parallel fill。
+- pass 2 必须保持每个 key 的 postings id 升序；建议沿用 archive range 的递增顺序，为每个线程计算 per-key slice offset 后无锁填充。
 
 ## 风险与注意事项
 
