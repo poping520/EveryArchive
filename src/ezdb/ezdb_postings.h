@@ -76,6 +76,7 @@ int ezdb_postings_builder_remove_id(PostingBuilder* builder, uint32_t key, uint3
 int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint32_t id, int mode);
 int ezdb_postings_count_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
 int ezdb_postings_fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
+int ezdb_postings_fill_text_grams_sliced(PostingBuilder* builder, PostingBuilder* slice_builder, const char* text, uint32_t id);
 EzdbDiskIndex* ezdb_postings_find_index(EzdbDiskIndex* index, uint64_t count, uint32_t key);
 int ezdb_postings_load(FILE* fp, uint64_t postings_offset, const EzdbDiskIndex* idx, uint32_t** out_ids);
 int ezdb_postings_load_intersected(FILE* fp,

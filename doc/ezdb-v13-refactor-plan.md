@@ -30,7 +30,7 @@ ezdb v13 的目标是为 `build-zip-entries` 建立一个更快、更低内存�
 | 删除旧 event spool sorter | 已完成 | 旧 run reader、heap merge、event sorter 写入路径已删除 |
 | query 基础模块 | 已完成 | query parser、AST、wildcard、candidate keys、text match helper 已迁入 `ezdb_query.c/.h` |
 | v13 section directory 格式 | 部分完成 | build/open 已接入 v13 section table；live entry append 重新 open 已修复并验证 |
-| 多线程 postings 构建 | 未开始 | 计划中的最大剩余提速点 |
+| 多线程 postings 构建 | 已完成 | pass 1 count、reduce、slice prepare、pass 2 fill 已并行化 |
 | query 主流程拆分 | 部分完成 | parser/helper 已迁出，`search/search-v2/query_entries` 主流程仍在 `ezdb.c` |
 | delta 模块拆分 | 未开始 | insert/update/delete/compact 仍在 `ezdb.c` |
 | entries 模块拆分 | 部分完成 | entry 写入相关还在 `ezdb.c`，stream 数据结构已存在 |
@@ -510,7 +510,7 @@ v13 调整：
 
 ### 阶段 D：多线程 postings
 
-状态：准备中。
+状态：已完成当前计划。
 
 已完成准备：
 
@@ -519,14 +519,16 @@ v13 调整：
 - entry index 构建日志已输出 `entry_index_threads`、`entry_index_count_parallel_seconds`、`entry_index_reduce_seconds`、`entry_index_fill_parallel_seconds`、`entry_index_write_seconds`。
 - pass 1 parallel count 已接入：每个线程使用独立 range reader 生成本地 count builder，再 reduce 合并到全局 builder。
 - 在 `test_data\all_zip_files.tsv` 上 6 线程实测：`entry_index_count_seconds 4.785s`、`entry_index_reduce_seconds 0.013s`、`entry_index_fill_seconds 14.265s`、总构建 `26.783s`。
+- pass 2 parallel fill 已接入：基于每个线程的本地 count 计算 per-key slice offset，数组/range postings 按 slice 无锁填充，bitset postings 使用原子 OR。
+- 在 `test_data\all_zip_files.tsv` 上 6 线程实测：`entry_index_count_seconds 3.337s`、`entry_index_reduce_seconds 0.021s`、`entry_index_prepare_seconds 0.068s`、`entry_index_fill_seconds 5.062s`、总构建 `17.256s`，输出仍为 `97.46 MB`。
 
 - [x] 设计 per-thread key count map。
 - [x] 实现 pass 1 parallel count。
 - [x] 实现 reduce。
-- [ ] 实现 slice offset prepare。
-- [ ] 实现 pass 2 parallel fill。
-- [ ] 实现 write 阶段复用 postings module。
-- [ ] 加入性能日志。
+- [x] 实现 slice offset prepare。
+- [x] 实现 pass 2 parallel fill。
+- [x] 实现 write 阶段复用 postings module。
+- [x] 加入性能日志。
 
 ### 阶段 E：测试体系
 
@@ -557,7 +559,7 @@ v13 调整：
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper。
 - `src/ezdb/ezdb_format.c/.h` 已接管 v13 header 与 section table helper。
 - 阶段 D 已完成独立 archive range reader 准备：核心 stream API 透传 `open_range/close_range`，zip spool stream 可创建 per-range reader。
-- 阶段 D 已完成 pass 1 parallel count 和 reduce，当前剩余最大瓶颈是单线程 pass 2 fill。
+- 阶段 D 已完成 pass 1 parallel count、reduce、slice offset prepare 和 pass 2 parallel fill；当前剩余优化点转向 ZIP fixture/测试体系、模块拆分和后续大样本复测。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -566,9 +568,8 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 阶段 D 多线程 postings 构建继续。
-- 下一步实现 slice offset prepare 和 pass 2 parallel fill。
-- pass 2 必须保持每个 key 的 postings id 升序；建议沿用 archive range 的递增顺序，为每个线程计算 per-key slice offset 后无锁填充。
+- 下一步进入阶段 E 测试体系，优先补 ZIP fixture 和 build-zip-entries 回归。
+- 建议先覆盖小 ZIP、空 ZIP、central directory comment、目录 entry skip，再补 ZIP64 和非 UTF-8 entry name。
 
 ## 风险与注意事项
 

@@ -5,6 +5,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <windows.h>
 
 static unsigned char ezdb_postings_fold_ascii_byte(unsigned char ch)
@@ -508,7 +511,38 @@ static int ezdb_postings_builder_fill_id(PostingBuilder* builder, uint32_t key, 
     return EZDB_OK;
 }
 
-int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint32_t id, int mode)
+static void ezdb_postings_atomic_or_byte(unsigned char* ptr, unsigned char mask)
+{
+#if defined(_MSC_VER)
+    volatile char* target = (volatile char*)ptr;
+    char old_value;
+    char new_value;
+    do {
+        old_value = *target;
+        new_value = (char)(old_value | (char)mask);
+    } while (_InterlockedCompareExchange8(target, new_value, old_value) != old_value);
+#else
+    *ptr |= mask;
+#endif
+}
+
+static int ezdb_postings_builder_fill_id_sliced(PostingBuilder* builder, PostingBuilder* slice_builder, uint32_t key, uint32_t id)
+{
+    PostingBuildEntry* entry = ezdb_postings_builder_find(builder, key);
+    if (!entry) return EZDB_ERR_FORMAT;
+    if (entry->fill_mode == EZDB_POSTING_BITSET) {
+        unsigned char* bits = (unsigned char*)entry->ids;
+        ezdb_postings_atomic_or_byte(&bits[id >> 3u], (unsigned char)(1u << (id & 7u)));
+        return EZDB_OK;
+    }
+    PostingBuildEntry* slice = ezdb_postings_builder_find(slice_builder, key);
+    if (!slice) return EZDB_ERR_FORMAT;
+    if (slice->cap >= slice->fill_bytes || slice->cap >= entry->count) return EZDB_ERR_FORMAT;
+    entry->ids[slice->cap++] = id;
+    return EZDB_OK;
+}
+
+static int ezdb_postings_add_text_grams_ex(PostingBuilder* builder, PostingBuilder* slice_builder, const char* text, uint32_t id, int mode)
 {
     uint32_t len = (uint32_t)strlen(text);
     if (!len) return EZDB_OK;
@@ -590,6 +624,8 @@ int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint
             rc = ezdb_postings_builder_count_id(builder, keys[i], id);
         } else if (mode == 2) {
             rc = ezdb_postings_builder_fill_id(builder, keys[i], id);
+        } else if (mode == 3) {
+            rc = ezdb_postings_builder_fill_id_sliced(builder, slice_builder, keys[i], id);
         } else {
             rc = ezdb_postings_builder_add(builder, keys[i], id);
         }
@@ -604,6 +640,11 @@ int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint
     return EZDB_OK;
 }
 
+int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint32_t id, int mode)
+{
+    return ezdb_postings_add_text_grams_ex(builder, NULL, text, id, mode);
+}
+
 int ezdb_postings_count_text_grams(PostingBuilder* builder, const char* text, uint32_t id)
 {
     return ezdb_postings_add_text_grams(builder, text, id, 1);
@@ -612,6 +653,12 @@ int ezdb_postings_count_text_grams(PostingBuilder* builder, const char* text, ui
 int ezdb_postings_fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id)
 {
     return ezdb_postings_add_text_grams(builder, text, id, 2);
+}
+
+int ezdb_postings_fill_text_grams_sliced(PostingBuilder* builder, PostingBuilder* slice_builder, const char* text, uint32_t id)
+{
+    if (!slice_builder) return EZDB_ERR_ARG;
+    return ezdb_postings_add_text_grams_ex(builder, slice_builder, text, id, 3);
 }
 
 static int ezdb_postings_append_varuint(unsigned char** data, uint32_t* size, uint32_t* cap, uint32_t value)

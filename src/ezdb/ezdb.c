@@ -2045,6 +2045,12 @@ typedef struct EntryIndexCountThread {
     int rc;
 } EntryIndexCountThread;
 
+typedef struct EntryIndexParallelState {
+    EntryIndexCountThread* contexts;
+    uint32_t thread_count;
+    int ready;
+} EntryIndexParallelState;
+
 static DWORD WINAPI entry_index_count_thread_proc(LPVOID param)
 {
     EntryIndexCountThread* ctx = (EntryIndexCountThread*)param;
@@ -2090,6 +2096,18 @@ static void entry_index_count_thread_cleanup(EntryIndexCountThread* ctx)
     memset(ctx, 0, sizeof(*ctx));
 }
 
+static void entry_index_parallel_state_free(EntryIndexParallelState* state)
+{
+    if (!state || !state->contexts) return;
+    for (uint32_t i = 0; i < state->thread_count; ++i) {
+        EntryIndexCountThread* ctx = &state->contexts[i];
+        if (ctx->builder_ready) ezdb_postings_builder_free(&ctx->builder);
+        free(ctx->local_archive_seen);
+    }
+    free(state->contexts);
+    memset(state, 0, sizeof(*state));
+}
+
 static int merge_entry_index_count_builder(PostingBuilder* dst, const PostingBuilder* src)
 {
     if (!dst || !src) return EZDB_ERR_ARG;
@@ -2106,7 +2124,8 @@ static int entry_index_count_parallel(EzdbEntrySource* source,
                                       const uint32_t* archive_entry_counts,
                                       uint32_t archive_count,
                                       uint32_t requested_threads,
-                                      double* out_reduce_ms)
+                                      double* out_reduce_ms,
+                                      EntryIndexParallelState* out_state)
 {
     if (!source || !source->open_range || !source->close_range || !builder ||
         !archive_entry_bases || !archive_entry_counts || !archive_count || requested_threads < 2u) {
@@ -2166,8 +2185,111 @@ static int entry_index_count_parallel(EzdbEntrySource* source,
         }
         if (out_reduce_ms) *out_reduce_ms = ezdb_now_ms() - reduce_start_ms;
     }
-    for (uint32_t t = 0; t < created; ++t) entry_index_count_thread_cleanup(&contexts[t]);
-    free(contexts);
+    for (uint32_t t = 0; t < created; ++t) {
+        if (contexts[t].source_opened && contexts[t].parent_source && contexts[t].parent_source->close_range) {
+            contexts[t].parent_source->close_range(&contexts[t].source);
+            contexts[t].source_opened = 0;
+        }
+    }
+    if (rc == EZDB_OK && out_state) {
+        out_state->contexts = contexts;
+        out_state->thread_count = created;
+        out_state->ready = 1;
+        contexts = NULL;
+    }
+    if (contexts) {
+        for (uint32_t t = 0; t < created; ++t) entry_index_count_thread_cleanup(&contexts[t]);
+        free(contexts);
+    }
+    free(handles);
+    return rc;
+}
+
+static int entry_index_prepare_parallel_fill_slices(PostingBuilder* builder, EntryIndexParallelState* state)
+{
+    if (!builder || !state || !state->ready) return EZDB_ERR_ARG;
+    for (uint32_t i = 0; i < builder->entry_count; ++i) {
+        PostingBuildEntry* entry = &builder->entries[i];
+        uint32_t offset = 0;
+        for (uint32_t t = 0; t < state->thread_count; ++t) {
+            PostingBuildEntry* local = ezdb_postings_builder_find(&state->contexts[t].builder, entry->key);
+            if (!local) continue;
+            if (UINT32_MAX - offset < local->count || offset + local->count > entry->count) return EZDB_ERR_FORMAT;
+            local->cap = offset;
+            local->fill_bytes = offset + local->count;
+            offset += local->count;
+        }
+        if (offset != entry->count) return EZDB_ERR_FORMAT;
+    }
+    return EZDB_OK;
+}
+
+static DWORD WINAPI entry_index_fill_thread_proc(LPVOID param)
+{
+    EntryIndexCountThread* ctx = (EntryIndexCountThread*)param;
+    PostingBuilder* global_builder = NULL;
+    if (!ctx || !ctx->parent_source || !ctx->parent_source->open_range) return 1;
+    global_builder = (PostingBuilder*)ctx->source.user_data;
+    memset(&ctx->source, 0, sizeof(ctx->source));
+    ctx->source_opened = 0;
+    ctx->rc = ctx->parent_source->open_range(ctx->parent_source->user_data, ctx->archive_begin, ctx->archive_end, &ctx->source);
+    if (ctx->rc != EZDB_OK) return 1;
+    ctx->source_opened = 1;
+    memset(ctx->local_archive_seen, 0, sizeof(uint32_t) * (size_t)(ctx->archive_end - ctx->archive_begin ? ctx->archive_end - ctx->archive_begin : 1u));
+    for (uint32_t i = 0; i < ctx->range_entry_count; ++i) {
+        EzdbEntryRecord record;
+        memset(&record, 0, sizeof(record));
+        ctx->rc = ctx->source.next(ctx->source.user_data, &record);
+        if (ctx->rc != EZDB_OK) return 1;
+        if (!record.entry_path || record.archive_id < ctx->archive_begin || record.archive_id >= ctx->archive_end) {
+            ctx->rc = EZDB_ERR_ARG;
+            return 1;
+        }
+        uint32_t local_archive = record.archive_id - ctx->archive_begin;
+        uint32_t entry_id = ctx->archive_entry_bases[record.archive_id] + ctx->local_archive_seen[local_archive]++;
+        ctx->rc = ezdb_postings_fill_text_grams_sliced(global_builder, &ctx->builder, record.entry_path, entry_id);
+        if (ctx->rc != EZDB_OK) return 1;
+    }
+    ctx->rc = EZDB_OK;
+    return 0;
+}
+
+static int entry_index_fill_parallel(EzdbEntrySource* source, PostingBuilder* builder, EntryIndexParallelState* state)
+{
+    if (!source || !builder || !state || !state->ready) return EZDB_ERR_ARG;
+    HANDLE* handles = (HANDLE*)calloc(state->thread_count, sizeof(*handles));
+    if (!handles) return EZDB_ERR_MEMORY;
+    int rc = EZDB_OK;
+    uint32_t created = 0;
+    for (uint32_t t = 0; t < state->thread_count; ++t) {
+        state->contexts[t].parent_source = source;
+        state->contexts[t].source.user_data = builder;
+        handles[t] = CreateThread(NULL, 0, entry_index_fill_thread_proc, &state->contexts[t], 0, NULL);
+        if (!handles[t]) {
+            rc = EZDB_ERR_IO;
+            break;
+        }
+        ++created;
+    }
+    if (created) {
+        DWORD wait_rc = WaitForMultipleObjects(created, handles, TRUE, INFINITE);
+        if (wait_rc == WAIT_FAILED) rc = EZDB_ERR_IO;
+    }
+    for (uint32_t t = 0; t < created; ++t) {
+        if (handles[t]) CloseHandle(handles[t]);
+        if (state->contexts[t].source_opened && source->close_range) {
+            source->close_range(&state->contexts[t].source);
+            state->contexts[t].source_opened = 0;
+        }
+    }
+    if (rc == EZDB_OK) {
+        for (uint32_t t = 0; t < created; ++t) {
+            if (state->contexts[t].rc != EZDB_OK) {
+                rc = state->contexts[t].rc;
+                break;
+            }
+        }
+    }
     free(handles);
     return rc;
 }
@@ -2214,7 +2336,9 @@ static int ezdb_write_entries_from_source(FILE* out,
     uint32_t* archive_entry_bases = NULL;
     int parallel_count_possible = 0;
     int parallel_count_enabled = 0;
+    int parallel_fill_enabled = 0;
     uint32_t last_entry_archive_id = UINT32_MAX;
+    EntryIndexParallelState parallel_state;
     PostingWriteStats entry_posting_stats;
     memset(&entry_posting_stats, 0, sizeof(entry_posting_stats));
 
@@ -2222,6 +2346,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     memset(&detail_writer, 0, sizeof(detail_writer));
     memset(&raw_writer, 0, sizeof(raw_writer));
     memset(&entry_builder, 0, sizeof(entry_builder));
+    memset(&parallel_state, 0, sizeof(parallel_state));
     if (snprintf(core_path, sizeof(core_path), "%s\\entry_core.tmp", options->temp_dir) >= (int)sizeof(core_path) ||
         snprintf(detail_path, sizeof(detail_path), "%s\\entry_detail.tmp", options->temp_dir) >= (int)sizeof(detail_path) ||
         snprintf(raw_path, sizeof(raw_path), "%s\\entry_raw.tmp", options->temp_dir) >= (int)sizeof(raw_path)) {
@@ -2366,7 +2491,8 @@ static int ezdb_write_entries_from_source(FILE* out,
                                         archive_entry_counts,
                                         original_archive_count,
                                         options->index_threads,
-                                        &index_reduce_ms);
+                                        &index_reduce_ms,
+                                        &parallel_state);
         index_count_ms = ezdb_now_ms() - stage_start_ms;
         if (rc == EZDB_OK) parallel_count_enabled = 1;
     }
@@ -2374,27 +2500,35 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (rc == EZDB_OK && entry_count && entry_builder_ready) {
         stage_start_ms = ezdb_now_ms();
         rc = ezdb_postings_builder_prepare_fill_adaptive(&entry_builder, entry_count);
+        if (rc == EZDB_OK && parallel_count_enabled) {
+            rc = entry_index_prepare_parallel_fill_slices(&entry_builder, &parallel_state);
+        }
         index_prepare_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK && entry_count && entry_builder_ready) {
-        if (!source->reset) {
+        if (parallel_count_enabled) {
+            stage_start_ms = ezdb_now_ms();
+            rc = entry_index_fill_parallel(source, &entry_builder, &parallel_state);
+            index_fill_ms = ezdb_now_ms() - stage_start_ms;
+            if (rc == EZDB_OK) parallel_fill_enabled = 1;
+        } else if (!source->reset) {
             rc = EZDB_ERR_ARG;
         } else {
             rc = source->reset(source->user_data);
-        }
-        stage_start_ms = ezdb_now_ms();
-        for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
-            EzdbEntryRecord record;
-            memset(&record, 0, sizeof(record));
-            rc = source->next(source->user_data, &record);
-            if (rc != EZDB_OK) break;
-            if (!record.entry_path) {
-                rc = EZDB_ERR_ARG;
-                break;
+            stage_start_ms = ezdb_now_ms();
+            for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
+                EzdbEntryRecord record;
+                memset(&record, 0, sizeof(record));
+                rc = source->next(source->user_data, &record);
+                if (rc != EZDB_OK) break;
+                if (!record.entry_path) {
+                    rc = EZDB_ERR_ARG;
+                    break;
+                }
+                rc = ezdb_postings_fill_text_grams(&entry_builder, record.entry_path, i);
             }
-            rc = ezdb_postings_fill_text_grams(&entry_builder, record.entry_path, i);
+            index_fill_ms = ezdb_now_ms() - stage_start_ms;
         }
-        index_fill_ms = ezdb_now_ms() - stage_start_ms;
     }
     postings_build_ms = index_count_ms + index_prepare_ms + index_fill_ms;
     if (rc == EZDB_OK && entry_count && entry_builder_ready) {
@@ -2482,6 +2616,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         printf("entry_index_prepare_seconds: %.3f\n", index_prepare_ms / 1000.0);
         printf("entry_index_fill_seconds: %.3f\n", index_fill_ms / 1000.0);
         printf("entry_index_fill_parallel_seconds: %.3f\n", index_fill_ms / 1000.0);
+        printf("entry_index_fill_parallel_enabled: %u\n", parallel_fill_enabled ? 1u : 0u);
         printf("entry_write_postings_seconds: %.3f\n", write_postings_ms / 1000.0);
         printf("entry_index_write_seconds: %.3f\n", write_postings_ms / 1000.0);
         printf("spool_event_bytes_mb: %.2f\n", 0.0);
@@ -2514,6 +2649,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (raw_fp) fclose(raw_fp);
     free(entry_index);
     if (entry_builder_ready) ezdb_postings_builder_free(&entry_builder);
+    entry_index_parallel_state_free(&parallel_state);
     free(archive_entry_counts);
     free(archive_entry_bases);
     if (detail_writer_ready) stream_paged_writer_free(&detail_writer);
