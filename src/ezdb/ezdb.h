@@ -39,6 +39,8 @@ typedef struct EzdbEntryStream {
     int (*reset)(void* user_data);
     int (*reset_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end);
     int (*next)(void* user_data, EzdbEntryRecord* out_record);
+    int (*open_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end, struct EzdbEntryStream* out_stream);
+    void (*close_range)(struct EzdbEntryStream* stream);
 } EzdbEntryStream;
 
 #define EZDB_BUILD_ENTRY_INDEX 0x01u

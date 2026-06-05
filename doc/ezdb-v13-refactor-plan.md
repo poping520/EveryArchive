@@ -510,7 +510,13 @@ v13 调整：
 
 ### 阶段 D：多线程 postings
 
-状态：未开始。
+状态：准备中。
+
+已完成准备：
+
+- `EzdbEntryStream` 已增加可选 `open_range` / `close_range`，支持为 archive range 创建独立 reader。
+- `build-zip-entries` 的 spool stream 已实现独立 range reader，后续线程可安全并发读取不同 archive range。
+- entry index 构建日志已输出 `entry_index_threads`、`entry_index_count_parallel_seconds`、`entry_index_reduce_seconds`、`entry_index_fill_parallel_seconds`、`entry_index_write_seconds`。
 
 - [ ] 设计 per-thread key count map。
 - [ ] 实现 pass 1 parallel count。
@@ -548,6 +554,7 @@ v13 调整：
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper。
 - `src/ezdb/ezdb_format.c/.h` 已接管 v13 header 与 section table helper。
+- 阶段 D 已完成独立 archive range reader 准备：核心 stream API 透传 `open_range/close_range`，zip spool stream 可创建 per-range reader。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -556,8 +563,8 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 阶段 D 多线程 postings 构建开始。
-- 首先设计并实现 entry postings 的 per-thread pass 1 count：按 archive range 切分线程，每个线程读取自己的 entry stream，生成本地 `key -> count`。
+- 阶段 D 多线程 postings 构建继续。
+- 下一步实现 entry postings 的 per-thread pass 1 count：按 archive range 切分线程，每个线程使用独立 range reader，生成本地 `key -> count`。
 - pass 1 完成后先保留单线程 fill/write，验证搜索结果一致，再继续 reduce/prepare/pass 2。
 
 ## 风险与注意事项

@@ -1104,6 +1104,11 @@ static void spool_entry_stream_close_file(SpoolEntryStream* stream)
     }
 }
 
+static int spool_entry_open_range(void* user_data, uint32_t archive_begin, uint32_t archive_end, EzdbEntryStream* out_stream);
+static void spool_entry_close_range(EzdbEntryStream* stream);
+static int spool_entry_next(void* user_data, EzdbEntryRecord* out_record);
+static void free_spool_entry_stream(SpoolEntryStream* stream);
+
 static int spool_entry_reset(void* user_data)
 {
     SpoolEntryStream* stream = (SpoolEntryStream*)user_data;
@@ -1130,6 +1135,38 @@ static int spool_entry_reset_range(void* user_data, uint32_t archive_begin, uint
     stream->remaining_entries = 0;
     stream->current_shard_id = UINT_MAX;
     return 0;
+}
+
+static int spool_entry_open_range(void* user_data, uint32_t archive_begin, uint32_t archive_end, EzdbEntryStream* out_stream)
+{
+    SpoolEntryStream* stream = (SpoolEntryStream*)user_data;
+    if (!stream || !out_stream) return -1;
+    SpoolEntryStream* range = (SpoolEntryStream*)calloc(1, sizeof(*range));
+    if (!range) return -1;
+    range->chunks = stream->chunks;
+    range->shards = stream->shards;
+    range->archive_count = stream->archive_count;
+    if (spool_entry_reset_range(range, archive_begin, archive_end) != 0) {
+        free(range);
+        return -1;
+    }
+    memset(out_stream, 0, sizeof(*out_stream));
+    out_stream->user_data = range;
+    out_stream->reset = spool_entry_reset;
+    out_stream->reset_range = spool_entry_reset_range;
+    out_stream->next = spool_entry_next;
+    out_stream->open_range = spool_entry_open_range;
+    out_stream->close_range = spool_entry_close_range;
+    return 0;
+}
+
+static void spool_entry_close_range(EzdbEntryStream* stream)
+{
+    if (!stream) return;
+    SpoolEntryStream* range = (SpoolEntryStream*)stream->user_data;
+    free_spool_entry_stream(range);
+    free(range);
+    memset(stream, 0, sizeof(*stream));
 }
 
 static int spool_entry_next(void* user_data, EzdbEntryRecord* out_record)
@@ -1400,6 +1437,8 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
     ez_stream.reset = spool_entry_reset;
     ez_stream.reset_range = spool_entry_reset_range;
     ez_stream.next = spool_entry_next;
+    ez_stream.open_range = spool_entry_open_range;
+    ez_stream.close_range = spool_entry_close_range;
 
     build_start = now_ms();
     {

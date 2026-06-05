@@ -133,6 +133,8 @@ typedef struct EzdbEntrySource {
     int (*reset)(void* user_data);
     int (*reset_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end);
     int (*next)(void* user_data, EzdbEntryRecord* out_record);
+    int (*open_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end, struct EzdbEntrySource* out_source);
+    void (*close_range)(struct EzdbEntrySource* source);
 } EzdbEntrySource;
 
 typedef struct EzdbCompactEntrySource {
@@ -1908,6 +1910,9 @@ typedef struct EzdbArrayEntrySource {
     uint32_t archive_end;
 } EzdbArrayEntrySource;
 
+static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record);
+static void array_entry_source_close_range(EzdbEntrySource* source);
+
 static int array_entry_source_reset(void* user_data)
 {
     EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
@@ -1926,6 +1931,35 @@ static int array_entry_source_reset_range(void* user_data, uint32_t archive_begi
     source->archive_begin = archive_begin;
     source->archive_end = archive_end;
     return EZDB_OK;
+}
+
+static int array_entry_source_open_range(void* user_data, uint32_t archive_begin, uint32_t archive_end, EzdbEntrySource* out_source)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source || !out_source || archive_begin > archive_end) return EZDB_ERR_ARG;
+    EzdbArrayEntrySource* range_source = (EzdbArrayEntrySource*)malloc(sizeof(*range_source));
+    if (!range_source) return EZDB_ERR_MEMORY;
+    *range_source = *source;
+    int rc = array_entry_source_reset_range(range_source, archive_begin, archive_end);
+    if (rc != EZDB_OK) {
+        free(range_source);
+        return rc;
+    }
+    memset(out_source, 0, sizeof(*out_source));
+    out_source->user_data = range_source;
+    out_source->reset = array_entry_source_reset;
+    out_source->reset_range = array_entry_source_reset_range;
+    out_source->next = array_entry_source_next;
+    out_source->open_range = array_entry_source_open_range;
+    out_source->close_range = array_entry_source_close_range;
+    return EZDB_OK;
+}
+
+static void array_entry_source_close_range(EzdbEntrySource* source)
+{
+    if (!source) return;
+    free(source->user_data);
+    memset(source, 0, sizeof(*source));
 }
 
 static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record)
@@ -2320,6 +2354,8 @@ static int ezdb_write_entries(FILE* out,
     source.reset = array_entry_source_reset;
     source.reset_range = array_entry_source_reset_range;
     source.next = array_entry_source_next;
+    source.open_range = array_entry_source_open_range;
+    source.close_range = array_entry_source_close_range;
     return ezdb_write_entries_from_source(out, header, &source, entry_count, original_archive_count, original_to_final, options);
 }
 
@@ -3110,6 +3146,63 @@ int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
     return ezdb_build_snapshot_stream_entries_ex(archives, archive_count, entry_stream, entry_count, output_ezdb, NULL);
 }
 
+typedef struct EzdbPublicEntryStreamRange {
+    EzdbEntryStream stream;
+} EzdbPublicEntryStreamRange;
+
+static void public_entry_stream_close_range(EzdbEntrySource* source);
+
+static int public_entry_stream_reset(void* user_data)
+{
+    EzdbEntryStream* stream = (EzdbEntryStream*)user_data;
+    if (!stream) return EZDB_ERR_ARG;
+    return stream->reset ? stream->reset(stream->user_data) : EZDB_OK;
+}
+
+static int public_entry_stream_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end)
+{
+    EzdbEntryStream* stream = (EzdbEntryStream*)user_data;
+    if (!stream || !stream->reset_range) return EZDB_ERR_ARG;
+    return stream->reset_range(stream->user_data, archive_begin, archive_end);
+}
+
+static int public_entry_stream_next(void* user_data, EzdbEntryRecord* out_record)
+{
+    EzdbEntryStream* stream = (EzdbEntryStream*)user_data;
+    if (!stream || !stream->next) return EZDB_ERR_ARG;
+    return stream->next(stream->user_data, out_record);
+}
+
+static int public_entry_stream_open_range(void* user_data, uint32_t archive_begin, uint32_t archive_end, EzdbEntrySource* out_source)
+{
+    EzdbEntryStream* stream = (EzdbEntryStream*)user_data;
+    if (!stream || !stream->open_range || !out_source) return EZDB_ERR_ARG;
+    EzdbPublicEntryStreamRange* range = (EzdbPublicEntryStreamRange*)calloc(1, sizeof(*range));
+    if (!range) return EZDB_ERR_MEMORY;
+    int rc = stream->open_range(stream->user_data, archive_begin, archive_end, &range->stream);
+    if (rc != EZDB_OK) {
+        free(range);
+        return rc;
+    }
+    memset(out_source, 0, sizeof(*out_source));
+    out_source->user_data = &range->stream;
+    out_source->reset = public_entry_stream_reset;
+    out_source->reset_range = range->stream.reset_range ? public_entry_stream_reset_range : NULL;
+    out_source->next = public_entry_stream_next;
+    if (range->stream.open_range) out_source->open_range = public_entry_stream_open_range;
+    out_source->close_range = public_entry_stream_close_range;
+    return EZDB_OK;
+}
+
+static void public_entry_stream_close_range(EzdbEntrySource* source)
+{
+    if (!source) return;
+    EzdbPublicEntryStreamRange* range = (EzdbPublicEntryStreamRange*)source->user_data;
+    if (range && range->stream.close_range) range->stream.close_range(&range->stream);
+    free(range);
+    memset(source, 0, sizeof(*source));
+}
+
 int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
                                           uint32_t archive_count,
                                           EzdbEntryStream* entry_stream,
@@ -3134,10 +3227,14 @@ int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
     EzdbEntrySource source;
     memset(&source, 0, sizeof(source));
     if (entry_stream) {
-        source.user_data = entry_stream->user_data;
-        source.reset = entry_stream->reset;
-        source.reset_range = entry_stream->reset_range;
-        source.next = entry_stream->next;
+        source.user_data = entry_stream;
+        source.reset = public_entry_stream_reset;
+        source.reset_range = entry_stream->reset_range ? public_entry_stream_reset_range : NULL;
+        source.next = public_entry_stream_next;
+        if (entry_stream->open_range) {
+            source.open_range = public_entry_stream_open_range;
+            source.close_range = public_entry_stream_close_range;
+        }
     }
     if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, NULL, entry_count, output_ezdb, archive_id_map, entry_count ? &source : NULL, &options);
     free(archive_id_map);
