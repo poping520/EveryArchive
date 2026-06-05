@@ -37,6 +37,7 @@ typedef struct EzdbEntryRecord {
 typedef struct EzdbEntryStream {
     void* user_data;
     int (*reset)(void* user_data);
+    int (*reset_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end);
     int (*next)(void* user_data, EzdbEntryRecord* out_record);
 } EzdbEntryStream;
 

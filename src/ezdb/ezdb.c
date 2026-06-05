@@ -131,6 +131,7 @@ static int copy_delta_blob_range(Ezdb* db, uint64_t offset, uint32_t len, unsign
 typedef struct EzdbEntrySource {
     void* user_data;
     int (*reset)(void* user_data);
+    int (*reset_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end);
     int (*next)(void* user_data, EzdbEntryRecord* out_record);
 } EzdbEntrySource;
 
@@ -984,7 +985,8 @@ static int resolve_build_options(const char* output_ezdb, const EzdbBuildOptions
     if (out->memory_limit_mb < 32u) out->memory_limit_mb = 32u;
     out->flags = options && options->flags ? options->flags : EZDB_BUILD_DEFAULT_FLAGS;
     out->log_level = options ? options->log_level : 0u;
-    out->index_threads = options && options->index_threads ? options->index_threads : 0u;
+    out->index_threads = options && options->index_threads ? options->index_threads : 1u;
+    if (out->index_threads > 64u) out->index_threads = 64u;
     out->zip_threads = options && options->zip_threads ? options->zip_threads : 0u;
     if (options && options->temp_dir && options->temp_dir[0]) {
         if (snprintf(out->temp_dir, sizeof(out->temp_dir), "%s", options->temp_dir) >= (int)sizeof(out->temp_dir)) return EZDB_ERR_ARG;
@@ -1902,6 +1904,8 @@ typedef struct EzdbArrayEntrySource {
     const EzdbEntryRecord* entries;
     uint32_t index;
     uint32_t count;
+    uint32_t archive_begin;
+    uint32_t archive_end;
 } EzdbArrayEntrySource;
 
 static int array_entry_source_reset(void* user_data)
@@ -1909,15 +1913,33 @@ static int array_entry_source_reset(void* user_data)
     EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
     if (!source) return EZDB_ERR_ARG;
     source->index = 0;
+    source->archive_begin = 0;
+    source->archive_end = UINT32_MAX;
+    return EZDB_OK;
+}
+
+static int array_entry_source_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source || archive_begin > archive_end) return EZDB_ERR_ARG;
+    source->index = 0;
+    source->archive_begin = archive_begin;
+    source->archive_end = archive_end;
     return EZDB_OK;
 }
 
 static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record)
 {
     EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
-    if (!source || !out_record || source->index >= source->count) return EZDB_ERR_ARG;
-    *out_record = source->entries[source->index++];
-    return EZDB_OK;
+    if (!source || !out_record) return EZDB_ERR_ARG;
+    while (source->index < source->count) {
+        const EzdbEntryRecord* record = &source->entries[source->index++];
+        if (record->archive_id >= source->archive_begin && record->archive_id < source->archive_end) {
+            *out_record = *record;
+            return EZDB_OK;
+        }
+    }
+    return EZDB_ERR_NOT_FOUND;
 }
 
 static void compact_entry_source_clear_current(EzdbCompactEntrySource* source)
@@ -2232,10 +2254,15 @@ static int ezdb_write_entries_from_source(FILE* out,
         printf("entry_write_core_seconds: %.3f\n", write_core_ms / 1000.0);
         printf("entry_write_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
         printf("entry_write_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
+        printf("entry_index_threads: %u\n", options->index_threads);
         printf("entry_index_count_seconds: %.3f\n", index_count_ms / 1000.0);
+        printf("entry_index_count_parallel_seconds: %.3f\n", index_count_ms / 1000.0);
+        printf("entry_index_reduce_seconds: %.3f\n", 0.0);
         printf("entry_index_prepare_seconds: %.3f\n", index_prepare_ms / 1000.0);
         printf("entry_index_fill_seconds: %.3f\n", index_fill_ms / 1000.0);
+        printf("entry_index_fill_parallel_seconds: %.3f\n", index_fill_ms / 1000.0);
         printf("entry_write_postings_seconds: %.3f\n", write_postings_ms / 1000.0);
+        printf("entry_index_write_seconds: %.3f\n", write_postings_ms / 1000.0);
         printf("spool_event_bytes_mb: %.2f\n", 0.0);
         printf("spool_sort_seconds: %.3f\n", 0.0);
         printf("spool_merge_seconds: %.3f\n", 0.0);
@@ -2291,6 +2318,7 @@ static int ezdb_write_entries(FILE* out,
     memset(&source, 0, sizeof(source));
     source.user_data = &array_source;
     source.reset = array_entry_source_reset;
+    source.reset_range = array_entry_source_reset_range;
     source.next = array_entry_source_next;
     return ezdb_write_entries_from_source(out, header, &source, entry_count, original_archive_count, original_to_final, options);
 }
@@ -3108,6 +3136,7 @@ int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
     if (entry_stream) {
         source.user_data = entry_stream->user_data;
         source.reset = entry_stream->reset;
+        source.reset_range = entry_stream->reset_range;
         source.next = entry_stream->next;
     }
     if (rc == EZDB_OK) rc = ezdb_write_archive_base(archives, archive_count, NULL, entry_count, output_ezdb, archive_id_map, entry_count ? &source : NULL, &options);

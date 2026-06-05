@@ -731,6 +731,8 @@ typedef struct SpoolEntryStream {
     const ArchiveEntryChunk* chunks;
     const ZipSpoolShard* shards;
     uint32_t archive_count;
+    uint32_t archive_begin;
+    uint32_t archive_end;
     uint32_t archive_index;
     uint32_t current_archive_id;
     uint32_t remaining_entries;
@@ -1107,7 +1109,23 @@ static int spool_entry_reset(void* user_data)
     SpoolEntryStream* stream = (SpoolEntryStream*)user_data;
     if (!stream) return -1;
     spool_entry_stream_close_file(stream);
-    stream->archive_index = 0;
+    stream->archive_begin = 0;
+    stream->archive_end = stream->archive_count;
+    stream->archive_index = stream->archive_begin;
+    stream->current_archive_id = UINT_MAX;
+    stream->remaining_entries = 0;
+    stream->current_shard_id = UINT_MAX;
+    return 0;
+}
+
+static int spool_entry_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end)
+{
+    SpoolEntryStream* stream = (SpoolEntryStream*)user_data;
+    if (!stream || archive_begin > archive_end || archive_end > stream->archive_count) return -1;
+    spool_entry_stream_close_file(stream);
+    stream->archive_begin = archive_begin;
+    stream->archive_end = archive_end;
+    stream->archive_index = archive_begin;
     stream->current_archive_id = UINT_MAX;
     stream->remaining_entries = 0;
     stream->current_shard_id = UINT_MAX;
@@ -1153,7 +1171,7 @@ static int spool_entry_next(void* user_data, EzdbEntryRecord* out_record)
             return 0;
         }
         spool_entry_stream_close_file(stream);
-        while (stream->archive_index < stream->archive_count) {
+        while (stream->archive_index < stream->archive_end) {
             const ArchiveEntryChunk* chunk = &stream->chunks[stream->archive_index];
             if (!chunk->ok || chunk->entry_count == 0) {
                 ++stream->archive_index;
@@ -1380,6 +1398,7 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
     memset(&ez_stream, 0, sizeof(ez_stream));
     ez_stream.user_data = &spool_stream;
     ez_stream.reset = spool_entry_reset;
+    ez_stream.reset_range = spool_entry_reset_range;
     ez_stream.next = spool_entry_next;
 
     build_start = now_ms();
