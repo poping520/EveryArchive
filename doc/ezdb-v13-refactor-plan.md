@@ -545,8 +545,8 @@ v13 调整：
 - [x] wildcard。
 - [x] insert/update/delete。
 - [x] compact。
-- [ ] 连续运行确定性测试。
-- [ ] temp dir 清理和失败路径测试。
+- [x] 连续运行确定性测试。
+- [x] temp dir 清理和失败路径测试。
 
 ## 当前代码基线与下次断点
 
@@ -562,6 +562,7 @@ v13 调整：
 - 阶段 D 已完成 pass 1 parallel count、reduce、slice offset prepare 和 pass 2 parallel fill；当前剩余优化点转向 ZIP fixture/测试体系、模块拆分和后续大样本复测。
 - 阶段 E 已新增 `EzdbZipFixtureTests`，运行时生成小 ZIP、空 ZIP、带 central directory comment 的 ZIP、含目录 entry 的 ZIP，并验证 `build-zip-entries`、`info`、`search-v2 archive/entry` 回归。
 - `EzdbBench` 已新增 `query-entries` 命令，`EzdbZipFixtureTests` 已覆盖 `query_entries`、wildcard、archive insert/update/delete 和 compact 后 entry 查询回归。
+- `EzdbZipFixtureTests` 已覆盖连续两次 fresh build 的关键查询确定性、`build-zip-entries` temp dir 成功清理和缺失 ZIP 解析失败路径；同时修复 compact 使用同一 archive id map 导致 entry archive remap 被覆盖的问题。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -570,8 +571,8 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 E 测试体系，补 ZIP64、非 UTF-8 entry name、连续运行确定性测试、temp dir 清理和失败路径测试。
-- 可优先把 `EzdbZipFixtureTests` 扩展为连续两次构建同一 fixture 并比对关键查询结果，再补边界 ZIP fixture。
+- 下一步继续阶段 E 测试体系，补 ZIP64 和非 UTF-8 entry name 边界 fixture。
+- 阶段 E 完成后回到阶段 B/C 的 entries/query/v13 header 收敛，继续拆模块。
 
 ## 风险与注意事项
 

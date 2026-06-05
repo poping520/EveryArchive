@@ -5276,6 +5276,7 @@ int ezdb_compact(Ezdb* db)
     EzdbArchiveRecord* archives = (EzdbArchiveRecord*)calloc(active_archives ? active_archives : 1u, sizeof(EzdbArchiveRecord));
     char** archive_paths = (char**)calloc(active_archives ? active_archives : 1u, sizeof(char*));
     uint32_t* archive_id_map = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(db->header.file_count ? db->header.file_count : 1u));
+    uint32_t* build_archive_id_map = NULL;
     if (!archives || !archive_paths || !archive_id_map) {
         free(archives);
         free(archive_paths);
@@ -5312,6 +5313,15 @@ int ezdb_compact(Ezdb* db)
         free(archive_id_map);
         return rc;
     }
+    build_archive_id_map = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(out_archive_count ? out_archive_count : 1u));
+    if (!build_archive_id_map) {
+        for (uint32_t i = 0; i < out_archive_count; ++i) free(archive_paths[i]);
+        free(archives);
+        free(archive_paths);
+        free(archive_id_map);
+        return EZDB_ERR_MEMORY;
+    }
+    for (uint32_t i = 0; i < out_archive_count; ++i) build_archive_id_map[i] = UINT32_MAX;
 
     EzdbCompactEntrySource compact_source;
     memset(&compact_source, 0, sizeof(compact_source));
@@ -5332,7 +5342,7 @@ int ezdb_compact(Ezdb* db)
         EzdbBuildOptionsResolved options;
         rc = resolve_build_options(tmp_path, NULL, &options);
         if (rc == EZDB_OK) {
-            rc = ezdb_write_archive_base(archives, out_archive_count, NULL, active_entries, tmp_path, archive_id_map, active_entries ? &source : NULL, &options);
+            rc = ezdb_write_archive_base(archives, out_archive_count, NULL, active_entries, tmp_path, build_archive_id_map, active_entries ? &source : NULL, &options);
         }
     }
     compact_entry_source_clear_current(&compact_source);
@@ -5371,6 +5381,7 @@ int ezdb_compact(Ezdb* db)
     free(archives);
     free(archive_paths);
     free(archive_id_map);
+    free(build_archive_id_map);
     return rc;
 }
 
