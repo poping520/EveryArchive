@@ -16,11 +16,13 @@ add_library(ezdb STATIC
         src/ezdb/ezdb_format.c
         src/ezdb/ezdb_io.c
         src/ezdb/ezdb_postings.c
+        src/ezdb/ezdb_query.c
         src/ezdb/ezdb.h
         src/ezdb/ezdb_format.h
         src/ezdb/ezdb_internal.h
         src/ezdb/ezdb_io.h
         src/ezdb/ezdb_postings.h
+        src/ezdb/ezdb_query.h
 )
 
 target_include_directories(ezdb PUBLIC

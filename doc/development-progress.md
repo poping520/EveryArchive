@@ -414,6 +414,34 @@
 
 * 文件统计面板
 
+## ezdb v13 重构阶段记录
+
+更新时间：2026-06-05。
+
+当前状态：
+
+- `ezdb_postings.c/.h` 已接管 postings builder、tokenizer、container encode、postings 写入、postings 读取和交集加载 helper。
+- 旧 postings event spool sorter 死代码已删除。
+- `ezdb_query.c/.h` 已新增，query AST/parser、通配符匹配、ASCII casefold contains、候选 key 构建和文本匹配 helper 已迁出 `ezdb.c`。
+- `ezdb_format.c/.h` 已加入 v13 fixed header、section descriptor、section table 读写/校验/查找 helper。
+- builder 已开始输出 `EZDB0013` v13 section directory 格式，v12 旧库打开会返回 format error。
+- archive 级 delta insert/update/delete 和 compact 的 v13 smoke 已通过。
+
+已验证：
+
+- Debug `EzdbBench` 构建通过。
+- v13 build/info/search smoke 曾通过。
+- v13 section table 损坏、重复 section id、offset 越界均能返回 format error。
+- v13 archive delta insert/update/delete 后 search smoke 通过。
+- v13 compact smoke 通过。
+
+下次继续的断点：
+
+- `EzdbBench live-entry-append-batch test_data\sample_100_50k.combined.tsv test_data\codex_tmp\v13_live_entry_append.ezdb 256` 能写入完成。
+- 随后 `EzdbBench info test_data\codex_tmp\v13_live_entry_append.ezdb` 仍返回 `open failed: invalid ezdb format (-3)`。
+- 已用脚本确认该文件的 v13 header、section table 和 delta frame 顺序基本结构可解析，下一步应在 `ezdb_open()` / `replay_delta_log()` 内缩小具体 `EZDB_ERR_FORMAT` 返回点。
+- 优先检查 entry append 回放后的 entry page size 校验、active entry count、delta entry path copy、`delta_entry_index_add_path()` 相关路径。
+
 ## 已完成
 * 多线程解析压缩包
   * 3271 个文件

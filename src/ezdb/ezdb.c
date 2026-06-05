@@ -21,8 +21,7 @@
 #include "ezdb_internal.h"
 #include "ezdb_io.h"
 #include "ezdb_postings.h"
-
-#include <zlib.h>
+#include "ezdb_query.h"
 
 #include <ctype.h>
 #include <direct.h>
@@ -120,33 +119,9 @@ typedef struct StreamPagedWriter {
     uint64_t raw_size;
 } StreamPagedWriter;
 
-typedef struct PostingEventSorter {
-    const EzdbBuildOptionsResolved* options;
-    uint64_t* buffer;
-    uint32_t buffer_count;
-    uint32_t buffer_cap;
-    char** run_paths;
-    uint32_t run_count;
-    uint32_t run_cap;
-    uint64_t event_count;
-    uint64_t event_bytes;
-    double sort_ms;
-} PostingEventSorter;
-
-typedef struct PostingRunReader {
-    FILE* fp;
-    uint64_t remaining;
-    uint64_t current;
-    int has_current;
-} PostingRunReader;
-
-typedef struct PostingHeapNode {
-    uint64_t value;
-    uint32_t run_id;
-} PostingHeapNode;
-
 static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, const void* bytes, uint32_t len, uint32_t extra_nul, uint32_t* out_offset);
 static int entry_is_searchable(Ezdb* db, uint32_t entry_id);
+static uint64_t ezdb_delta_append_offset(Ezdb* db);
 static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out);
 static char* entry_path_copy_by_id(Ezdb* db, uint32_t id);
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path);
@@ -167,37 +142,13 @@ typedef struct EzdbCompactEntrySource {
     void* raw_path;
 } EzdbCompactEntrySource;
 
-typedef struct QueryIndex {
-    const EzdbDiskIndex* idx;
-} QueryIndex;
-
-typedef enum EzdbQueryNodeType {
-    EZDB_QUERY_TERM = 1,
-    EZDB_QUERY_WILDCARD = 2,
-    EZDB_QUERY_NOT = 3,
-    EZDB_QUERY_AND = 4,
-    EZDB_QUERY_OR = 5
-} EzdbQueryNodeType;
-
-typedef struct EzdbQueryNode {
-    EzdbQueryNodeType type;
-    char* text;
-    size_t text_len;
-    struct EzdbQueryNode* left;
-    struct EzdbQueryNode* right;
-} EzdbQueryNode;
-
-typedef struct EzdbQueryParser {
-    const char* text;
-    size_t len;
-    size_t pos;
-    int error;
-} EzdbQueryParser;
-
 struct Ezdb {
     FILE* fp;
     char* path;
     int read_only;
+    int format_v13;
+    uint64_t v13_section_table_offset;
+    uint64_t v13_section_table_size;
     EzdbHeader header;
     uint32_t* file_parent_dir_ids;
     uint32_t* file_name_offsets;
@@ -305,11 +256,6 @@ static int ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, ui
     *data = new_data;
     *capacity = next;
     return EZDB_OK;
-}
-
-static unsigned char fold_ascii_byte(unsigned char ch)
-{
-    return (ch >= 'A' && ch <= 'Z') ? (unsigned char)(ch + ('a' - 'A')) : ch;
 }
 
 static uint32_t fnv1a_bytes(const char* text, size_t len)
@@ -540,28 +486,12 @@ static int u32_compare(const void* a, const void* b)
     return av < bv ? -1 : 1;
 }
 
-static int posting_entry_key_compare(const void* a, const void* b)
-{
-    const PostingBuildEntry* pa = *(const PostingBuildEntry* const*)a;
-    const PostingBuildEntry* pb = *(const PostingBuildEntry* const*)b;
-    if (pa->key == pb->key) return 0;
-    return pa->key < pb->key ? -1 : 1;
-}
-
 static int index_compare(const void* a, const void* b)
 {
     const EzdbDiskIndex* ia = (const EzdbDiskIndex*)a;
     const EzdbDiskIndex* ib = (const EzdbDiskIndex*)b;
     if (ia->key == ib->key) return 0;
     return ia->key < ib->key ? -1 : 1;
-}
-
-static int query_index_compare(const void* a, const void* b)
-{
-    const QueryIndex* qa = (const QueryIndex*)a;
-    const QueryIndex* qb = (const QueryIndex*)b;
-    if (qa->idx->count == qb->idx->count) return 0;
-    return qa->idx->count < qb->idx->count ? -1 : 1;
 }
 
 static uint32_t next_pow2_u32(uint32_t value)
@@ -854,7 +784,7 @@ static int delta_entry_index_ensure(Ezdb* db)
 {
     if (!db) return EZDB_ERR_ARG;
     if (db->delta_entry_index_ready) return EZDB_OK;
-    int rc = posting_builder_init(&db->delta_entry_index, 4096u);
+    int rc = ezdb_postings_builder_init(&db->delta_entry_index, 4096u);
     if (rc != EZDB_OK) return rc;
     db->delta_entry_index_ready = 1;
     return EZDB_OK;
@@ -865,7 +795,7 @@ static int delta_entry_index_add_path(Ezdb* db, uint32_t entry_id, const char* p
     if (!path || !*path) return EZDB_OK;
     int rc = delta_entry_index_ensure(db);
     if (rc != EZDB_OK) return rc;
-    return add_text_grams_to_builder(&db->delta_entry_index, path, entry_id, 0);
+    return ezdb_postings_add_text_grams(&db->delta_entry_index, path, entry_id, 0);
 }
 
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path)
@@ -873,7 +803,7 @@ static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char
     if (!db || !path || !*path || !db->delta_entry_index_ready) return EZDB_OK;
     uint32_t* keys = NULL;
     uint32_t key_count = 0;
-    int rc = build_query_keys(path, &keys, &key_count);
+    int rc = ezdb_postings_build_query_keys(path, &keys, &key_count);
     if (rc != EZDB_OK) {
         free(keys);
         return rc;
@@ -895,7 +825,7 @@ static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char
         }
         if (!duplicate) {
             seen[seen_count++] = keys[i];
-            rc = posting_builder_remove_id(&db->delta_entry_index, keys[i], entry_id);
+            rc = ezdb_postings_builder_remove_id(&db->delta_entry_index, keys[i], entry_id);
             if (rc != EZDB_OK) break;
         }
     }
@@ -907,7 +837,7 @@ static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char
 static int rebuild_delta_entry_index(Ezdb* db)
 {
     if (!db) return EZDB_ERR_ARG;
-    posting_builder_free(&db->delta_entry_index);
+    ezdb_postings_builder_free(&db->delta_entry_index);
     memset(&db->delta_entry_index, 0, sizeof(db->delta_entry_index));
     db->delta_entry_index_ready = 0;
     for (uint32_t e = 0; e < db->header.entry_count; ++e) {
@@ -971,23 +901,6 @@ static int append_varuint64(unsigned char** data, uint32_t* size, uint32_t* cap,
     memcpy(*data + *size, bytes, count);
     *size += count;
     return EZDB_OK;
-}
-
-static int read_varuint_mem(const unsigned char* data, uint32_t size, uint32_t* pos, uint32_t* out)
-{
-    uint32_t value = 0;
-    uint32_t shift = 0;
-    while (*pos < size) {
-        unsigned char byte = data[(*pos)++];
-        value |= (uint32_t)(byte & 0x7fu) << shift;
-        if (!(byte & 0x80u)) {
-            *out = value;
-            return EZDB_OK;
-        }
-        shift += 7u;
-        if (shift >= 35u) return EZDB_ERR_FORMAT;
-    }
-    return EZDB_ERR_FORMAT;
 }
 
 static int encode_file_records_compact(const BuildFile* files, uint32_t file_count, unsigned char** out_data, uint64_t* out_size)
@@ -1185,337 +1098,6 @@ static int copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_writ
     free(buf);
     if (fclose(src) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
     return rc;
-}
-
-static int u64_compare(const void* a, const void* b)
-{
-    uint64_t av = *(const uint64_t*)a;
-    uint64_t bv = *(const uint64_t*)b;
-    return (av > bv) - (av < bv);
-}
-
-static char* ezdb_strdup_local(const char* text)
-{
-    size_t len = text ? strlen(text) : 0u;
-    char* out = (char*)malloc(len + 1u);
-    if (!out) return NULL;
-    if (len) memcpy(out, text, len);
-    out[len] = '\0';
-    return out;
-}
-
-static int posting_event_sorter_add_run_path(PostingEventSorter* sorter, const char* path)
-{
-    if (ensure_capacity((void**)&sorter->run_paths, sizeof(char*), &sorter->run_cap, sorter->run_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
-    sorter->run_paths[sorter->run_count] = ezdb_strdup_local(path);
-    if (!sorter->run_paths[sorter->run_count]) return EZDB_ERR_MEMORY;
-    ++sorter->run_count;
-    return EZDB_OK;
-}
-
-static void posting_event_sorter_free(PostingEventSorter* sorter)
-{
-    if (!sorter) return;
-    for (uint32_t i = 0; i < sorter->run_count; ++i) {
-        if (sorter->run_paths[i]) {
-            remove(sorter->run_paths[i]);
-            free(sorter->run_paths[i]);
-        }
-    }
-    free(sorter->run_paths);
-    free(sorter->buffer);
-    memset(sorter, 0, sizeof(*sorter));
-}
-
-static int posting_event_sorter_init(PostingEventSorter* sorter, const EzdbBuildOptionsResolved* options)
-{
-    if (!sorter || !options) return EZDB_ERR_ARG;
-    memset(sorter, 0, sizeof(*sorter));
-    sorter->options = options;
-    uint64_t cap64 = ((uint64_t)options->memory_limit_mb * 1024u * 1024u) / sizeof(uint64_t) / 2u;
-    if (cap64 < 262144u) cap64 = 262144u;
-    if (cap64 > 33554432u) cap64 = 33554432u;
-    sorter->buffer_cap = (uint32_t)cap64;
-    sorter->buffer = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)sorter->buffer_cap);
-    if (!sorter->buffer) return EZDB_ERR_MEMORY;
-    return ensure_directory_exists(options->temp_dir);
-}
-
-static int posting_event_sorter_flush(PostingEventSorter* sorter)
-{
-    if (!sorter || !sorter->buffer) return EZDB_ERR_ARG;
-    if (!sorter->buffer_count) return EZDB_OK;
-    char path[1200];
-    if (snprintf(path, sizeof(path), "%s\\entry_events_%04u.run", sorter->options->temp_dir, sorter->run_count) >= (int)sizeof(path)) return EZDB_ERR_ARG;
-    double start_ms = ezdb_now_ms();
-    qsort(sorter->buffer, sorter->buffer_count, sizeof(uint64_t), u64_compare);
-    sorter->sort_ms += ezdb_now_ms() - start_ms;
-    FILE* fp = fopen(path, "wb");
-    if (!fp) return EZDB_ERR_IO;
-    int rc = EZDB_OK;
-    if (fwrite(sorter->buffer, sizeof(uint64_t), sorter->buffer_count, fp) != sorter->buffer_count) rc = EZDB_ERR_IO;
-    if (fclose(fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
-    if (rc != EZDB_OK) {
-        remove(path);
-        return rc;
-    }
-    rc = posting_event_sorter_add_run_path(sorter, path);
-    sorter->buffer_count = 0;
-    return rc;
-}
-
-static int posting_event_sorter_emit(PostingEventSorter* sorter, uint32_t key, uint32_t entry_id)
-{
-    if (!sorter || !sorter->buffer) return EZDB_ERR_ARG;
-    if (sorter->buffer_count == sorter->buffer_cap) {
-        int rc = posting_event_sorter_flush(sorter);
-        if (rc != EZDB_OK) return rc;
-    }
-    sorter->buffer[sorter->buffer_count++] = ((uint64_t)key << 32u) | (uint64_t)entry_id;
-    sorter->event_count += 1u;
-    sorter->event_bytes += sizeof(uint64_t);
-    return EZDB_OK;
-}
-
-typedef struct PostingEventEmitContext {
-    PostingEventSorter* sorter;
-    uint32_t entry_id;
-} PostingEventEmitContext;
-
-static int emit_gram_event(uint32_t key, void* user_data)
-{
-    PostingEventEmitContext* ctx = (PostingEventEmitContext*)user_data;
-    return posting_event_sorter_emit(ctx->sorter, key, ctx->entry_id);
-}
-
-static void heap_swap(PostingHeapNode* a, PostingHeapNode* b)
-{
-    PostingHeapNode t = *a;
-    *a = *b;
-    *b = t;
-}
-
-static void heap_push(PostingHeapNode* heap, uint32_t* count, PostingHeapNode node)
-{
-    uint32_t i = (*count)++;
-    heap[i] = node;
-    while (i) {
-        uint32_t parent = (i - 1u) / 2u;
-        if (heap[parent].value <= heap[i].value) break;
-        heap_swap(&heap[parent], &heap[i]);
-        i = parent;
-    }
-}
-
-static PostingHeapNode heap_pop(PostingHeapNode* heap, uint32_t* count)
-{
-    PostingHeapNode out = heap[0];
-    heap[0] = heap[--(*count)];
-    uint32_t i = 0;
-    for (;;) {
-        uint32_t left = i * 2u + 1u;
-        uint32_t right = left + 1u;
-        uint32_t smallest = i;
-        if (left < *count && heap[left].value < heap[smallest].value) smallest = left;
-        if (right < *count && heap[right].value < heap[smallest].value) smallest = right;
-        if (smallest == i) break;
-        heap_swap(&heap[i], &heap[smallest]);
-        i = smallest;
-    }
-    return out;
-}
-
-static int posting_run_reader_next(PostingRunReader* reader, uint64_t* out_value)
-{
-    if (!reader || !out_value || !reader->remaining) return 0;
-    if (fread(out_value, sizeof(uint64_t), 1, reader->fp) != 1) return -1;
-    --reader->remaining;
-    return 1;
-}
-
-static int append_u32(uint32_t** data, uint32_t* count, uint32_t* cap, uint32_t value)
-{
-    if (ensure_capacity((void**)data, sizeof(uint32_t), cap, *count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
-    (*data)[(*count)++] = value;
-    return EZDB_OK;
-}
-
-static int write_posting_group(FILE* out,
-                               uint32_t key,
-                               uint32_t* ids,
-                               uint32_t count,
-                               uint32_t universe_count,
-                               EzdbDiskIndex** indexes,
-                               uint32_t* index_count,
-                               uint32_t* index_cap,
-                               uint64_t* written,
-                               PostingWriteStats* stats)
-{
-    if (!count) return EZDB_OK;
-    double stage_start_ms = ezdb_now_ms();
-    uint32_t bitset_size = (universe_count + 7u) / 8u;
-    uint32_t array_size = estimate_array_size(ids, count);
-    uint32_t range_count = count_ranges(ids, count);
-    uint32_t range_size = estimate_range_size(ids, count);
-    uint32_t type = EZDB_POSTING_ARRAY;
-    uint32_t encoded_size = array_size;
-    if (range_count <= count / 2u && range_size < encoded_size) {
-        type = EZDB_POSTING_RANGE;
-        encoded_size = range_size;
-    }
-    if (count >= universe_count / EZDB_BITSET_DENSITY_DIVISOR && bitset_size < encoded_size) {
-        type = EZDB_POSTING_BITSET;
-    }
-    if (stats) {
-        if (type == EZDB_POSTING_ARRAY) stats->array_count += 1u;
-        else if (type == EZDB_POSTING_RANGE) stats->range_count += 1u;
-        else stats->bitset_count += 1u;
-        stats->choose_ms += ezdb_now_ms() - stage_start_ms;
-    }
-
-    unsigned char* raw_payload = NULL;
-    uint32_t raw_size = 0;
-    stage_start_ms = ezdb_now_ms();
-    int rc = encode_posting_container(ids, count, universe_count, type, &raw_payload, &raw_size);
-    if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
-    if (rc != EZDB_OK) return rc;
-
-    unsigned char* payload = NULL;
-    uint32_t payload_size = 0;
-    int compressed = 0;
-    stage_start_ms = ezdb_now_ms();
-    rc = maybe_compress_payload(raw_payload, raw_size, &payload, &payload_size, &compressed);
-    if (stats) {
-        stats->compress_ms += ezdb_now_ms() - stage_start_ms;
-        stats->raw_bytes += raw_size;
-        stats->encoded_bytes += payload_size;
-        if (compressed) stats->compressed_count += 1u;
-    }
-    free(raw_payload);
-    if (rc != EZDB_OK) return rc;
-
-    uint64_t local_offset = *written;
-    stage_start_ms = ezdb_now_ms();
-    rc = write_bytes(out, payload, payload_size, written);
-    if (stats) stats->fwrite_ms += ezdb_now_ms() - stage_start_ms;
-    free(payload);
-    if (rc != EZDB_OK) return rc;
-
-    if (ensure_capacity((void**)indexes, sizeof(EzdbDiskIndex), index_cap, *index_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
-    stage_start_ms = ezdb_now_ms();
-    EzdbDiskIndex* idx = &(*indexes)[(*index_count)++];
-    idx->key = key;
-    idx->count = count;
-    idx->container_type = type | (compressed ? EZDB_POSTING_COMPRESSED : 0u);
-    idx->encoded_size = (uint32_t)(*written - local_offset);
-    idx->raw_size = raw_size;
-    idx->offset = local_offset;
-    if (stats) stats->index_meta_ms += ezdb_now_ms() - stage_start_ms;
-    return EZDB_OK;
-}
-
-static int posting_event_sorter_write_postings(PostingEventSorter* sorter,
-                                               FILE* out,
-                                               uint32_t universe_count,
-                                               EzdbDiskIndex** out_index,
-                                               uint32_t* out_index_count,
-                                               uint64_t* out_written,
-                                               PostingWriteStats* stats,
-                                               double* out_merge_ms)
-{
-    if (!sorter || !out || !out_index || !out_index_count || !out_written) return EZDB_ERR_ARG;
-    *out_index = NULL;
-    *out_index_count = 0;
-    *out_written = 0;
-    if (stats) memset(stats, 0, sizeof(*stats));
-    if (out_merge_ms) *out_merge_ms = 0.0;
-    int rc = posting_event_sorter_flush(sorter);
-    if (rc != EZDB_OK) return rc;
-    if (!sorter->run_count) return EZDB_OK;
-
-    double merge_start_ms = ezdb_now_ms();
-    PostingRunReader* readers = (PostingRunReader*)calloc(sorter->run_count, sizeof(PostingRunReader));
-    PostingHeapNode* heap = (PostingHeapNode*)malloc(sizeof(PostingHeapNode) * (size_t)sorter->run_count);
-    EzdbDiskIndex* indexes = NULL;
-    uint32_t index_count = 0;
-    uint32_t index_cap = 0;
-    uint32_t heap_count = 0;
-    uint32_t* ids = NULL;
-    uint32_t id_count = 0;
-    uint32_t id_cap = 0;
-    uint32_t current_key = 0;
-    int has_key = 0;
-    uint64_t last_value = UINT64_MAX;
-    uint64_t written = 0;
-    if (!readers || !heap) rc = EZDB_ERR_MEMORY;
-    for (uint32_t i = 0; rc == EZDB_OK && i < sorter->run_count; ++i) {
-        FILE* fp = fopen(sorter->run_paths[i], "rb");
-        if (!fp) {
-            rc = EZDB_ERR_IO;
-            break;
-        }
-        readers[i].fp = fp;
-        if (_fseeki64(fp, 0, SEEK_END) != 0) {
-            rc = EZDB_ERR_IO;
-            break;
-        }
-        __int64 size = _ftelli64(fp);
-        if (size < 0 || (size % (int)sizeof(uint64_t)) != 0 || _fseeki64(fp, 0, SEEK_SET) != 0) {
-            rc = EZDB_ERR_IO;
-            break;
-        }
-        readers[i].remaining = (uint64_t)size / sizeof(uint64_t);
-        uint64_t value = 0;
-        int n = posting_run_reader_next(&readers[i], &value);
-        if (n < 0) rc = EZDB_ERR_IO;
-        else if (n > 0) heap_push(heap, &heap_count, (PostingHeapNode){ value, i });
-    }
-
-    while (rc == EZDB_OK && heap_count) {
-        PostingHeapNode node = heap_pop(heap, &heap_count);
-        uint64_t value = node.value;
-        uint64_t next_value = 0;
-        int n = posting_run_reader_next(&readers[node.run_id], &next_value);
-        if (n < 0) {
-            rc = EZDB_ERR_IO;
-            break;
-        }
-        if (n > 0) heap_push(heap, &heap_count, (PostingHeapNode){ next_value, node.run_id });
-        if (value == last_value) continue;
-        last_value = value;
-        uint32_t key = (uint32_t)(value >> 32u);
-        uint32_t id = (uint32_t)value;
-        if (!has_key) {
-            current_key = key;
-            has_key = 1;
-        } else if (key != current_key) {
-            rc = write_posting_group(out, current_key, ids, id_count, universe_count, &indexes, &index_count, &index_cap, &written, stats);
-            if (rc != EZDB_OK) break;
-            current_key = key;
-            id_count = 0;
-        }
-        rc = append_u32(&ids, &id_count, &id_cap, id);
-    }
-    if (rc == EZDB_OK && has_key) {
-        rc = write_posting_group(out, current_key, ids, id_count, universe_count, &indexes, &index_count, &index_cap, &written, stats);
-    }
-    if (out_merge_ms) *out_merge_ms = ezdb_now_ms() - merge_start_ms;
-
-    for (uint32_t i = 0; i < sorter->run_count; ++i) {
-        if (readers && readers[i].fp) fclose(readers[i].fp);
-    }
-    free(readers);
-    free(heap);
-    free(ids);
-    if (rc != EZDB_OK) {
-        free(indexes);
-        return rc;
-    }
-    *out_index = indexes;
-    *out_index_count = index_count;
-    *out_written = written;
-    if (stats) stats->sort_ms = sorter->sort_ms;
-    return EZDB_OK;
 }
 
 static void page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
@@ -1830,6 +1412,7 @@ static int restore_txn_snapshot(Ezdb* db)
 
 static int write_header(Ezdb* db)
 {
+    if (db && db->format_v13) return ezdb_write_v13_db_header(db);
     if (fseek(db->fp, 0, SEEK_SET) != 0 || fwrite(&db->header, sizeof(db->header), 1, db->fp) != 1) {
         return EZDB_ERR_IO;
     }
@@ -1849,7 +1432,7 @@ static int append_delta_disk(Ezdb* db, uint32_t type, uint32_t id, const EzdbFil
         return EZDB_ERR_ARG;
     }
 
-    uint64_t append_offset = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    uint64_t append_offset = ezdb_delta_append_offset(db);
     if (fseek(db->fp, (long)append_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     EzdbDeltaDiskHeader dh;
     memset(&dh, 0, sizeof(dh));
@@ -1874,7 +1457,7 @@ static int append_delta_frame(Ezdb* db, uint32_t type)
 {
     if (!db || db->read_only || !db->fp) return EZDB_ERR_READ_ONLY;
     if (type != EZDB_DELTA_BATCH_BEGIN && type != EZDB_DELTA_BATCH_COMMIT) return EZDB_ERR_ARG;
-    uint64_t append_offset = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    uint64_t append_offset = ezdb_delta_append_offset(db);
     if (fseek(db->fp, (long)append_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     EzdbDeltaDiskHeader dh;
     memset(&dh, 0, sizeof(dh));
@@ -1892,7 +1475,7 @@ static int append_entry_delete_archive_frame(Ezdb* db, uint32_t archive_id, int 
 {
     if (!db || db->read_only || !db->fp) return EZDB_ERR_READ_ONLY;
     if (archive_id >= db->header.file_count || !bitset_get(db->active_bits, archive_id)) return EZDB_ERR_NOT_FOUND;
-    uint64_t append_offset = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    uint64_t append_offset = ezdb_delta_append_offset(db);
     if (fseek(db->fp, (long)append_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     EzdbDeltaDiskHeader dh;
     memset(&dh, 0, sizeof(dh));
@@ -1933,7 +1516,7 @@ static int append_entry_delta_disk(Ezdb* db, uint32_t archive_id, const EzdbEntr
         return rc;
     }
 
-    uint64_t append_offset = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    uint64_t append_offset = ezdb_delta_append_offset(db);
     if (fseek(db->fp, (long)append_offset, SEEK_SET) != 0) rc = EZDB_ERR_IO;
     EzdbEntryDeltaDiskHeader eh;
     memset(&eh, 0, sizeof(eh));
@@ -1979,133 +1562,6 @@ static int append_entry_delta_disk(Ezdb* db, uint32_t archive_id, const EzdbEntr
     db->header.delta_size = old_delta_size;
     db->header.reserved_offset = old_reserved_offset;
     return rc;
-}
-
-static int write_postings(FILE* out, PostingBuilder* builder, uint32_t universe_count,
-                          EzdbDiskIndex** out_index, uint32_t* out_index_count,
-                          uint64_t* out_written, PostingWriteStats* stats)
-{
-    *out_index = NULL;
-    *out_index_count = 0;
-    *out_written = 0;
-    if (stats) memset(stats, 0, sizeof(*stats));
-    if (!builder->entry_count) return EZDB_OK;
-
-    double stage_start_ms = ezdb_now_ms();
-    PostingBuildEntry** sorted = (PostingBuildEntry**)malloc(sizeof(PostingBuildEntry*) * (size_t)builder->entry_count);
-    if (!sorted) return EZDB_ERR_MEMORY;
-    for (uint32_t i = 0; i < builder->entry_count; ++i) sorted[i] = &builder->entries[i];
-    qsort(sorted, builder->entry_count, sizeof(PostingBuildEntry*), posting_entry_key_compare);
-    if (stats) stats->sort_ms = ezdb_now_ms() - stage_start_ms;
-
-    EzdbDiskIndex* indexes = NULL;
-    uint32_t index_count = 0;
-    uint32_t index_cap = 0;
-    uint64_t written = 0;
-    for (uint32_t entry_i = 0; entry_i < builder->entry_count; ++entry_i) {
-        PostingBuildEntry* entry = sorted[entry_i];
-        if (!entry->count) continue;
-
-        uint32_t bitset_size = (universe_count + 7u) / 8u;
-        uint32_t type = EZDB_POSTING_ARRAY;
-        uint32_t encoded_size = 0;
-        unsigned char* raw_payload = NULL;
-        uint32_t raw_size = 0;
-        int rc = EZDB_OK;
-        stage_start_ms = ezdb_now_ms();
-        if (entry->fill_mode == EZDB_POSTING_BITSET) {
-            type = EZDB_POSTING_BITSET;
-            encoded_size = bitset_size;
-            raw_size = entry->fill_bytes;
-            if (stats) stats->bitset_count += 1u;
-            if (stats) stats->choose_ms += ezdb_now_ms() - stage_start_ms;
-            stage_start_ms = ezdb_now_ms();
-            raw_payload = (unsigned char*)malloc(raw_size ? raw_size : 1u);
-            if (!raw_payload) {
-                free(sorted);
-                free(indexes);
-                return EZDB_ERR_MEMORY;
-            }
-            if (raw_size) memcpy(raw_payload, entry->ids, raw_size);
-            if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
-        } else {
-            uint32_t array_size = estimate_array_size(entry->ids, entry->count);
-            uint32_t range_count = count_ranges(entry->ids, entry->count);
-            uint32_t range_size = estimate_range_size(entry->ids, entry->count);
-            encoded_size = array_size;
-            if (range_count <= entry->count / 2u && range_size < encoded_size) {
-                type = EZDB_POSTING_RANGE;
-                encoded_size = range_size;
-            }
-            if (entry->count >= universe_count / EZDB_BITSET_DENSITY_DIVISOR && bitset_size < encoded_size) {
-                type = EZDB_POSTING_BITSET;
-                encoded_size = bitset_size;
-            }
-            if (stats) {
-                if (type == EZDB_POSTING_ARRAY) stats->array_count += 1u;
-                else if (type == EZDB_POSTING_RANGE) stats->range_count += 1u;
-                else if (type == EZDB_POSTING_BITSET) stats->bitset_count += 1u;
-                stats->choose_ms += ezdb_now_ms() - stage_start_ms;
-            }
-            stage_start_ms = ezdb_now_ms();
-            rc = encode_posting_container(entry->ids, entry->count, universe_count, type, &raw_payload, &raw_size);
-            if (stats) stats->encode_ms += ezdb_now_ms() - stage_start_ms;
-        }
-        if (rc != EZDB_OK) {
-            free(sorted);
-            free(indexes);
-            return rc;
-        }
-
-        unsigned char* payload = NULL;
-        uint32_t payload_size = 0;
-        int compressed = 0;
-        stage_start_ms = ezdb_now_ms();
-        rc = maybe_compress_payload(raw_payload, raw_size, &payload, &payload_size, &compressed);
-        if (stats) {
-            stats->compress_ms += ezdb_now_ms() - stage_start_ms;
-            stats->raw_bytes += raw_size;
-            stats->encoded_bytes += payload_size;
-            if (compressed) stats->compressed_count += 1u;
-        }
-        free(raw_payload);
-        if (rc != EZDB_OK) {
-            free(sorted);
-            free(indexes);
-            return rc;
-        }
-
-        uint64_t local_offset = written;
-        stage_start_ms = ezdb_now_ms();
-        rc = write_bytes(out, payload, payload_size, &written);
-        if (stats) stats->fwrite_ms += ezdb_now_ms() - stage_start_ms;
-        free(payload);
-        if (rc != EZDB_OK) {
-            free(sorted);
-            free(indexes);
-            return rc;
-        }
-
-        if (ensure_capacity((void**)&indexes, sizeof(EzdbDiskIndex), &index_cap, index_count + 1) != EZDB_OK) {
-            free(sorted);
-            free(indexes);
-            return EZDB_ERR_MEMORY;
-        }
-        stage_start_ms = ezdb_now_ms();
-        indexes[index_count].key = entry->key;
-        indexes[index_count].count = entry->count;
-        indexes[index_count].container_type = type | (compressed ? EZDB_POSTING_COMPRESSED : 0u);
-        indexes[index_count].encoded_size = (uint32_t)(written - local_offset);
-        indexes[index_count].raw_size = raw_size;
-        indexes[index_count].offset = local_offset;
-        ++index_count;
-        if (stats) stats->index_meta_ms += ezdb_now_ms() - stage_start_ms;
-    }
-    free(sorted);
-    *out_index = indexes;
-    *out_index_count = index_count;
-    *out_written = written;
-    return EZDB_OK;
 }
 
 static uint32_t dfs_assign(BuildDir* dirs,
@@ -2259,570 +1715,22 @@ static int build_result_path(Ezdb* db, uint32_t id, EzdbSearchResult* out_result
     return EZDB_OK;
 }
 
-static int contains_ascii_casefold_bytes(const char* text, size_t text_len, const char* needle, size_t needle_len)
-{
-    if (!needle_len) return 1;
-    if (needle_len > text_len) return 0;
-    for (size_t i = 0; i + needle_len <= text_len; ++i) {
-        size_t j = 0;
-        while (j < needle_len &&
-               fold_ascii_byte((unsigned char)text[i + j]) == fold_ascii_byte((unsigned char)needle[j])) ++j;
-        if (j == needle_len) return 1;
-    }
-    return 0;
-}
-
-static int query_is_space(unsigned char ch)
-{
-    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
-}
-
-static void query_skip_spaces(EzdbQueryParser* p)
-{
-    while (p->pos < p->len && query_is_space((unsigned char)p->text[p->pos])) ++p->pos;
-}
-
-static EzdbQueryNode* query_node_new(EzdbQueryNodeType type, EzdbQueryNode* left, EzdbQueryNode* right, char* text, size_t text_len)
-{
-    EzdbQueryNode* node = (EzdbQueryNode*)calloc(1, sizeof(EzdbQueryNode));
-    if (!node) {
-        free(text);
-        return NULL;
-    }
-    node->type = type;
-    node->left = left;
-    node->right = right;
-    node->text = text;
-    node->text_len = text_len;
-    return node;
-}
-
-static void query_node_free(EzdbQueryNode* node)
-{
-    if (!node) return;
-    query_node_free(node->left);
-    query_node_free(node->right);
-    free(node->text);
-    free(node);
-}
-
-static EzdbQueryNode* query_parse_or(EzdbQueryParser* p);
-
-static int query_starts_primary(EzdbQueryParser* p)
-{
-    query_skip_spaces(p);
-    if (p->pos >= p->len) return 0;
-    return p->text[p->pos] != ')' && p->text[p->pos] != '|';
-}
-
-static int query_text_has_wildcard(const char* text, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        if (text[i] == '*' || text[i] == '?') return 1;
-    }
-    return 0;
-}
-
-static EzdbQueryNode* query_parse_primary(EzdbQueryParser* p)
-{
-    query_skip_spaces(p);
-    if (p->pos >= p->len) {
-        p->error = 1;
-        return NULL;
-    }
-    if (p->text[p->pos] == '(') {
-        ++p->pos;
-        EzdbQueryNode* inner = query_parse_or(p);
-        query_skip_spaces(p);
-        if (!inner || p->pos >= p->len || p->text[p->pos] != ')') {
-            query_node_free(inner);
-            p->error = 1;
-            return NULL;
-        }
-        ++p->pos;
-        return inner;
-    }
-    if (p->text[p->pos] == '"') {
-        size_t start = ++p->pos;
-        while (p->pos < p->len && p->text[p->pos] != '"') ++p->pos;
-        if (p->pos >= p->len) {
-            p->error = 1;
-            return NULL;
-        }
-        size_t len = p->pos - start;
-        char* text = ezdb_strdup_range(p->text + start, len);
-        ++p->pos;
-        if (!text) {
-            p->error = 1;
-            return NULL;
-        }
-        return query_node_new(EZDB_QUERY_TERM, NULL, NULL, text, len);
-    }
-    if (p->text[p->pos] == ')' || p->text[p->pos] == '|') {
-        p->error = 1;
-        return NULL;
-    }
-    size_t start = p->pos;
-    while (p->pos < p->len &&
-           !query_is_space((unsigned char)p->text[p->pos]) &&
-           p->text[p->pos] != '(' &&
-           p->text[p->pos] != ')' &&
-           p->text[p->pos] != '|' &&
-           p->text[p->pos] != '!') {
-        ++p->pos;
-    }
-    if (p->pos == start) {
-        p->error = 1;
-        return NULL;
-    }
-    size_t len = p->pos - start;
-    char* text = ezdb_strdup_range(p->text + start, len);
-    if (!text) {
-        p->error = 1;
-        return NULL;
-    }
-    return query_node_new(query_text_has_wildcard(text, len) ? EZDB_QUERY_WILDCARD : EZDB_QUERY_TERM,
-                          NULL,
-                          NULL,
-                          text,
-                          len);
-}
-
-static EzdbQueryNode* query_parse_not(EzdbQueryParser* p)
-{
-    query_skip_spaces(p);
-    if (p->pos < p->len && p->text[p->pos] == '!') {
-        ++p->pos;
-        EzdbQueryNode* child = query_parse_not(p);
-        if (!child) {
-            p->error = 1;
-            return NULL;
-        }
-        EzdbQueryNode* node = query_node_new(EZDB_QUERY_NOT, child, NULL, NULL, 0);
-        if (!node) {
-            query_node_free(child);
-            p->error = 1;
-        }
-        return node;
-    }
-    return query_parse_primary(p);
-}
-
-static EzdbQueryNode* query_parse_and(EzdbQueryParser* p)
-{
-    EzdbQueryNode* left = query_parse_not(p);
-    if (!left) return NULL;
-    while (!p->error && query_starts_primary(p)) {
-        EzdbQueryNode* right = query_parse_not(p);
-        if (!right) {
-            query_node_free(left);
-            return NULL;
-        }
-        EzdbQueryNode* parent = query_node_new(EZDB_QUERY_AND, left, right, NULL, 0);
-        if (!parent) {
-            query_node_free(left);
-            query_node_free(right);
-            p->error = 1;
-            return NULL;
-        }
-        left = parent;
-    }
-    return left;
-}
-
-static EzdbQueryNode* query_parse_or(EzdbQueryParser* p)
-{
-    EzdbQueryNode* left = query_parse_and(p);
-    if (!left) return NULL;
-    for (;;) {
-        query_skip_spaces(p);
-        if (p->pos >= p->len || p->text[p->pos] != '|') break;
-        ++p->pos;
-        EzdbQueryNode* right = query_parse_and(p);
-        if (!right) {
-            query_node_free(left);
-            return NULL;
-        }
-        EzdbQueryNode* parent = query_node_new(EZDB_QUERY_OR, left, right, NULL, 0);
-        if (!parent) {
-            query_node_free(left);
-            query_node_free(right);
-            p->error = 1;
-            return NULL;
-        }
-        left = parent;
-    }
-    return left;
-}
-
-static EzdbQueryNode* query_parse(const char* keyword)
-{
-    EzdbQueryParser p;
-    memset(&p, 0, sizeof(p));
-    p.text = keyword;
-    p.len = strlen(keyword);
-    query_skip_spaces(&p);
-    if (p.pos >= p.len) return NULL;
-    EzdbQueryNode* root = query_parse_or(&p);
-    query_skip_spaces(&p);
-    if (p.error || p.pos != p.len) {
-        query_node_free(root);
-        return NULL;
-    }
-    return root;
-}
-
-static int wildcard_match_here(const char* text, size_t text_len, const char* pattern, size_t pattern_len)
-{
-    size_t ti = 0, pi = 0;
-    size_t star_pi = SIZE_MAX, star_ti = 0;
-    while (ti < text_len) {
-        if (pi >= pattern_len) return 1;
-        if (pi < pattern_len && pattern[pi] == '*') {
-            while (pi < pattern_len && pattern[pi] == '*') ++pi;
-            if (pi >= pattern_len) return 1;
-            star_pi = pi;
-            star_ti = ti;
-            continue;
-        }
-        if (pi < pattern_len && pattern[pi] == '?') {
-            ti += (size_t)utf8_token_len((const unsigned char*)text + ti, text_len - ti);
-            ++pi;
-            continue;
-        }
-        if (pi < pattern_len &&
-            fold_ascii_byte((unsigned char)text[ti]) == fold_ascii_byte((unsigned char)pattern[pi])) {
-            ++ti;
-            ++pi;
-            continue;
-        }
-        if (star_pi != SIZE_MAX) {
-            star_ti += (size_t)utf8_token_len((const unsigned char*)text + star_ti, text_len - star_ti);
-            ti = star_ti;
-            pi = star_pi;
-            continue;
-        }
-        return 0;
-    }
-    while (pi < pattern_len && pattern[pi] == '*') ++pi;
-    return pi == pattern_len;
-}
-
-static int wildcard_contains_ascii_casefold(const char* text, size_t text_len, const char* pattern, size_t pattern_len)
-{
-    if (!pattern_len) return 1;
-    if (pattern[0] == '*') return wildcard_match_here(text, text_len, pattern, pattern_len);
-    for (size_t i = 0; i <= text_len; ) {
-        if (wildcard_match_here(text + i, text_len - i, pattern, pattern_len)) return 1;
-        if (i == text_len) break;
-        i += (size_t)utf8_token_len((const unsigned char*)text + i, text_len - i);
-    }
-    return 0;
-}
-
-static int query_match_path(const EzdbQueryNode* node, const char* path, size_t path_len)
-{
-    if (!node) return 1;
-    switch (node->type) {
-    case EZDB_QUERY_TERM:
-        return contains_ascii_casefold_bytes(path, path_len, node->text, node->text_len);
-    case EZDB_QUERY_WILDCARD:
-        return wildcard_contains_ascii_casefold(path, path_len, node->text, node->text_len);
-    case EZDB_QUERY_NOT:
-        return !query_match_path(node->left, path, path_len);
-    case EZDB_QUERY_AND:
-        return query_match_path(node->left, path, path_len) && query_match_path(node->right, path, path_len);
-    case EZDB_QUERY_OR:
-        return query_match_path(node->left, path, path_len) || query_match_path(node->right, path, path_len);
-    default:
-        return 0;
-    }
-}
-
-static int query_longest_literal_from_wildcard(const char* text, size_t len, const char** out_text, size_t* out_len)
-{
-    size_t best_start = 0, best_len = 0;
-    size_t start = 0, cur_len = 0;
-    for (size_t i = 0; i < len; ++i) {
-        if (text[i] == '*' || text[i] == '?') {
-            if (cur_len > best_len) {
-                best_start = start;
-                best_len = cur_len;
-            }
-            start = i + 1u;
-            cur_len = 0;
-        } else {
-            ++cur_len;
-        }
-    }
-    if (cur_len > best_len) {
-        best_start = start;
-        best_len = cur_len;
-    }
-    if (!best_len) return 0;
-    *out_text = text + best_start;
-    *out_len = best_len;
-    return 1;
-}
-
-static int query_build_candidate_keys(const char* text, size_t len, uint32_t** out_keys, uint32_t* out_count)
-{
-    if (!len || len > UINT32_MAX) {
-        *out_keys = NULL;
-        *out_count = 0;
-        return EZDB_OK;
-    }
-    return build_query_keys(text, out_keys, out_count);
-}
-
 static int record_contains_keyword(Ezdb* db, uint32_t id, const char* keyword, size_t key_len)
 {
     EzdbDeltaRecord* delta = find_delta_record(db, id);
     if (delta) {
         return delta->type != EZDB_DELTA_DELETE &&
-               contains_ascii_casefold_bytes(delta->path, delta->path_len, keyword, key_len);
+               ezdb_query_contains_ascii_casefold(delta->path, delta->path_len, keyword, key_len);
     }
     if (id >= db->header.base_file_count) return 0;
-    if (contains_ascii_casefold_bytes(file_name_by_id(db, id), db->file_name_lens[id], keyword, key_len)) return 1;
+    if (ezdb_query_contains_ascii_casefold(file_name_by_id(db, id), db->file_name_lens[id], keyword, key_len)) return 1;
     char* path = NULL;
     EzdbSearchResult result;
     if (build_result_path(db, id, &result) != EZDB_OK) return 0;
     path = result.path;
-    int matched = contains_ascii_casefold_bytes(path, strlen(path), keyword, key_len);
+    int matched = ezdb_query_contains_ascii_casefold(path, strlen(path), keyword, key_len);
     ezdb_free_result(&result);
     return matched;
-}
-
-static EzdbDiskIndex* find_index(EzdbDiskIndex* index, uint64_t count, uint32_t key)
-{
-    EzdbDiskIndex search_key;
-    search_key.key = key;
-    search_key.count = 0;
-    search_key.offset = 0;
-    return (EzdbDiskIndex*)bsearch(&search_key, index, (size_t)count, sizeof(EzdbDiskIndex), index_compare);
-}
-
-static int load_postings(Ezdb* db, const EzdbDiskIndex* idx, uint32_t** out_ids)
-{
-    uint32_t* ids = (uint32_t*)malloc(sizeof(uint32_t) * idx->count);
-    if (!ids && idx->count) return EZDB_ERR_MEMORY;
-    if (fseek(db->fp, (long)(db->header.postings_offset + idx->offset), SEEK_SET) != 0) {
-        free(ids);
-        return EZDB_ERR_IO;
-    }
-    unsigned char* encoded = (unsigned char*)malloc(idx->encoded_size ? idx->encoded_size : 1u);
-    if (!encoded) {
-        free(ids);
-        return EZDB_ERR_MEMORY;
-    }
-    if (idx->encoded_size && fread(encoded, 1, idx->encoded_size, db->fp) != idx->encoded_size) {
-        free(encoded);
-        free(ids);
-        return EZDB_ERR_IO;
-    }
-
-    uint32_t raw_size = idx->raw_size ? idx->raw_size : idx->encoded_size;
-    unsigned char* raw = encoded;
-    if (idx->container_type & EZDB_POSTING_COMPRESSED) {
-        raw = (unsigned char*)malloc(raw_size ? raw_size : 1u);
-        if (!raw) {
-            free(encoded);
-            free(ids);
-            return EZDB_ERR_MEMORY;
-        }
-        uLongf dest_len = (uLongf)raw_size;
-        int zrc = uncompress(raw, &dest_len, encoded, (uLong)idx->encoded_size);
-        free(encoded);
-        if (zrc != Z_OK || dest_len != raw_size) {
-            free(raw);
-            free(ids);
-            return EZDB_ERR_FORMAT;
-        }
-    }
-
-    uint32_t container_type = idx->container_type & EZDB_POSTING_TYPE_MASK;
-    if (container_type == EZDB_POSTING_ARRAY) {
-        uint32_t current = 0;
-        uint32_t pos = 0;
-        for (uint32_t i = 0; i < idx->count; ++i) {
-            uint32_t delta = 0;
-            int rc = read_varuint_mem(raw, raw_size, &pos, &delta);
-            if (rc != EZDB_OK) {
-                if (raw != encoded) free(raw);
-                else free(encoded);
-                free(ids);
-                return rc;
-            }
-            current = i == 0 ? delta : current + delta;
-            ids[i] = current;
-        }
-    } else if (container_type == EZDB_POSTING_RANGE) {
-        uint32_t n = 0;
-        uint32_t current_start = 0;
-        uint32_t pos = 0;
-        while (n < idx->count) {
-            uint32_t start_delta = 0, len = 0;
-            int rc = read_varuint_mem(raw, raw_size, &pos, &start_delta);
-            if (rc == EZDB_OK) rc = read_varuint_mem(raw, raw_size, &pos, &len);
-            if (rc != EZDB_OK) {
-                if (raw != encoded) free(raw);
-                else free(encoded);
-                free(ids);
-                return rc;
-            }
-            current_start = n == 0 ? start_delta : current_start + start_delta;
-            for (uint32_t j = 0; j < len && n < idx->count; ++j) ids[n++] = current_start + j;
-        }
-    } else if (container_type == EZDB_POSTING_BITSET) {
-        uint32_t n = 0;
-        for (uint32_t byte_i = 0; byte_i < raw_size && n < idx->count; ++byte_i) {
-            unsigned char byte = raw[byte_i];
-            while (byte && n < idx->count) {
-                unsigned bit = 0;
-                while (bit < 8u && !(byte & (1u << bit))) ++bit;
-                if (bit >= 8u) break;
-                ids[n++] = byte_i * 8u + bit;
-                byte &= (unsigned char)~(1u << bit);
-            }
-        }
-        if (n != idx->count) {
-            if (raw != encoded) free(raw);
-            else free(encoded);
-            free(ids);
-            return EZDB_ERR_FORMAT;
-        }
-    } else {
-        if (raw != encoded) free(raw);
-        else free(encoded);
-        free(ids);
-        return EZDB_ERR_FORMAT;
-    }
-    if (raw != encoded) free(raw);
-    else free(encoded);
-    *out_ids = ids;
-    return EZDB_OK;
-}
-
-static int load_intersected_postings(Ezdb* db, EzdbDiskIndex* index, uint64_t index_count, uint32_t* keys, uint32_t key_count, uint32_t** out_ids, uint32_t* out_count)
-{
-    *out_ids = NULL;
-    *out_count = 0;
-    QueryIndex* qis = (QueryIndex*)malloc(sizeof(QueryIndex) * key_count);
-    if (!qis) return EZDB_ERR_MEMORY;
-    for (uint32_t i = 0; i < key_count; ++i) {
-        EzdbDiskIndex* idx = find_index(index, index_count, keys[i]);
-        if (!idx) {
-            free(qis);
-            return EZDB_OK;
-        }
-        qis[i].idx = idx;
-    }
-    qsort(qis, key_count, sizeof(QueryIndex), query_index_compare);
-    uint32_t* current = NULL;
-    uint32_t current_count = 0;
-    int rc = EZDB_OK;
-    for (uint32_t i = 0; i < key_count && rc == EZDB_OK; ++i) {
-        uint32_t* ids = NULL;
-        rc = load_postings(db, qis[i].idx, &ids);
-        if (rc != EZDB_OK) break;
-        if (!current) {
-            current = ids;
-            current_count = qis[i].idx->count;
-        } else {
-            uint32_t max_next = current_count < qis[i].idx->count ? current_count : qis[i].idx->count;
-            uint32_t* next = (uint32_t*)malloc(sizeof(uint32_t) * max_next);
-            if (!next && max_next) {
-                free(ids);
-                rc = EZDB_ERR_MEMORY;
-                break;
-            }
-            uint32_t a = 0, b = 0, n = 0;
-            while (a < current_count && b < qis[i].idx->count) {
-                if (current[a] == ids[b]) {
-                    next[n++] = current[a];
-                    ++a;
-                    ++b;
-                } else if (current[a] < ids[b]) {
-                    ++a;
-                } else {
-                    ++b;
-                }
-            }
-            free(current);
-            free(ids);
-            current = next;
-            current_count = n;
-            if (!current_count) break;
-        }
-    }
-    free(qis);
-    if (rc != EZDB_OK) {
-        free(current);
-        return rc;
-    }
-    *out_ids = current;
-    *out_count = current_count;
-    return EZDB_OK;
-}
-
-static int load_intersected_memory_postings(PostingBuilder* builder, uint32_t* keys, uint32_t key_count, uint32_t** out_ids, uint32_t* out_count)
-{
-    *out_ids = NULL;
-    *out_count = 0;
-    if (!builder || !builder->buckets || !builder->entry_count || !key_count) return EZDB_OK;
-    PostingBuildEntry** entries = (PostingBuildEntry**)malloc(sizeof(PostingBuildEntry*) * (size_t)key_count);
-    if (!entries) return EZDB_ERR_MEMORY;
-    for (uint32_t i = 0; i < key_count; ++i) {
-        PostingBuildEntry* entry = posting_builder_find(builder, keys[i]);
-        if (!entry || !entry->count) {
-            free(entries);
-            return EZDB_OK;
-        }
-        entries[i] = entry;
-    }
-    for (uint32_t i = 0; i + 1u < key_count; ++i) {
-        for (uint32_t j = i + 1u; j < key_count; ++j) {
-            if (entries[j]->count < entries[i]->count) {
-                PostingBuildEntry* tmp = entries[i];
-                entries[i] = entries[j];
-                entries[j] = tmp;
-            }
-        }
-    }
-    uint32_t* current = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)entries[0]->count);
-    if (!current && entries[0]->count) {
-        free(entries);
-        return EZDB_ERR_MEMORY;
-    }
-    memcpy(current, entries[0]->ids, sizeof(uint32_t) * (size_t)entries[0]->count);
-    uint32_t current_count = entries[0]->count;
-    for (uint32_t i = 1; i < key_count && current_count; ++i) {
-        uint32_t* next = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(current_count < entries[i]->count ? current_count : entries[i]->count));
-        if (!next && current_count && entries[i]->count) {
-            free(current);
-            free(entries);
-            return EZDB_ERR_MEMORY;
-        }
-        uint32_t a = 0, b = 0, n = 0;
-        while (a < current_count && b < entries[i]->count) {
-            if (current[a] == entries[i]->ids[b]) {
-                next[n++] = current[a];
-                ++a;
-                ++b;
-            } else if (current[a] < entries[i]->ids[b]) {
-                ++a;
-            } else {
-                ++b;
-            }
-        }
-        free(current);
-        current = next;
-        current_count = n;
-    }
-    free(entries);
-    *out_ids = current;
-    *out_count = current_count;
-    return EZDB_OK;
 }
 
 static int mark_literal_candidates(Ezdb* db, const char* literal, size_t literal_len, unsigned char* seen, int* any_marked)
@@ -2831,7 +1739,7 @@ static int mark_literal_candidates(Ezdb* db, const char* literal, size_t literal
     if (!keyword) return EZDB_ERR_MEMORY;
     uint32_t* keys = NULL;
     uint32_t key_count = 0;
-    int rc = query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
+    int rc = ezdb_query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
     if (rc != EZDB_OK) {
         free(keyword);
         return rc;
@@ -2846,8 +1754,8 @@ static int mark_literal_candidates(Ezdb* db, const char* literal, size_t literal
     uint32_t file_count = 0;
     uint32_t* dir_ids = NULL;
     uint32_t dir_count = 0;
-    rc = load_intersected_postings(db, db->file_index, db->header.file_index_count, keys, key_count, &file_ids, &file_count);
-    if (rc == EZDB_OK) rc = load_intersected_postings(db, db->dir_index, db->header.dir_index_count, keys, key_count, &dir_ids, &dir_count);
+    rc = ezdb_postings_load_intersected(db->fp, db->header.postings_offset, db->file_index, db->header.file_index_count, keys, key_count, &file_ids, &file_count);
+    if (rc == EZDB_OK) rc = ezdb_postings_load_intersected(db->fp, db->header.postings_offset, db->dir_index, db->header.dir_index_count, keys, key_count, &dir_ids, &dir_count);
     free(keys);
     if (rc != EZDB_OK) {
         free(file_ids);
@@ -2881,7 +1789,7 @@ static int mark_literal_candidates(Ezdb* db, const char* literal, size_t literal
         EzdbDeltaRecord* delta = &db->deltas[i];
         if (find_delta_record(db, delta->id) != delta) continue;
         if (delta->type == EZDB_DELTA_DELETE || !bitset_get(db->active_bits, delta->id)) continue;
-        if (contains_ascii_casefold_bytes(delta->path, delta->path_len, keyword, literal_len)) {
+        if (ezdb_query_contains_ascii_casefold(delta->path, delta->path_len, keyword, literal_len)) {
             seen[delta->id >> 3u] |= (unsigned char)(1u << (delta->id & 7u));
             *any_marked = 1;
         }
@@ -2926,7 +1834,7 @@ static int query_build_candidate_bitset(Ezdb* db, EzdbQueryNode* node, unsigned 
         if (node->type == EZDB_QUERY_TERM) {
             literal = node->text;
             literal_len = node->text_len;
-        } else if (!query_longest_literal_from_wildcard(node->text, node->text_len, &literal, &literal_len)) {
+        } else if (!ezdb_query_longest_literal_from_wildcard(node->text, node->text_len, &literal, &literal_len)) {
             return EZDB_OK;
         }
         unsigned char* bits = (unsigned char*)calloc(bit_bytes ? bit_bytes : 1u, 1);
@@ -3129,7 +2037,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         if (rc == EZDB_OK) raw_writer_ready = 1;
     }
     if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
-        rc = posting_builder_init(&entry_builder, 262144u);
+        rc = ezdb_postings_builder_init(&entry_builder, 262144u);
         if (rc == EZDB_OK) entry_builder_ready = 1;
     }
     if (rc == EZDB_OK && source && source->reset) rc = source->reset(source->user_data);
@@ -3202,7 +2110,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         }
 
         if (entry_builder_ready) {
-            rc = count_text_grams(&entry_builder, record.entry_path, i);
+            rc = ezdb_postings_count_text_grams(&entry_builder, record.entry_path, i);
             if (rc != EZDB_OK) break;
         }
     }
@@ -3219,6 +2127,45 @@ static int ezdb_write_entries_from_source(FILE* out,
         raw_fp = NULL;
     }
 
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+        stage_start_ms = ezdb_now_ms();
+        rc = ezdb_postings_builder_prepare_fill_adaptive(&entry_builder, entry_count);
+        index_prepare_ms = ezdb_now_ms() - stage_start_ms;
+    }
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+        if (!source->reset) {
+            rc = EZDB_ERR_ARG;
+        } else {
+            rc = source->reset(source->user_data);
+        }
+        stage_start_ms = ezdb_now_ms();
+        for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
+            EzdbEntryRecord record;
+            memset(&record, 0, sizeof(record));
+            rc = source->next(source->user_data, &record);
+            if (rc != EZDB_OK) break;
+            if (!record.entry_path) {
+                rc = EZDB_ERR_ARG;
+                break;
+            }
+            rc = ezdb_postings_fill_text_grams(&entry_builder, record.entry_path, i);
+        }
+        index_fill_ms = ezdb_now_ms() - stage_start_ms;
+    }
+    postings_build_ms = index_count_ms + index_prepare_ms + index_fill_ms;
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+        stage_start_ms = ezdb_now_ms();
+        uint64_t entry_postings_start = (uint64_t)ftell(out);
+        rc = ezdb_postings_write(out, &entry_builder, entry_count, &entry_index, &entry_index_count,
+                            &entry_postings_size, &entry_posting_stats);
+        write_postings_ms = ezdb_now_ms() - stage_start_ms;
+        if (rc == EZDB_OK) {
+            uint64_t relative = entry_postings_start - header->postings_offset;
+            for (uint32_t i = 0; i < entry_index_count; ++i) entry_index[i].offset += relative;
+            header->entry_index_count = entry_index_count;
+            header->entry_postings_size = entry_postings_size;
+        }
+    }
     if (rc == EZDB_OK) {
         stage_start_ms = ezdb_now_ms();
         header->entry_records_offset = (uint64_t)ftell(out);
@@ -3256,48 +2203,11 @@ static int ezdb_write_entries_from_source(FILE* out,
             fwrite(raw_writer.pages, sizeof(EzdbDiskPage), raw_writer.page_count, out) != raw_writer.page_count) rc = EZDB_ERR_IO;
         write_raw_ms = ezdb_now_ms() - stage_start_ms;
     }
-    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+    if (rc == EZDB_OK && entry_index_count) {
         stage_start_ms = ezdb_now_ms();
-        rc = posting_builder_prepare_fill_adaptive(&entry_builder, entry_count);
-        index_prepare_ms = ezdb_now_ms() - stage_start_ms;
-    }
-    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
-        if (!source->reset) {
-            rc = EZDB_ERR_ARG;
-        } else {
-            rc = source->reset(source->user_data);
-        }
-        stage_start_ms = ezdb_now_ms();
-        for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
-            EzdbEntryRecord record;
-            memset(&record, 0, sizeof(record));
-            rc = source->next(source->user_data, &record);
-            if (rc != EZDB_OK) break;
-            if (!record.entry_path) {
-                rc = EZDB_ERR_ARG;
-                break;
-            }
-            rc = fill_text_grams(&entry_builder, record.entry_path, i);
-        }
-        index_fill_ms = ezdb_now_ms() - stage_start_ms;
-    }
-    postings_build_ms = index_count_ms + index_prepare_ms + index_fill_ms;
-    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
-        stage_start_ms = ezdb_now_ms();
-        uint64_t entry_postings_start = (uint64_t)ftell(out);
-        rc = write_postings(out, &entry_builder, entry_count, &entry_index, &entry_index_count,
-                            &entry_postings_size, &entry_posting_stats);
-        write_postings_ms = ezdb_now_ms() - stage_start_ms;
-        if (rc == EZDB_OK) {
-            stage_start_ms = ezdb_now_ms();
-            uint64_t relative = entry_postings_start - header->postings_offset;
-            for (uint32_t i = 0; i < entry_index_count; ++i) entry_index[i].offset += relative;
-            header->entry_index_offset = (uint64_t)ftell(out);
-            header->entry_index_count = entry_index_count;
-            header->entry_postings_size = entry_postings_size;
-            if (entry_index_count && fwrite(entry_index, sizeof(EzdbDiskIndex), entry_index_count, out) != entry_index_count) rc = EZDB_ERR_IO;
-            write_index_ms = ezdb_now_ms() - stage_start_ms;
-        }
+        header->entry_index_offset = (uint64_t)ftell(out);
+        if (fwrite(entry_index, sizeof(EzdbDiskIndex), entry_index_count, out) != entry_index_count) rc = EZDB_ERR_IO;
+        write_index_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
         stage_start_ms = ezdb_now_ms();
@@ -3353,7 +2263,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (detail_fp) fclose(detail_fp);
     if (raw_fp) fclose(raw_fp);
     free(entry_index);
-    if (entry_builder_ready) posting_builder_free(&entry_builder);
+    if (entry_builder_ready) ezdb_postings_builder_free(&entry_builder);
     if (detail_writer_ready) stream_paged_writer_free(&detail_writer);
     if (raw_writer_ready) stream_paged_writer_free(&raw_writer);
     remove(core_path);
@@ -3381,6 +2291,355 @@ static int ezdb_write_entries(FILE* out,
     source.reset = array_entry_source_reset;
     source.next = array_entry_source_next;
     return ezdb_write_entries_from_source(out, header, &source, entry_count, original_archive_count, original_to_final, options);
+}
+
+static void ezdb_add_v13_section(EzdbSectionDesc* sections,
+                                 uint32_t* section_count,
+                                 uint32_t section_id,
+                                 uint32_t flags,
+                                 uint64_t offset,
+                                 uint64_t encoded_size,
+                                 uint64_t raw_size,
+                                 uint64_t aux_offset,
+                                 uint64_t aux_size,
+                                 uint32_t page_size,
+                                 uint32_t aux_count)
+{
+    if (!encoded_size && !raw_size && !aux_size && !aux_count) return;
+    EzdbSectionDesc* section = &sections[*section_count];
+    memset(section, 0, sizeof(*section));
+    section->section_id = section_id;
+    section->flags = flags;
+    section->offset = offset;
+    section->encoded_size = encoded_size;
+    section->raw_size = raw_size;
+    section->aux_offset = aux_offset;
+    section->aux_size = aux_size;
+    section->page_size = page_size;
+    section->aux_count = aux_count;
+    *section_count += 1u;
+}
+
+static int ezdb_build_v13_sections_from_header(const EzdbHeader* header,
+                                               EzdbSectionDesc* sections,
+                                               uint32_t section_cap,
+                                               uint32_t* out_section_count)
+{
+    if (!header || !sections || !out_section_count || section_cap < EZDB_SECTION_METADATA) return EZDB_ERR_ARG;
+    uint32_t count = 0;
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ARCHIVE_RECORDS,
+                         header->file_records_flags,
+                         header->file_records_offset,
+                         header->file_records_size,
+                         header->file_records_raw_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_DIR_RECORDS,
+                         header->dir_records_flags,
+                         header->dir_records_offset,
+                         header->dir_records_size,
+                         header->dir_records_raw_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_STRING_POOL,
+                         header->strings_flags,
+                         header->strings_offset,
+                         header->strings_size,
+                         header->strings_raw_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ARCHIVE_META,
+                         header->archive_meta_flags,
+                         header->archive_meta_offset,
+                         header->archive_meta_size,
+                         header->archive_meta_raw_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ENTRY_CORE,
+                         header->entry_records_flags,
+                         header->entry_records_offset,
+                         header->entry_records_size,
+                         header->entry_records_raw_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ENTRY_DETAIL_PAGES,
+                         0,
+                         header->entry_detail_offset,
+                         header->entry_detail_size,
+                         sizeof(EzdbDiskEntry) * header->base_entry_count,
+                         header->entry_detail_index_offset,
+                         sizeof(EzdbDiskPage) * header->entry_detail_page_count,
+                         header->entry_page_size,
+                         (uint32_t)header->entry_detail_page_count);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ENTRY_RAW_PAGES,
+                         0,
+                         header->raw_blob_offset,
+                         header->raw_blob_size,
+                         header->raw_blob_raw_size,
+                         header->raw_blob_index_offset,
+                         sizeof(EzdbDiskPage) * header->raw_blob_page_count,
+                         header->raw_blob_page_size,
+                         (uint32_t)header->raw_blob_page_count);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_FILE_INDEX,
+                         0,
+                         header->file_index_offset,
+                         sizeof(EzdbDiskIndex) * header->file_index_count,
+                         sizeof(EzdbDiskIndex) * header->file_index_count,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_DIR_INDEX,
+                         0,
+                         header->dir_index_offset,
+                         sizeof(EzdbDiskIndex) * header->dir_index_count,
+                         sizeof(EzdbDiskIndex) * header->dir_index_count,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_ENTRY_INDEX,
+                         0,
+                         header->entry_index_offset,
+                         sizeof(EzdbDiskIndex) * header->entry_index_count,
+                         sizeof(EzdbDiskIndex) * header->entry_index_count,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_POSTINGS,
+                         0,
+                         header->postings_offset,
+                         header->postings_size + header->entry_postings_size,
+                         header->postings_size + header->entry_postings_size,
+                         0, 0, 0, 0);
+    ezdb_add_v13_section(sections, &count, EZDB_SECTION_DELTA_LOG,
+                         0,
+                         header->delta_offset,
+                         header->delta_size,
+                         header->delta_size,
+                         0, 0, 0, 0);
+    *out_section_count = count;
+    return EZDB_OK;
+}
+
+static int ezdb_write_v13_header_and_section_table(FILE* out, const EzdbHeader* header)
+{
+    if (!out || !header) return EZDB_ERR_ARG;
+    EzdbSectionDesc sections[EZDB_SECTION_METADATA];
+    uint32_t section_count = 0;
+    int rc = ezdb_build_v13_sections_from_header(header, sections, EZDB_SECTION_METADATA, &section_count);
+    if (rc != EZDB_OK) return rc;
+    uint64_t table_offset = 0;
+    uint64_t table_size = 0;
+    rc = ezdb_format_write_section_table(out, sections, section_count, &table_offset, &table_size);
+    if (rc != EZDB_OK) return rc;
+    uint64_t file_size = table_offset + table_size;
+    rc = ezdb_format_validate_section_table(sections, section_count, file_size);
+    if (rc != EZDB_OK) return rc;
+
+    EzdbV13Header disk_header;
+    memset(&disk_header, 0, sizeof(disk_header));
+    memcpy(disk_header.magic, EZDB_V13_MAGIC, sizeof(disk_header.magic));
+    disk_header.version = EZDB_V13_VERSION;
+    disk_header.header_size = sizeof(EzdbV13Header);
+    disk_header.section_count = section_count;
+    disk_header.section_table_offset = table_offset;
+    disk_header.archive_count = header->file_count;
+    disk_header.active_archive_count = header->active_count;
+    disk_header.dir_count = header->dir_count;
+    disk_header.entry_count = header->entry_count;
+    disk_header.active_entry_count = header->active_entry_count;
+    disk_header.base_archive_count = header->base_file_count;
+    disk_header.base_entry_count = header->base_entry_count;
+    if (fseek(out, 0, SEEK_SET) != 0 || fwrite(&disk_header, sizeof(disk_header), 1, out) != 1) {
+        return EZDB_ERR_IO;
+    }
+    return EZDB_OK;
+}
+
+static int ezdb_write_v13_db_header(Ezdb* db)
+{
+    if (!db || !db->fp) return EZDB_ERR_ARG;
+    uint64_t table_offset = db->header.delta_offset
+        ? db->header.delta_offset + db->header.delta_size
+        : db->v13_section_table_offset;
+    if (!table_offset) table_offset = db->header.reserved_offset;
+    if (fseek(db->fp, (long)table_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+
+    EzdbSectionDesc sections[EZDB_SECTION_METADATA];
+    uint32_t section_count = 0;
+    int rc = ezdb_build_v13_sections_from_header(&db->header, sections, EZDB_SECTION_METADATA, &section_count);
+    if (rc != EZDB_OK) return rc;
+    uint64_t written_table_offset = 0;
+    uint64_t table_size = 0;
+    rc = ezdb_format_write_section_table(db->fp, sections, section_count, &written_table_offset, &table_size);
+    if (rc != EZDB_OK) return rc;
+    if (written_table_offset != table_offset) return EZDB_ERR_IO;
+    uint64_t file_size = table_offset + table_size;
+    rc = ezdb_format_validate_section_table(sections, section_count, file_size);
+    if (rc != EZDB_OK) return rc;
+
+    db->v13_section_table_offset = table_offset;
+    db->v13_section_table_size = table_size;
+    db->header.reserved_offset = file_size;
+    db->header.reserved_size = 0;
+
+    EzdbV13Header disk_header;
+    memset(&disk_header, 0, sizeof(disk_header));
+    memcpy(disk_header.magic, EZDB_V13_MAGIC, sizeof(disk_header.magic));
+    disk_header.version = EZDB_V13_VERSION;
+    disk_header.header_size = sizeof(EzdbV13Header);
+    disk_header.section_count = section_count;
+    disk_header.section_table_offset = table_offset;
+    disk_header.archive_count = db->header.file_count;
+    disk_header.active_archive_count = db->header.active_count;
+    disk_header.dir_count = db->header.dir_count;
+    disk_header.entry_count = db->header.entry_count;
+    disk_header.active_entry_count = db->header.active_entry_count;
+    disk_header.base_archive_count = db->header.base_file_count;
+    disk_header.base_entry_count = db->header.base_entry_count;
+    if (fseek(db->fp, 0, SEEK_SET) != 0 || fwrite(&disk_header, sizeof(disk_header), 1, db->fp) != 1) {
+        return EZDB_ERR_IO;
+    }
+    return flush_file(db->fp);
+}
+
+static uint64_t ezdb_delta_append_offset(Ezdb* db)
+{
+    if (!db) return 0;
+    if (db->format_v13) {
+        if (db->header.delta_offset && db->header.delta_size) return db->header.delta_offset + db->header.delta_size;
+        return db->v13_section_table_offset ? db->v13_section_table_offset : db->header.reserved_offset;
+    }
+    return db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+}
+
+static int ezdb_get_file_size(FILE* fp, uint64_t* out_size)
+{
+    if (!fp || !out_size) return EZDB_ERR_ARG;
+    long current = ftell(fp);
+    if (current < 0) return EZDB_ERR_IO;
+    if (fseek(fp, 0, SEEK_END) != 0) return EZDB_ERR_IO;
+    long end = ftell(fp);
+    if (end < 0) return EZDB_ERR_IO;
+    if (fseek(fp, current, SEEK_SET) != 0) return EZDB_ERR_IO;
+    *out_size = (uint64_t)end;
+    return EZDB_OK;
+}
+
+static uint64_t ezdb_v13_index_count_from_section(const EzdbSectionDesc* section)
+{
+    if (!section) return 0;
+    if (section->aux_count) return section->aux_count;
+    if (sizeof(EzdbDiskIndex) && section->encoded_size % sizeof(EzdbDiskIndex) == 0) {
+        return section->encoded_size / sizeof(EzdbDiskIndex);
+    }
+    return UINT64_MAX;
+}
+
+static int ezdb_apply_v13_section_header(EzdbHeader* header,
+                                         const EzdbSectionDesc* sections,
+                                         uint32_t section_count,
+                                         uint32_t section_id)
+{
+    const EzdbSectionDesc* section = ezdb_format_find_section(sections, section_count, section_id);
+    if (!section) return EZDB_OK;
+    switch (section_id) {
+    case EZDB_SECTION_ARCHIVE_RECORDS:
+        header->file_records_offset = section->offset;
+        header->file_records_size = section->encoded_size;
+        header->file_records_raw_size = section->raw_size;
+        header->file_records_flags = section->flags;
+        break;
+    case EZDB_SECTION_DIR_RECORDS:
+        header->dir_records_offset = section->offset;
+        header->dir_records_size = section->encoded_size;
+        header->dir_records_raw_size = section->raw_size;
+        header->dir_records_flags = section->flags;
+        break;
+    case EZDB_SECTION_STRING_POOL:
+        header->strings_offset = section->offset;
+        header->strings_size = section->encoded_size;
+        header->strings_raw_size = section->raw_size;
+        header->strings_flags = section->flags;
+        break;
+    case EZDB_SECTION_ARCHIVE_META:
+        header->archive_meta_offset = section->offset;
+        header->archive_meta_size = section->encoded_size;
+        header->archive_meta_raw_size = section->raw_size;
+        header->archive_meta_flags = section->flags;
+        break;
+    case EZDB_SECTION_ENTRY_CORE:
+        header->entry_records_offset = section->offset;
+        header->entry_records_size = section->encoded_size;
+        header->entry_records_raw_size = section->raw_size;
+        header->entry_records_flags = section->flags;
+        break;
+    case EZDB_SECTION_ENTRY_DETAIL_PAGES:
+        header->entry_detail_offset = section->offset;
+        header->entry_detail_size = section->encoded_size;
+        header->entry_detail_index_offset = section->aux_offset;
+        header->entry_detail_page_count = section->aux_count;
+        header->entry_page_size = section->page_size;
+        break;
+    case EZDB_SECTION_ENTRY_RAW_PAGES:
+        header->raw_blob_offset = section->offset;
+        header->raw_blob_size = section->encoded_size;
+        header->raw_blob_raw_size = section->raw_size;
+        header->raw_blob_index_offset = section->aux_offset;
+        header->raw_blob_page_count = section->aux_count;
+        header->raw_blob_page_size = section->page_size;
+        break;
+    case EZDB_SECTION_FILE_INDEX: {
+        uint64_t count = ezdb_v13_index_count_from_section(section);
+        if (count == UINT64_MAX) return EZDB_ERR_FORMAT;
+        header->file_index_offset = section->offset;
+        header->file_index_count = count;
+        break;
+    }
+    case EZDB_SECTION_DIR_INDEX: {
+        uint64_t count = ezdb_v13_index_count_from_section(section);
+        if (count == UINT64_MAX) return EZDB_ERR_FORMAT;
+        header->dir_index_offset = section->offset;
+        header->dir_index_count = count;
+        break;
+    }
+    case EZDB_SECTION_ENTRY_INDEX: {
+        uint64_t count = ezdb_v13_index_count_from_section(section);
+        if (count == UINT64_MAX) return EZDB_ERR_FORMAT;
+        header->entry_index_offset = section->offset;
+        header->entry_index_count = count;
+        break;
+    }
+    case EZDB_SECTION_POSTINGS:
+        header->postings_offset = section->offset;
+        header->postings_size = section->encoded_size;
+        header->entry_postings_size = 0;
+        break;
+    case EZDB_SECTION_DELTA_LOG:
+        header->delta_offset = section->offset;
+        header->delta_size = section->encoded_size;
+        break;
+    default:
+        break;
+    }
+    return EZDB_OK;
+}
+
+static int ezdb_apply_v13_header(EzdbHeader* header,
+                                 const EzdbV13Header* disk_header,
+                                 const EzdbSectionDesc* sections,
+                                 uint32_t section_count,
+                                 uint64_t file_size)
+{
+    if (!header || !disk_header || !sections) return EZDB_ERR_ARG;
+    memset(header, 0, sizeof(*header));
+    memcpy(header->magic, EZDB_MAGIC, sizeof(header->magic));
+    header->version = EZDB_VERSION;
+    header->header_size = sizeof(EzdbHeader);
+    header->file_count = disk_header->archive_count;
+    header->active_count = disk_header->active_archive_count;
+    header->dir_count = disk_header->dir_count;
+    header->entry_count = disk_header->entry_count;
+    header->active_entry_count = disk_header->active_entry_count;
+    header->base_file_count = disk_header->base_archive_count ? disk_header->base_archive_count : disk_header->archive_count;
+    header->base_entry_count = disk_header->base_entry_count;
+    if (!header->base_entry_count && header->entry_count) header->base_entry_count = header->entry_count;
+    header->reserved_offset = file_size;
+    header->reserved_size = 0;
+
+    for (uint32_t i = 0; i < section_count; ++i) {
+        int rc = ezdb_apply_v13_section_header(header, sections, section_count, sections[i].section_id);
+        if (rc != EZDB_OK) return rc;
+    }
+    return EZDB_OK;
 }
 
 static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
@@ -3492,7 +2751,9 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
             header.active_count = file_count;
             header.base_file_count = file_count;
             header.dir_count = dir_count;
-            fwrite(&header, sizeof(header), 1, out);
+            EzdbV13Header disk_header_placeholder;
+            memset(&disk_header_placeholder, 0, sizeof(disk_header_placeholder));
+            if (fwrite(&disk_header_placeholder, sizeof(disk_header_placeholder), 1, out) != 1) rc = EZDB_ERR_IO;
 
             stage_start_ms = ezdb_now_ms();
             header.file_records_offset = (uint64_t)ftell(out);
@@ -3580,53 +2841,61 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
             uint64_t file_postings_size = 0, dir_postings_size = 0;
             if (rc == EZDB_OK) {
                 stage_start_ms = ezdb_now_ms();
-                rc = posting_builder_init(&file_builder, 262144u);
+                rc = ezdb_postings_builder_init(&file_builder, 262144u);
                 if (rc == EZDB_OK) file_builder_ready = 1;
             }
             if (rc == EZDB_OK) {
                 for (uint32_t i = 0; i < file_count; ++i) {
-                    rc = count_text_grams(&file_builder, string_pool + file_name_offsets[i], i);
+                    rc = ezdb_postings_count_text_grams(&file_builder, string_pool + file_name_offsets[i], i);
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = posting_builder_prepare_fill(&file_builder);
+            if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&file_builder);
             if (rc == EZDB_OK) {
                 for (uint32_t i = 0; i < file_count; ++i) {
-                    rc = fill_text_grams(&file_builder, string_pool + file_name_offsets[i], i);
+                    rc = ezdb_postings_fill_text_grams(&file_builder, string_pool + file_name_offsets[i], i);
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = write_postings(out, &file_builder, file_count, &file_index, &file_index_count, &file_postings_size, NULL);
+            if (rc == EZDB_OK) rc = ezdb_postings_write(out, &file_builder, file_count, &file_index, &file_index_count, &file_postings_size, NULL);
             if (rc == EZDB_OK) file_index_ms = ezdb_now_ms() - stage_start_ms;
             if (file_builder_ready) {
-                posting_builder_free(&file_builder);
+                ezdb_postings_builder_free(&file_builder);
                 file_builder_ready = 0;
             }
             if (rc == EZDB_OK) {
                 stage_start_ms = ezdb_now_ms();
-                rc = posting_builder_init(&dir_builder, 131072u);
+                rc = ezdb_postings_builder_init(&dir_builder, 131072u);
                 if (rc == EZDB_OK) dir_builder_ready = 1;
             }
             if (rc == EZDB_OK) {
                 for (uint32_t i = 1; i < dir_count; ++i) {
-                    rc = count_text_grams(&dir_builder, string_pool + dirs[i].name_offset, i);
+                    rc = ezdb_postings_count_text_grams(&dir_builder, string_pool + dirs[i].name_offset, i);
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = posting_builder_prepare_fill(&dir_builder);
+            if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&dir_builder);
             if (rc == EZDB_OK) {
                 for (uint32_t i = 1; i < dir_count; ++i) {
-                    rc = fill_text_grams(&dir_builder, string_pool + dirs[i].name_offset, i);
+                    rc = ezdb_postings_fill_text_grams(&dir_builder, string_pool + dirs[i].name_offset, i);
                     if (rc != EZDB_OK) break;
                 }
             }
-            if (rc == EZDB_OK) rc = write_postings(out, &dir_builder, dir_count, &dir_index, &dir_index_count, &dir_postings_size, NULL);
+            if (rc == EZDB_OK) rc = ezdb_postings_write(out, &dir_builder, dir_count, &dir_index, &dir_index_count, &dir_postings_size, NULL);
             if (rc == EZDB_OK) dir_index_ms = ezdb_now_ms() - stage_start_ms;
             if (dir_builder_ready) {
-                posting_builder_free(&dir_builder);
+                ezdb_postings_builder_free(&dir_builder);
                 dir_builder_ready = 0;
             }
             header.postings_size = file_postings_size + dir_postings_size;
+
+            if (rc == EZDB_OK) {
+                if (entry_source) {
+                    rc = ezdb_write_entries_from_source(out, &header, entry_source, entry_count, archive_count, original_to_final, options);
+                } else {
+                    rc = ezdb_write_entries(out, &header, entries, entry_count, archive_count, original_to_final, options);
+                }
+            }
 
             header.file_index_offset = (uint64_t)ftell(out);
             header.file_index_count = file_index_count;
@@ -3637,14 +2906,7 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
             header.dir_index_count = dir_index_count;
             if (rc == EZDB_OK && dir_index_count && fwrite(dir_index, sizeof(EzdbDiskIndex), dir_index_count, out) != dir_index_count) rc = EZDB_ERR_IO;
 
-            if (rc == EZDB_OK) {
-                if (entry_source) {
-                    rc = ezdb_write_entries_from_source(out, &header, entry_source, entry_count, archive_count, original_to_final, options);
-                } else {
-                    rc = ezdb_write_entries(out, &header, entries, entry_count, archive_count, original_to_final, options);
-                }
-            }
-            if (rc == EZDB_OK && (fseek(out, 0, SEEK_SET) != 0 || fwrite(&header, sizeof(header), 1, out) != 1)) rc = EZDB_ERR_IO;
+            if (rc == EZDB_OK) rc = ezdb_write_v13_header_and_section_table(out, &header);
             free(file_index);
             free(dir_index);
             fclose(out);
@@ -3660,8 +2922,8 @@ static int ezdb_write_archive_base(const EzdbArchiveRecord* archives,
     free(string_pool);
     free(string_entries);
     free(string_buckets);
-    if (file_builder_ready) posting_builder_free(&file_builder);
-    if (dir_builder_ready) posting_builder_free(&dir_builder);
+    if (file_builder_ready) ezdb_postings_builder_free(&file_builder);
+    if (dir_builder_ready) ezdb_postings_builder_free(&dir_builder);
     if (rc == EZDB_OK) {
         double total_ms = ezdb_now_ms() - total_start_ms;
         printf("build_build_tree_seconds: %.3f\n", build_tree_ms / 1000.0);
@@ -3689,7 +2951,7 @@ static int mark_entry_literal_candidates(Ezdb* db, const char* literal, size_t l
         if (!keyword) return EZDB_ERR_MEMORY;
         uint32_t* keys = NULL;
         uint32_t key_count = 0;
-        rc = query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
+        rc = ezdb_query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
         if (rc != EZDB_OK) {
             free(keyword);
             return rc;
@@ -3697,7 +2959,7 @@ static int mark_entry_literal_candidates(Ezdb* db, const char* literal, size_t l
         if (key_count) {
             uint32_t* entry_ids = NULL;
             uint32_t entry_count = 0;
-            rc = load_intersected_postings(db, db->entry_index, db->header.entry_index_count, keys, key_count, &entry_ids, &entry_count);
+            rc = ezdb_postings_load_intersected(db->fp, db->header.postings_offset, db->entry_index, db->header.entry_index_count, keys, key_count, &entry_ids, &entry_count);
             if (rc != EZDB_OK) {
                 free(entry_ids);
                 free(keys);
@@ -3721,7 +2983,7 @@ static int mark_entry_literal_candidates(Ezdb* db, const char* literal, size_t l
         if (!keyword) return EZDB_ERR_MEMORY;
         uint32_t* keys = NULL;
         uint32_t key_count = 0;
-        rc = query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
+        rc = ezdb_query_build_candidate_keys(keyword, literal_len, &keys, &key_count);
         if (rc != EZDB_OK) {
             free(keyword);
             return rc;
@@ -3729,7 +2991,7 @@ static int mark_entry_literal_candidates(Ezdb* db, const char* literal, size_t l
         if (key_count) {
             uint32_t* entry_ids = NULL;
             uint32_t entry_count = 0;
-            rc = load_intersected_memory_postings(&db->delta_entry_index, keys, key_count, &entry_ids, &entry_count);
+            rc = ezdb_postings_load_intersected_memory(&db->delta_entry_index, keys, key_count, &entry_ids, &entry_count);
             if (rc != EZDB_OK) {
                 free(entry_ids);
                 free(keys);
@@ -3872,13 +3134,44 @@ int ezdb_open(const char* path, Ezdb** out_db)
     db->fp = fp;
     db->read_only = read_only;
     db->path = ezdb_strdup_range(path, strlen(path));
-    if (fread(&db->header, sizeof(db->header), 1, fp) != 1 ||
-        !ezdb_format_header_is_current(&db->header)) {
+    char magic[8];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic)) {
         ezdb_close(db);
         return EZDB_ERR_FORMAT;
     }
+    if (memcmp(magic, EZDB_V13_MAGIC, sizeof(magic)) != 0) {
+        ezdb_close(db);
+        return EZDB_ERR_FORMAT;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        ezdb_close(db);
+        return EZDB_ERR_IO;
+    }
+    EzdbV13Header disk_header;
+    if (fread(&disk_header, sizeof(disk_header), 1, fp) != 1 ||
+        !ezdb_format_v13_header_is_current(&disk_header)) {
+        ezdb_close(db);
+        return EZDB_ERR_FORMAT;
+    }
+    uint64_t file_size = 0;
+    int rc = ezdb_get_file_size(fp, &file_size);
+    if (rc != EZDB_OK) {
+        ezdb_close(db);
+        return rc;
+    }
+    EzdbSectionDesc* sections = NULL;
+    rc = ezdb_format_read_section_table(fp, &disk_header, file_size, &sections);
+    if (rc == EZDB_OK) rc = ezdb_apply_v13_header(&db->header, &disk_header, sections, disk_header.section_count, file_size);
+    free(sections);
+    if (rc != EZDB_OK) {
+        ezdb_close(db);
+        return rc;
+    }
+    db->format_v13 = 1;
+    db->v13_section_table_offset = disk_header.section_table_offset;
+    db->v13_section_table_size = sizeof(EzdbSectionDesc) * (uint64_t)disk_header.section_count;
     if (!db->header.base_file_count) db->header.base_file_count = db->header.file_count;
-    if (!db->header.delta_offset) db->header.delta_offset = db->header.reserved_offset;
+    if (!db->format_v13 && !db->header.delta_offset) db->header.delta_offset = db->header.reserved_offset;
     if (db->header.file_count > UINT32_MAX || db->header.base_file_count > UINT32_MAX ||
         db->header.dir_count > UINT32_MAX ||
         db->header.entry_count > UINT32_MAX || db->header.base_entry_count > UINT32_MAX ||
@@ -3893,7 +3186,7 @@ int ezdb_open(const char* path, Ezdb** out_db)
         ezdb_close(db);
         return EZDB_ERR_FORMAT;
     }
-    if ((db->header.entry_count && db->header.entry_page_size != EZDB_ENTRY_PAGE_SIZE) ||
+    if ((db->header.base_entry_count && db->header.entry_page_size != EZDB_ENTRY_PAGE_SIZE) ||
         (db->header.raw_blob_raw_size && db->header.raw_blob_page_size != EZDB_RAW_BLOB_PAGE_SIZE)) {
         ezdb_close(db);
         return EZDB_ERR_FORMAT;
@@ -3958,12 +3251,12 @@ int ezdb_open(const char* path, Ezdb** out_db)
         ezdb_close(db);
         return EZDB_ERR_MEMORY;
     }
-    int rc = read_file_records_compact_stream(fp,
-                                              db->header.file_records_offset,
-                                              db->header.file_records_size,
-                                              db->header.file_records_flags,
-                                              db,
-                                              (uint32_t)db->header.base_file_count);
+    rc = read_file_records_compact_stream(fp,
+                                          db->header.file_records_offset,
+                                          db->header.file_records_size,
+                                          db->header.file_records_flags,
+                                          db,
+                                          (uint32_t)db->header.base_file_count);
     if (rc == EZDB_OK) {
         rc = read_section_into(fp, db->header.dir_records_offset, db->header.dir_records_size, db->header.dir_records_raw_size, db->header.dir_records_flags, (unsigned char*)db->dirs);
     }
@@ -4010,6 +3303,14 @@ int ezdb_open(const char* path, Ezdb** out_db)
             fread(db->entry_index, sizeof(EzdbDiskIndex), (size_t)db->header.entry_index_count, fp) != (size_t)db->header.entry_index_count) {
             ezdb_close(db);
             return EZDB_ERR_IO;
+        }
+        uint64_t max_entry_posting_end = 0;
+        for (uint64_t i = 0; i < db->header.entry_index_count; ++i) {
+            uint64_t end = db->entry_index[i].offset + db->entry_index[i].encoded_size;
+            if (end > max_entry_posting_end) max_entry_posting_end = end;
+        }
+        if (max_entry_posting_end > db->header.postings_size) {
+            db->header.entry_postings_size = max_entry_posting_end - db->header.postings_size;
         }
     }
     db->strings[db->header.strings_raw_size] = '\0';
@@ -4067,7 +3368,7 @@ static void ezdb_release_members(Ezdb* db, int free_path)
     free(db->file_index);
     free(db->dir_index);
     free(db->entry_index);
-    posting_builder_free(&db->delta_entry_index);
+    ezdb_postings_builder_free(&db->delta_entry_index);
     free(db->active_bits);
     free(db->covered_base_bits);
     free(db->txn_start_active_bits);
@@ -4229,7 +3530,7 @@ static int query_build_entry_candidate_bitset(Ezdb* db, EzdbQueryNode* node, con
         if (node->type == EZDB_QUERY_TERM) {
             literal = node->text;
             literal_len = node->text_len;
-        } else if (!query_longest_literal_from_wildcard(node->text, node->text_len, &literal, &literal_len)) {
+        } else if (!ezdb_query_longest_literal_from_wildcard(node->text, node->text_len, &literal, &literal_len)) {
             return EZDB_OK;
         }
         unsigned char* bits = (unsigned char*)calloc(bit_bytes ? bit_bytes : 1u, 1);
@@ -4367,15 +3668,15 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, Ezdb
     if (!key_len) return EZDB_OK;
     uint32_t* keys = NULL;
     uint32_t key_count = 0;
-    int rc = build_query_keys(keyword, &keys, &key_count);
+    int rc = ezdb_postings_build_query_keys(keyword, &keys, &key_count);
     if (rc != EZDB_OK) return rc;
 
     uint32_t* file_ids = NULL;
     uint32_t file_count = 0;
     uint32_t* dir_ids = NULL;
     uint32_t dir_count = 0;
-    rc = load_intersected_postings(db, db->file_index, db->header.file_index_count, keys, key_count, &file_ids, &file_count);
-    if (rc == EZDB_OK) rc = load_intersected_postings(db, db->dir_index, db->header.dir_index_count, keys, key_count, &dir_ids, &dir_count);
+    rc = ezdb_postings_load_intersected(db->fp, db->header.postings_offset, db->file_index, db->header.file_index_count, keys, key_count, &file_ids, &file_count);
+    if (rc == EZDB_OK) rc = ezdb_postings_load_intersected(db->fp, db->header.postings_offset, db->dir_index, db->header.dir_index_count, keys, key_count, &dir_ids, &dir_count);
     free(keys);
     if (rc != EZDB_OK) {
         free(file_ids);
@@ -4413,7 +3714,7 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, Ezdb
         EzdbDeltaRecord* delta = &db->deltas[i];
         if (find_delta_record(db, delta->id) != delta) continue;
         if (delta->type == EZDB_DELTA_DELETE || !bitset_get(db->active_bits, delta->id)) continue;
-        if (contains_ascii_casefold_bytes(delta->path, delta->path_len, keyword, key_len)) {
+        if (ezdb_query_contains_ascii_casefold(delta->path, delta->path_len, keyword, key_len)) {
             seen[delta->id >> 3u] |= (unsigned char)(1u << (delta->id & 7u));
         }
     }
@@ -4443,24 +3744,24 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, Ezdb
 int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCallback callback, void* user_data)
 {
     if (!db || !keyword || !callback) return EZDB_ERR_ARG;
-    while (query_is_space((unsigned char)*keyword)) ++keyword;
+    while (ezdb_query_is_space((unsigned char)*keyword)) ++keyword;
     if (!*keyword) return EZDB_OK;
 
-    EzdbQueryNode* root = query_parse(keyword);
+    EzdbQueryNode* root = ezdb_query_parse(keyword);
     if (!root) return ezdb_search_plain(db, keyword, limit, callback, user_data);
 
     unsigned char* seen = NULL;
     int has_positive_candidates = 0;
     int rc = query_build_candidate_bitset(db, root, &seen, &has_positive_candidates);
     if (rc != EZDB_OK) {
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return rc;
     }
     size_t seen_size = ((size_t)db->header.file_count + 7u) / 8u;
     int full_scan = !has_positive_candidates;
     if (!full_scan && !bitset_any(seen, seen_size)) {
         free(seen);
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return EZDB_OK;
     }
 
@@ -4479,7 +3780,7 @@ int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCa
             continue;
         }
         if (rc != EZDB_OK) break;
-        if (query_match_path(root, result.path, strlen(result.path))) {
+        if (ezdb_query_match_path(root, result.path, strlen(result.path))) {
             callback(&result, user_data);
             ++emitted;
         }
@@ -4487,7 +3788,7 @@ int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCa
     }
 
     free(seen);
-    query_node_free(root);
+    ezdb_query_node_free(root);
     return rc;
 }
 
@@ -4586,16 +3887,10 @@ static int ezdb_emit_entry_result_with_path(Ezdb* db, uint32_t id, char* entry_p
     return EZDB_OK;
 }
 
-static int ezdb_query_matches_text(EzdbQueryNode* root, const char* keyword, const char* text, size_t text_len)
-{
-    if (root) return query_match_path(root, text, text_len);
-    return contains_ascii_casefold_bytes(text, text_len, keyword, strlen(keyword));
-}
-
 int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, EzdbSearchV2Callback callback, void* user_data)
 {
     if (!db || !keyword || !callback) return EZDB_ERR_ARG;
-    while (query_is_space((unsigned char)*keyword)) ++keyword;
+    while (ezdb_query_is_space((unsigned char)*keyword)) ++keyword;
     if (!*keyword) return EZDB_OK;
     if (!scope) scope = EZDB_SEARCH_ARCHIVE_PATH;
 
@@ -4617,19 +3912,19 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
 
     if (!(scope & (EZDB_SEARCH_ENTRY_PATH | EZDB_SEARCH_COMBINED_PATH))) return EZDB_OK;
 
-    EzdbQueryNode* root = query_parse(keyword);
+    EzdbQueryNode* root = ezdb_query_parse(keyword);
     unsigned char* entry_seen = NULL;
     int has_entry_candidates = 0;
     rc = query_build_entry_candidate_bitset(db, root, keyword, scope, &entry_seen, &has_entry_candidates);
     if (rc != EZDB_OK) {
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return rc;
     }
     size_t entry_seen_size = ((size_t)db->header.entry_count + 7u) / 8u;
     int full_entry_scan = !has_entry_candidates;
     if (!full_entry_scan && !bitset_any(entry_seen, entry_seen_size)) {
         free(entry_seen);
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return EZDB_OK;
     }
     for (uint32_t id = 0; rc == EZDB_OK && id < db->header.entry_count; ++id) {
@@ -4687,7 +3982,7 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
         free(entry_path);
     }
     free(entry_seen);
-    query_node_free(root);
+    ezdb_query_node_free(root);
     return rc;
 }
 
@@ -4773,21 +4068,21 @@ static int ezdb_collect_matching_entry_ids(Ezdb* db, const char* keyword, uint32
 {
     if (!(scope & (EZDB_SEARCH_ARCHIVE_PATH | EZDB_SEARCH_ENTRY_PATH | EZDB_SEARCH_COMBINED_PATH))) return EZDB_OK;
 
-    EzdbQueryNode* root = query_parse(keyword);
+    EzdbQueryNode* root = ezdb_query_parse(keyword);
     unsigned char* entry_seen = NULL;
     int has_entry_candidates = 0;
     uint32_t candidate_scope = scope;
     if (scope & EZDB_SEARCH_ARCHIVE_PATH) candidate_scope |= EZDB_SEARCH_COMBINED_PATH;
     int rc = query_build_entry_candidate_bitset(db, root, keyword, candidate_scope, &entry_seen, &has_entry_candidates);
     if (rc != EZDB_OK) {
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return rc;
     }
     size_t entry_seen_size = ((size_t)db->header.entry_count + 7u) / 8u;
     int full_entry_scan = !has_entry_candidates;
     if (!full_entry_scan && !bitset_any(entry_seen, entry_seen_size)) {
         free(entry_seen);
-        query_node_free(root);
+        ezdb_query_node_free(root);
         return EZDB_OK;
     }
 
@@ -4814,7 +4109,7 @@ static int ezdb_collect_matching_entry_ids(Ezdb* db, const char* keyword, uint32
         if (rc == EZDB_OK && matched) rc = ezdb_id_vec_push(vec, id);
     }
     free(entry_seen);
-    query_node_free(root);
+    ezdb_query_node_free(root);
     return rc;
 }
 
@@ -4909,7 +4204,7 @@ int ezdb_query_entries(Ezdb* db, const EzdbEntryQuery* query, EzdbEntryQueryPage
     EzdbIdVec vec;
     memset(&vec, 0, sizeof(vec));
     const char* keyword = query->keyword ? query->keyword : "";
-    while (query_is_space((unsigned char)*keyword)) ++keyword;
+    while (ezdb_query_is_space((unsigned char)*keyword)) ++keyword;
 
     int rc = EZDB_OK;
     if (!*keyword) {
@@ -5070,6 +4365,10 @@ int ezdb_rollback_write(Ezdb* db)
     db->txn_start_entry_count = 0;
     db->txn_start_active_entry_count = 0;
     if (db->fp) {
+        if (db->format_v13) {
+            int wrc = write_header(db);
+            if (wrc != EZDB_OK && rc == EZDB_OK) rc = wrc;
+        }
         if (fseek(db->fp, (long)db->header.reserved_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     }
     return rc;
@@ -5337,7 +4636,7 @@ int ezdb_append_archive_entries(Ezdb* db, uint32_t archive_id, const EzdbEntryRe
     db->header.entry_count = new_entry_count;
     db->header.active_entry_count += entry_count;
 
-    uint64_t append_base = db->header.delta_offset ? db->header.delta_offset + db->header.delta_size : db->header.reserved_offset;
+    uint64_t append_base = ezdb_delta_append_offset(db);
     for (uint32_t i = 0; i < entry_count; ++i) {
         uint32_t id = (uint32_t)(old_entry_count + i);
         size_t path_len_sz = entries[i].entry_path ? strlen(entries[i].entry_path) : 0;

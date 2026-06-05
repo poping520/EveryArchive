@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define EZDB_GRAM1 1u
 #define EZDB_GRAM2 2u
@@ -64,22 +65,35 @@ int ezdb_postings_utf8_token_len(const unsigned char* s, size_t remain);
 uint32_t ezdb_postings_make_gram_key_from_span(const char* text, uint32_t offset, uint32_t len, uint32_t token_count);
 int ezdb_postings_enumerate_text_gram_keys(const char* text, const GramKeyCallback* callback);
 int ezdb_postings_build_query_keys(const char* keyword, uint32_t** out_keys, uint32_t* out_count);
-int posting_builder_init(PostingBuilder* builder, uint32_t bucket_count);
-void posting_builder_free(PostingBuilder* builder);
-int posting_builder_add(PostingBuilder* builder, uint32_t key, uint32_t id);
-PostingBuildEntry* posting_builder_find(PostingBuilder* builder, uint32_t key);
-int posting_builder_prepare_fill(PostingBuilder* builder);
-int posting_builder_prepare_fill_adaptive(PostingBuilder* builder, uint32_t universe_count);
-int posting_builder_remove_id(PostingBuilder* builder, uint32_t key, uint32_t id);
-int add_text_grams_to_builder(PostingBuilder* builder, const char* text, uint32_t id, int mode);
-int count_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
-int fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
-uint32_t estimate_array_size(const uint32_t* ids, uint32_t count);
-uint32_t count_ranges(const uint32_t* ids, uint32_t count);
-uint32_t estimate_range_size(const uint32_t* ids, uint32_t count);
-int encode_posting_container(const uint32_t* ids, uint32_t count, uint32_t universe_count, uint32_t type, unsigned char** out_data, uint32_t* out_size);
-
-#define utf8_token_len ezdb_postings_utf8_token_len
-#define make_gram_key_from_span ezdb_postings_make_gram_key_from_span
-#define enumerate_text_gram_keys ezdb_postings_enumerate_text_gram_keys
-#define build_query_keys ezdb_postings_build_query_keys
+int ezdb_postings_builder_init(PostingBuilder* builder, uint32_t bucket_count);
+void ezdb_postings_builder_free(PostingBuilder* builder);
+int ezdb_postings_builder_add(PostingBuilder* builder, uint32_t key, uint32_t id);
+PostingBuildEntry* ezdb_postings_builder_find(PostingBuilder* builder, uint32_t key);
+int ezdb_postings_builder_prepare_fill(PostingBuilder* builder);
+int ezdb_postings_builder_prepare_fill_adaptive(PostingBuilder* builder, uint32_t universe_count);
+int ezdb_postings_builder_remove_id(PostingBuilder* builder, uint32_t key, uint32_t id);
+int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint32_t id, int mode);
+int ezdb_postings_count_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
+int ezdb_postings_fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
+EzdbDiskIndex* ezdb_postings_find_index(EzdbDiskIndex* index, uint64_t count, uint32_t key);
+int ezdb_postings_load(FILE* fp, uint64_t postings_offset, const EzdbDiskIndex* idx, uint32_t** out_ids);
+int ezdb_postings_load_intersected(FILE* fp,
+                                   uint64_t postings_offset,
+                                   EzdbDiskIndex* index,
+                                   uint64_t index_count,
+                                   const uint32_t* keys,
+                                   uint32_t key_count,
+                                   uint32_t** out_ids,
+                                   uint32_t* out_count);
+int ezdb_postings_load_intersected_memory(PostingBuilder* builder,
+                                          const uint32_t* keys,
+                                          uint32_t key_count,
+                                          uint32_t** out_ids,
+                                          uint32_t* out_count);
+int ezdb_postings_write(FILE* out,
+                   PostingBuilder* builder,
+                   uint32_t universe_count,
+                   EzdbDiskIndex** out_index,
+                   uint32_t* out_index_count,
+                   uint64_t* out_written,
+                   PostingWriteStats* stats);
