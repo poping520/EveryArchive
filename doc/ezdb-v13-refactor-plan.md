@@ -541,10 +541,10 @@ v13 调整：
 - [ ] 非 UTF-8 entry name。
 - [x] 目录 entry skip。
 - [x] search-v2 archive/entry。
-- [ ] query_entries。
-- [ ] wildcard。
-- [ ] insert/update/delete。
-- [ ] compact。
+- [x] query_entries。
+- [x] wildcard。
+- [x] insert/update/delete。
+- [x] compact。
 - [ ] 连续运行确定性测试。
 - [ ] temp dir 清理和失败路径测试。
 
@@ -561,6 +561,7 @@ v13 调整：
 - 阶段 D 已完成独立 archive range reader 准备：核心 stream API 透传 `open_range/close_range`，zip spool stream 可创建 per-range reader。
 - 阶段 D 已完成 pass 1 parallel count、reduce、slice offset prepare 和 pass 2 parallel fill；当前剩余优化点转向 ZIP fixture/测试体系、模块拆分和后续大样本复测。
 - 阶段 E 已新增 `EzdbZipFixtureTests`，运行时生成小 ZIP、空 ZIP、带 central directory comment 的 ZIP、含目录 entry 的 ZIP，并验证 `build-zip-entries`、`info`、`search-v2 archive/entry` 回归。
+- `EzdbBench` 已新增 `query-entries` 命令，`EzdbZipFixtureTests` 已覆盖 `query_entries`、wildcard、archive insert/update/delete 和 compact 后 entry 查询回归。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -569,8 +570,8 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 E 测试体系，补 ZIP64、非 UTF-8 entry name、`query_entries`、wildcard、增量和 compact 回归。
-- 可优先把 `EzdbZipFixtureTests` 扩展到 query/CRUD，再补边界 ZIP fixture。
+- 下一步继续阶段 E 测试体系，补 ZIP64、非 UTF-8 entry name、连续运行确定性测试、temp dir 清理和失败路径测试。
+- 可优先把 `EzdbZipFixtureTests` 扩展为连续两次构建同一 fixture 并比对关键查询结果，再补边界 ZIP fixture。
 
 ## 风险与注意事项
 

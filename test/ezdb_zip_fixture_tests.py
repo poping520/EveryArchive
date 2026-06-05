@@ -34,6 +34,13 @@ def require_contains(output, text):
         raise AssertionError("expected output to contain {!r}\n{}".format(text, output))
 
 
+def extract_int_field(output, name):
+    match = re.search(r"^{}:\s+([0-9]+)$".format(re.escape(name)), output, re.MULTILINE)
+    if not match:
+        raise AssertionError("missing integer field '{}'\n{}".format(name, output))
+    return int(match.group(1))
+
+
 def create_fixtures(zip_dir):
     zip_dir.mkdir(parents=True, exist_ok=True)
 
@@ -113,6 +120,53 @@ def main():
     archive_output = run_command([str(bench), "search-v2", str(db_path), "archive", "small_fixture", "10"])
     require_field(archive_output, "returned", 1)
     require_contains(archive_output, "small_fixture.zip")
+
+    get_entry_output = run_command([str(bench), "get-entry", str(db_path), "1"])
+    require_contains(get_entry_output, "config/index_9146.js")
+
+    query_entries_output = run_command([str(bench), "query-entries", str(db_path), "entry", "index_9146", "0", "10"])
+    require_field(query_entries_output, "total", 1)
+    require_field(query_entries_output, "returned", 1)
+    require_contains(query_entries_output, "config/index_9146.js")
+
+    wildcard_output = run_command([str(bench), "search-v2", str(db_path), "entry", "*_9146.js", "10"])
+    require_field(wildcard_output, "returned", 1)
+    require_contains(wildcard_output, "config/index_9146.js")
+
+    insert_output = run_command(
+        [str(bench), "insert", str(db_path), "T:\\stage_e_insert_target.zip", "1234", "132537600000000001"]
+    )
+    inserted_id = extract_int_field(insert_output, "insert_id")
+    inserted_search = run_command([str(bench), "search-v2", str(db_path), "archive", "stage_e_insert_target", "10"])
+    require_field(inserted_search, "returned", 1)
+    require_contains(inserted_search, "stage_e_insert_target.zip")
+
+    run_command(
+        [
+            str(bench),
+            "update",
+            str(db_path),
+            str(inserted_id),
+            "T:\\stage_e_update_target.zip",
+            "5678",
+            "132537600000000002",
+        ]
+    )
+    updated_search = run_command([str(bench), "search-v2", str(db_path), "archive", "stage_e_update_target", "10"])
+    require_field(updated_search, "returned", 1)
+    require_contains(updated_search, "stage_e_update_target.zip")
+    old_search = run_command([str(bench), "search-v2", str(db_path), "archive", "stage_e_insert_target", "10"])
+    require_field(old_search, "returned", 0)
+
+    run_command([str(bench), "delete", str(db_path), str(inserted_id)])
+    deleted_search = run_command([str(bench), "search-v2", str(db_path), "archive", "stage_e_update_target", "10"])
+    require_field(deleted_search, "returned", 0)
+
+    compact_output = run_command([str(bench), "compact", str(db_path)])
+    require_contains(compact_output, "compact_ms:")
+    post_compact_entry = run_command([str(bench), "search-v2", str(db_path), "entry", "index_9146", "10"])
+    require_field(post_compact_entry, "returned", 1)
+    require_contains(post_compact_entry, "config/index_9146.js")
 
 
 if __name__ == "__main__":

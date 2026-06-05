@@ -67,6 +67,7 @@ static void print_usage(void)
     printf("  EzdbBench get-entry <db.ezdb> <id>\n");
     printf("  EzdbBench search <db.ezdb> <keyword> [limit]\n");
     printf("  EzdbBench search-v2 <db.ezdb> <scope> <keyword> [limit]\n");
+    printf("  EzdbBench query-entries <db.ezdb> <scope> <keyword> [offset] [limit]\n");
     printf("  EzdbBench insert <db.ezdb> <path> [size] [mtime]\n");
     printf("  EzdbBench update <db.ezdb> <id> <path> [size] [mtime]\n");
     printf("  EzdbBench delete <db.ezdb> <id>\n");
@@ -1986,6 +1987,69 @@ static int run_main(int argc, char** argv)
             ezdb_close(db);
             return 2;
         }
+        ezdb_close(db);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "query-entries") == 0) {
+        if (argc < 5 || argc > 7) {
+            print_usage();
+            return 1;
+        }
+        Ezdb* db = NULL;
+        double open_start = now_ms();
+        int rc = ezdb_open(argv[2], &db);
+        double open_elapsed = now_ms() - open_start;
+        if (rc != 0) {
+            fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
+            return 2;
+        }
+
+        EzdbEntryQuery query;
+        memset(&query, 0, sizeof(query));
+        query.scope = parse_scope_arg(argv[3]);
+        query.keyword = argv[4];
+        query.sort_column = -1;
+        query.sort_ascending = 1;
+        query.offset = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 10) : 0u;
+        query.limit = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 10) : 100u;
+
+        EzdbEntryQueryPage page;
+        double query_start = now_ms();
+        rc = ezdb_query_entries(db, &query, &page);
+        double query_elapsed = now_ms() - query_start;
+        if (rc != 0) {
+            fprintf(stderr, "query-entries failed: %s (%d)\n", ezdb_error_message(rc), rc);
+            ezdb_close(db);
+            return 2;
+        }
+
+        printf("open_ms: %.2f\n", open_elapsed);
+        printf("query_entries_ms: %.2f\n", query_elapsed);
+        printf("total: %llu\n", (unsigned long long)page.total_count);
+        printf("returned: %u\n", page.returned_count);
+        for (uint32_t i = 0; i < page.returned_count; ++i) {
+            EzdbEntryResult result;
+            rc = ezdb_get_entry(db, page.ids[i], &result);
+            if (rc != 0) {
+                fprintf(stderr, "query-entries get-entry failed: %s (%d)\n", ezdb_error_message(rc), rc);
+                ezdb_free_entry_query_page(&page);
+                ezdb_close(db);
+                return 2;
+            }
+            printf("[%u archive:%u] %s :: %s, %lld, %llu, %llu raw=%u\n",
+                   result.id,
+                   result.archive_id,
+                   result.archive_path,
+                   result.entry_path,
+                   (long long)result.compressed_size,
+                   (unsigned long long)result.original_size,
+                   (unsigned long long)result.modified_time,
+                   result.entry_raw_path_len);
+            ezdb_free_entry_result(&result);
+        }
+        ezdb_free_entry_query_page(&page);
+        print_memory_usage("query_entries");
         ezdb_close(db);
         return 0;
     }
