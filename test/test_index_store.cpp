@@ -105,6 +105,13 @@ static int RunStoreCase(const wchar_t* name, std::unique_ptr<IndexStore> store)
         if (store->GetEntryCount(L"file.txt") != 0) return Fail("entry transaction stale entry still searchable");
     }
 
+    if (std::wstring(name).find(L".ezdb") != std::wstring::npos) {
+        store->Close();
+        if (!store->Open(dbPath, &err)) return Fail("ezdb reopen after entry transaction failed");
+        if (store->GetEntryCount(L"txn_") != 2) return Fail("ezdb reopen entry transaction count mismatch");
+        if (store->GetEntryCount(L"file.txt") != 0) return Fail("ezdb reopen stale entry still searchable");
+    }
+
     if (!store->Compact()) return Fail("compact failed");
 
     store->Close();

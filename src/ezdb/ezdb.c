@@ -1266,9 +1266,11 @@ static char* entry_path_copy_by_id(Ezdb* db, uint32_t id)
     uint32_t len = db->entry_path_lens[id];
     char* out = (char*)malloc((size_t)len + 1u);
     if (!out) return NULL;
+    long saved_pos = db->fp ? ftell(db->fp) : -1L;
     int rc = bitset_get(db->delta_entry_bits, id)
         ? copy_delta_blob_range(db, db->delta_entry_refs[id].path_offset, len, (unsigned char*)out)
         : copy_raw_blob_range(db, db->entry_path_offsets[id], len, (unsigned char*)out);
+    if (saved_pos >= 0 && fseek(db->fp, saved_pos, SEEK_SET) != 0) rc = EZDB_ERR_IO;
     if (rc != EZDB_OK) {
         free(out);
         return NULL;
@@ -2629,9 +2631,8 @@ static int ezdb_apply_v13_header(EzdbHeader* header,
     header->dir_count = disk_header->dir_count;
     header->entry_count = disk_header->entry_count;
     header->active_entry_count = disk_header->active_entry_count;
-    header->base_file_count = disk_header->base_archive_count ? disk_header->base_archive_count : disk_header->archive_count;
+    header->base_file_count = disk_header->base_archive_count;
     header->base_entry_count = disk_header->base_entry_count;
-    if (!header->base_entry_count && header->entry_count) header->base_entry_count = header->entry_count;
     header->reserved_offset = file_size;
     header->reserved_size = 0;
 
