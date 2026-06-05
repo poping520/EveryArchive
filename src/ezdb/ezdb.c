@@ -4218,10 +4218,10 @@ static int ezdb_write_entries_from_source(FILE* out,
     FILE* raw_fp = NULL;
     StreamPagedWriter detail_writer;
     StreamPagedWriter raw_writer;
-    PostingEventSorter event_sorter;
+    PostingBuilder entry_builder;
     int detail_writer_ready = 0;
     int raw_writer_ready = 0;
-    int event_sorter_ready = 0;
+    int entry_builder_ready = 0;
     EzdbDiskIndex* entry_index = NULL;
     uint32_t entry_index_count = 0;
     uint64_t entry_postings_size = 0;
@@ -4230,9 +4230,11 @@ static int ezdb_write_entries_from_source(FILE* out,
     double write_core_ms = 0.0;
     double write_detail_ms = 0.0;
     double write_raw_ms = 0.0;
+    double index_count_ms = 0.0;
+    double index_prepare_ms = 0.0;
+    double index_fill_ms = 0.0;
     double postings_build_ms = 0.0;
     double write_postings_ms = 0.0;
-    double merge_ms = 0.0;
     double write_index_ms = 0.0;
     double finalize_ms = 0.0;
     PostingWriteStats entry_posting_stats;
@@ -4241,7 +4243,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (!options) return EZDB_ERR_ARG;
     memset(&detail_writer, 0, sizeof(detail_writer));
     memset(&raw_writer, 0, sizeof(raw_writer));
-    memset(&event_sorter, 0, sizeof(event_sorter));
+    memset(&entry_builder, 0, sizeof(entry_builder));
     if (snprintf(core_path, sizeof(core_path), "%s\\entry_core.tmp", options->temp_dir) >= (int)sizeof(core_path) ||
         snprintf(detail_path, sizeof(detail_path), "%s\\entry_detail.tmp", options->temp_dir) >= (int)sizeof(detail_path) ||
         snprintf(raw_path, sizeof(raw_path), "%s\\entry_raw.tmp", options->temp_dir) >= (int)sizeof(raw_path)) {
@@ -4263,8 +4265,8 @@ static int ezdb_write_entries_from_source(FILE* out,
         if (rc == EZDB_OK) raw_writer_ready = 1;
     }
     if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
-        rc = posting_event_sorter_init(&event_sorter, options);
-        if (rc == EZDB_OK) event_sorter_ready = 1;
+        rc = posting_builder_init(&entry_builder, 262144u);
+        if (rc == EZDB_OK) entry_builder_ready = 1;
     }
     if (rc == EZDB_OK && source && source->reset) rc = source->reset(source->user_data);
 
@@ -4335,18 +4337,13 @@ static int ezdb_write_entries_from_source(FILE* out,
             break;
         }
 
-        if (event_sorter_ready) {
-            PostingEventEmitContext emit_ctx;
-            GramKeyCallback callback;
-            emit_ctx.sorter = &event_sorter;
-            emit_ctx.entry_id = i;
-            callback.emit = emit_gram_event;
-            callback.user_data = &emit_ctx;
-            rc = enumerate_text_gram_keys(record.entry_path, &callback);
+        if (entry_builder_ready) {
+            rc = count_text_grams(&entry_builder, record.entry_path, i);
             if (rc != EZDB_OK) break;
         }
     }
     stream_total_ms = ezdb_now_ms() - stage_start_ms;
+    index_count_ms = stream_total_ms;
     if (rc == EZDB_OK) {
         if (stream_paged_writer_finish(&detail_writer) != EZDB_OK) rc = EZDB_ERR_IO;
         if (rc == EZDB_OK && stream_paged_writer_finish(&raw_writer) != EZDB_OK) rc = EZDB_ERR_IO;
@@ -4395,12 +4392,37 @@ static int ezdb_write_entries_from_source(FILE* out,
             fwrite(raw_writer.pages, sizeof(EzdbDiskPage), raw_writer.page_count, out) != raw_writer.page_count) rc = EZDB_ERR_IO;
         write_raw_ms = ezdb_now_ms() - stage_start_ms;
     }
-    postings_build_ms = event_sorter_ready ? stream_total_ms : 0.0;
-    if (rc == EZDB_OK && entry_count && event_sorter_ready) {
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+        stage_start_ms = ezdb_now_ms();
+        rc = posting_builder_prepare_fill_adaptive(&entry_builder, entry_count);
+        index_prepare_ms = ezdb_now_ms() - stage_start_ms;
+    }
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
+        if (!source->reset) {
+            rc = EZDB_ERR_ARG;
+        } else {
+            rc = source->reset(source->user_data);
+        }
+        stage_start_ms = ezdb_now_ms();
+        for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
+            EzdbEntryRecord record;
+            memset(&record, 0, sizeof(record));
+            rc = source->next(source->user_data, &record);
+            if (rc != EZDB_OK) break;
+            if (!record.entry_path) {
+                rc = EZDB_ERR_ARG;
+                break;
+            }
+            rc = fill_text_grams(&entry_builder, record.entry_path, i);
+        }
+        index_fill_ms = ezdb_now_ms() - stage_start_ms;
+    }
+    postings_build_ms = index_count_ms + index_prepare_ms + index_fill_ms;
+    if (rc == EZDB_OK && entry_count && entry_builder_ready) {
         stage_start_ms = ezdb_now_ms();
         uint64_t entry_postings_start = (uint64_t)ftell(out);
-        rc = posting_event_sorter_write_postings(&event_sorter, out, entry_count, &entry_index, &entry_index_count,
-                                                 &entry_postings_size, &entry_posting_stats, &merge_ms);
+        rc = write_postings(out, &entry_builder, entry_count, &entry_index, &entry_index_count,
+                            &entry_postings_size, &entry_posting_stats);
         write_postings_ms = ezdb_now_ms() - stage_start_ms;
         if (rc == EZDB_OK) {
             stage_start_ms = ezdb_now_ms();
@@ -4434,13 +4456,13 @@ static int ezdb_write_entries_from_source(FILE* out,
         printf("entry_write_core_seconds: %.3f\n", write_core_ms / 1000.0);
         printf("entry_write_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
         printf("entry_write_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
-        printf("entry_index_count_seconds: %.3f\n", 0.0);
-        printf("entry_index_prepare_seconds: %.3f\n", 0.0);
-        printf("entry_index_fill_seconds: %.3f\n", 0.0);
+        printf("entry_index_count_seconds: %.3f\n", index_count_ms / 1000.0);
+        printf("entry_index_prepare_seconds: %.3f\n", index_prepare_ms / 1000.0);
+        printf("entry_index_fill_seconds: %.3f\n", index_fill_ms / 1000.0);
         printf("entry_write_postings_seconds: %.3f\n", write_postings_ms / 1000.0);
-        printf("spool_event_bytes_mb: %.2f\n", (double)event_sorter.event_bytes / 1024.0 / 1024.0);
-        printf("spool_sort_seconds: %.3f\n", entry_posting_stats.sort_ms / 1000.0);
-        printf("spool_merge_seconds: %.3f\n", merge_ms / 1000.0);
+        printf("spool_event_bytes_mb: %.2f\n", 0.0);
+        printf("spool_sort_seconds: %.3f\n", 0.0);
+        printf("spool_merge_seconds: %.3f\n", 0.0);
         printf("stream_peak_memory_mb: %.2f\n", ezdb_peak_working_set_mb());
         printf("entry_postings_sort_seconds: %.3f\n", entry_posting_stats.sort_ms / 1000.0);
         printf("entry_postings_choose_seconds: %.3f\n", entry_posting_stats.choose_ms / 1000.0);
@@ -4467,7 +4489,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (detail_fp) fclose(detail_fp);
     if (raw_fp) fclose(raw_fp);
     free(entry_index);
-    if (event_sorter_ready) posting_event_sorter_free(&event_sorter);
+    if (entry_builder_ready) posting_builder_free(&entry_builder);
     if (detail_writer_ready) stream_paged_writer_free(&detail_writer);
     if (raw_writer_ready) stream_paged_writer_free(&raw_writer);
     remove(core_path);
