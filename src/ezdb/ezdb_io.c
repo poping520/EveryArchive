@@ -189,3 +189,107 @@ int ezdb_io_write_paged_section(FILE* out,
     *out_written = written;
     return EZDB_OK;
 }
+
+void ezdb_io_section_var_reader_close(EzdbSectionVarReader* reader)
+{
+    if (!reader) return;
+    if (reader->z_ready) inflateEnd(&reader->z);
+    reader->z_ready = 0;
+}
+
+int ezdb_io_section_var_reader_init(EzdbSectionVarReader* reader, FILE* fp, uint64_t offset, uint64_t encoded_size, uint32_t flags)
+{
+    if (!reader || !fp) return EZDB_ERR_ARG;
+    memset(reader, 0, sizeof(*reader));
+    if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+    reader->fp = fp;
+    reader->remaining = encoded_size;
+    reader->compressed = (flags & EZDB_SECTION_COMPRESSED) != 0;
+    if (reader->compressed) {
+        int zrc = inflateInit(&reader->z);
+        if (zrc != Z_OK) return EZDB_ERR_FORMAT;
+        reader->z_ready = 1;
+    }
+    return EZDB_OK;
+}
+
+static int ezdb_io_section_var_reader_fill(EzdbSectionVarReader* reader)
+{
+    reader->pos = 0;
+    reader->end = 0;
+    if (!reader->compressed) {
+        if (!reader->remaining) return EZDB_ERR_IO;
+        uint32_t want = reader->remaining > sizeof(reader->out) ? (uint32_t)sizeof(reader->out) : (uint32_t)reader->remaining;
+        if (fread(reader->out, 1, want, reader->fp) != want) return EZDB_ERR_IO;
+        reader->remaining -= want;
+        reader->end = want;
+        return EZDB_OK;
+    }
+
+    while (reader->end == 0) {
+        if (reader->z.avail_in == 0 && reader->remaining) {
+            uint32_t want = reader->remaining > sizeof(reader->in) ? (uint32_t)sizeof(reader->in) : (uint32_t)reader->remaining;
+            if (fread(reader->in, 1, want, reader->fp) != want) return EZDB_ERR_IO;
+            reader->remaining -= want;
+            reader->z.next_in = reader->in;
+            reader->z.avail_in = want;
+        }
+        reader->z.next_out = reader->out;
+        reader->z.avail_out = (uInt)sizeof(reader->out);
+        int zrc = inflate(&reader->z, reader->remaining || reader->z.avail_in ? Z_NO_FLUSH : Z_FINISH);
+        reader->end = (uint32_t)(sizeof(reader->out) - reader->z.avail_out);
+        if (reader->end) return EZDB_OK;
+        if (zrc == Z_STREAM_END) return EZDB_ERR_IO;
+        if (zrc != Z_OK && zrc != Z_BUF_ERROR) return EZDB_ERR_FORMAT;
+        if (!reader->remaining && reader->z.avail_in == 0 && zrc == Z_BUF_ERROR) return EZDB_ERR_IO;
+    }
+    return EZDB_OK;
+}
+
+static int ezdb_io_section_var_reader_byte(EzdbSectionVarReader* reader, unsigned char* out)
+{
+    if (reader->pos >= reader->end) {
+        int rc = ezdb_io_section_var_reader_fill(reader);
+        if (rc != EZDB_OK) return rc;
+    }
+    *out = reader->out[reader->pos++];
+    return EZDB_OK;
+}
+
+int ezdb_io_section_var_reader_varuint(EzdbSectionVarReader* reader, uint32_t* out)
+{
+    if (!reader || !out) return EZDB_ERR_ARG;
+    uint32_t value = 0;
+    int shift = 0;
+    for (int i = 0; i < 5; ++i) {
+        unsigned char ch = 0;
+        int rc = ezdb_io_section_var_reader_byte(reader, &ch);
+        if (rc != EZDB_OK) return rc;
+        value |= (uint32_t)(ch & 0x7fu) << shift;
+        if (!(ch & 0x80u)) {
+            *out = value;
+            return EZDB_OK;
+        }
+        shift += 7;
+    }
+    return EZDB_ERR_FORMAT;
+}
+
+int ezdb_io_section_var_reader_varuint64(EzdbSectionVarReader* reader, uint64_t* out)
+{
+    if (!reader || !out) return EZDB_ERR_ARG;
+    uint64_t value = 0;
+    int shift = 0;
+    for (int i = 0; i < 10; ++i) {
+        unsigned char ch = 0;
+        int rc = ezdb_io_section_var_reader_byte(reader, &ch);
+        if (rc != EZDB_OK) return rc;
+        value |= (uint64_t)(ch & 0x7fu) << shift;
+        if (!(ch & 0x80u)) {
+            *out = value;
+            return EZDB_OK;
+        }
+        shift += 7;
+    }
+    return EZDB_ERR_FORMAT;
+}

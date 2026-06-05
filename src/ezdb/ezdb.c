@@ -34,16 +34,6 @@
 #include <windows.h>
 #include <psapi.h>
 
-#define EZDB_MAGIC "EZDB0012"
-#define EZDB_VERSION 12u
-#define EZDB_DELTA_MAGIC 0x31445a45u
-#define EZDB_DELTA_INSERT 1u
-#define EZDB_DELTA_UPDATE 2u
-#define EZDB_DELTA_DELETE 3u
-#define EZDB_DELTA_BATCH_BEGIN 4u
-#define EZDB_DELTA_BATCH_COMMIT 5u
-#define EZDB_DELTA_ENTRY_DELETE_ARCHIVE 6u
-#define EZDB_DELTA_ENTRY_APPEND 7u
 #define EZDB_WRITE_TXN_ACTIVE 1u
 #define EZDB_GRAM1 1u
 #define EZDB_GRAM2 2u
@@ -65,68 +55,6 @@
 #define EZDB_ENTRY_DETAIL_CACHE_PAGES 8u
 #define EZDB_RAW_BLOB_CACHE_PAGES 64u
 #define EZDB_ENTRY_CORE_RECORD_SIZE 12u
-
-typedef struct EzdbHeader {
-    char magic[8];
-    uint32_t version;
-    uint32_t header_size;
-    uint64_t file_count;
-    uint64_t active_count;
-    uint64_t dir_count;
-    uint64_t file_records_offset;
-    uint64_t file_records_size;
-    uint64_t dir_records_offset;
-    uint64_t dir_records_size;
-    uint64_t strings_offset;
-    uint64_t strings_size;
-    uint64_t file_index_offset;
-    uint64_t file_index_count;
-    uint64_t dir_index_offset;
-    uint64_t dir_index_count;
-    uint64_t postings_offset;
-    uint64_t postings_size;
-    uint64_t reserved_offset;
-    uint64_t reserved_size;
-    uint64_t file_records_raw_size;
-    uint64_t dir_records_raw_size;
-    uint64_t strings_raw_size;
-    uint32_t file_records_flags;
-    uint32_t dir_records_flags;
-    uint32_t strings_flags;
-    uint32_t reserved_flags;
-    uint64_t base_file_count;
-    uint64_t delta_offset;
-    uint64_t delta_size;
-    uint64_t archive_meta_offset;
-    uint64_t archive_meta_size;
-    uint64_t archive_meta_raw_size;
-    uint32_t archive_meta_flags;
-    uint32_t archive_meta_reserved;
-    uint64_t entry_records_offset;
-    uint64_t entry_records_size;
-    uint64_t entry_records_raw_size;
-    uint32_t entry_records_flags;
-    uint32_t entry_records_reserved;
-    uint64_t raw_blob_offset;
-    uint64_t raw_blob_size;
-    uint64_t raw_blob_raw_size;
-    uint32_t raw_blob_flags;
-    uint32_t raw_blob_reserved;
-    uint64_t entry_count;
-    uint64_t active_entry_count;
-    uint64_t entry_index_offset;
-    uint64_t entry_index_count;
-    uint64_t entry_postings_size;
-    uint64_t entry_detail_offset;
-    uint64_t entry_detail_size;
-    uint64_t entry_detail_index_offset;
-    uint64_t entry_detail_page_count;
-    uint64_t raw_blob_index_offset;
-    uint64_t raw_blob_page_count;
-    uint32_t entry_page_size;
-    uint32_t raw_blob_page_size;
-    uint64_t base_entry_count;
-} EzdbHeader;
 
 typedef struct EzdbDeltaRecord {
     uint32_t id;
@@ -1601,118 +1529,6 @@ static int encode_file_records_compact(const BuildFile* files, uint32_t file_cou
     *out_data = data;
     *out_size = size;
     return EZDB_OK;
-}
-
-typedef struct SectionVarReader {
-    FILE* fp;
-    uint64_t remaining;
-    int compressed;
-    z_stream z;
-    int z_ready;
-    unsigned char in[65536];
-    unsigned char out[65536];
-    uint32_t pos;
-    uint32_t end;
-} SectionVarReader;
-
-static void section_var_reader_close(SectionVarReader* reader)
-{
-    if (reader->z_ready) inflateEnd(&reader->z);
-    reader->z_ready = 0;
-}
-
-static int section_var_reader_init(SectionVarReader* reader, FILE* fp, uint64_t offset, uint64_t encoded_size, uint32_t flags)
-{
-    memset(reader, 0, sizeof(*reader));
-    if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
-    reader->fp = fp;
-    reader->remaining = encoded_size;
-    reader->compressed = (flags & EZDB_SECTION_COMPRESSED) != 0;
-    if (reader->compressed) {
-        int zrc = inflateInit(&reader->z);
-        if (zrc != Z_OK) return EZDB_ERR_FORMAT;
-        reader->z_ready = 1;
-    }
-    return EZDB_OK;
-}
-
-static int section_var_reader_fill(SectionVarReader* reader)
-{
-    reader->pos = 0;
-    reader->end = 0;
-    if (!reader->compressed) {
-        if (!reader->remaining) return EZDB_ERR_IO;
-        uint32_t want = reader->remaining > sizeof(reader->out) ? (uint32_t)sizeof(reader->out) : (uint32_t)reader->remaining;
-        if (fread(reader->out, 1, want, reader->fp) != want) return EZDB_ERR_IO;
-        reader->remaining -= want;
-        reader->end = want;
-        return EZDB_OK;
-    }
-
-    while (reader->end == 0) {
-        if (reader->z.avail_in == 0 && reader->remaining) {
-            uint32_t want = reader->remaining > sizeof(reader->in) ? (uint32_t)sizeof(reader->in) : (uint32_t)reader->remaining;
-            if (fread(reader->in, 1, want, reader->fp) != want) return EZDB_ERR_IO;
-            reader->remaining -= want;
-            reader->z.next_in = reader->in;
-            reader->z.avail_in = want;
-        }
-        reader->z.next_out = reader->out;
-        reader->z.avail_out = (uInt)sizeof(reader->out);
-        int zrc = inflate(&reader->z, reader->remaining || reader->z.avail_in ? Z_NO_FLUSH : Z_FINISH);
-        reader->end = (uint32_t)(sizeof(reader->out) - reader->z.avail_out);
-        if (reader->end) return EZDB_OK;
-        if (zrc == Z_STREAM_END) return EZDB_ERR_IO;
-        if (zrc != Z_OK && zrc != Z_BUF_ERROR) return EZDB_ERR_FORMAT;
-        if (!reader->remaining && reader->z.avail_in == 0 && zrc == Z_BUF_ERROR) return EZDB_ERR_IO;
-    }
-    return EZDB_OK;
-}
-
-static int section_var_reader_byte(SectionVarReader* reader, unsigned char* out)
-{
-    if (reader->pos >= reader->end) {
-        int rc = section_var_reader_fill(reader);
-        if (rc != EZDB_OK) return rc;
-    }
-    *out = reader->out[reader->pos++];
-    return EZDB_OK;
-}
-
-static int section_var_reader_varuint(SectionVarReader* reader, uint32_t* out)
-{
-    uint32_t value = 0;
-    int shift = 0;
-    for (int i = 0; i < 5; ++i) {
-        unsigned char ch = 0;
-        int rc = section_var_reader_byte(reader, &ch);
-        if (rc != EZDB_OK) return rc;
-        value |= (uint32_t)(ch & 0x7fu) << shift;
-        if (!(ch & 0x80u)) {
-            *out = value;
-            return EZDB_OK;
-        }
-        shift += 7;
-    }
-    return EZDB_ERR_FORMAT;
-}
-
-static int section_var_reader_varuint64(SectionVarReader* reader, uint64_t* out)
-{
-    uint64_t value = 0;
-    int shift = 0;
-    for (int i = 0; i < 10; ++i) {
-        unsigned char ch = 0;
-        int rc = section_var_reader_byte(reader, &ch);
-        if (rc != EZDB_OK) return rc;
-        value |= (uint64_t)(ch & 0x7fu) << shift;
-        if (!(ch & 0x80u)) {
-            *out = value;
-            return EZDB_OK;
-        }
-        shift += 7;
-    }
-    return EZDB_ERR_FORMAT;
 }
 
 static int store_file_record(Ezdb* db, uint32_t id, uint32_t parent_dir, uint32_t name_offset, uint32_t name_len, uint64_t size, uint64_t modified_time)
@@ -4737,9 +4553,7 @@ int ezdb_open(const char* path, Ezdb** out_db)
     db->read_only = read_only;
     db->path = ezdb_strdup_range(path, strlen(path));
     if (fread(&db->header, sizeof(db->header), 1, fp) != 1 ||
-        memcmp(db->header.magic, EZDB_MAGIC, 8) != 0 ||
-        db->header.version != EZDB_VERSION ||
-        db->header.header_size != sizeof(EzdbHeader)) {
+        !ezdb_format_header_is_current(&db->header)) {
         ezdb_close(db);
         return EZDB_ERR_FORMAT;
     }

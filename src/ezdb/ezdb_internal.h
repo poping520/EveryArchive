@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ezdb_format.h"
+
 #include <stdint.h>
 
 #define EZDB_POSTING_COMPRESS_MIN_SIZE 256u
