@@ -532,13 +532,13 @@ v13 调整：
 
 ### 阶段 E：测试体系
 
-状态：部分完成。
+状态：已完成。
 
 - [x] 小 ZIP fixture。
 - [x] 空 ZIP。
-- [ ] ZIP64。
+- [x] ZIP64。
 - [x] central directory comment。
-- [ ] 非 UTF-8 entry name。
+- [x] 非 UTF-8 entry name。
 - [x] 目录 entry skip。
 - [x] search-v2 archive/entry。
 - [x] query_entries。
@@ -563,6 +563,7 @@ v13 调整：
 - 阶段 E 已新增 `EzdbZipFixtureTests`，运行时生成小 ZIP、空 ZIP、带 central directory comment 的 ZIP、含目录 entry 的 ZIP，并验证 `build-zip-entries`、`info`、`search-v2 archive/entry` 回归。
 - `EzdbBench` 已新增 `query-entries` 命令，`EzdbZipFixtureTests` 已覆盖 `query_entries`、wildcard、archive insert/update/delete 和 compact 后 entry 查询回归。
 - `EzdbZipFixtureTests` 已覆盖连续两次 fresh build 的关键查询确定性、`build-zip-entries` temp dir 成功清理和缺失 ZIP 解析失败路径；同时修复 compact 使用同一 archive id map 导致 entry archive remap 被覆盖的问题。
+- `EzdbZipFixtureTests` 已加入手写最小 ZIP64 central directory fixture 和非 UTF-8 raw entry name fixture，覆盖 ZIP64 extra 解析、ACP raw path 解码和 raw path 保留。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -571,8 +572,7 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 E 测试体系，补 ZIP64 和非 UTF-8 entry name 边界 fixture。
-- 阶段 E 完成后回到阶段 B/C 的 entries/query/v13 header 收敛，继续拆模块。
+- 下一步回到阶段 B/C 的 entries/query/v13 header 收敛，优先处理 `EzdbHeader` 运行期映射依赖或 query 主流程拆分。
 
 ## 风险与注意事项
 

@@ -1,6 +1,8 @@
 import argparse
+import binascii
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import zipfile
@@ -8,8 +10,8 @@ from pathlib import Path
 
 
 def run_command(args):
-    proc = subprocess.run(args, text=True, capture_output=True)
-    output = proc.stdout + proc.stderr
+    proc = subprocess.run(args, text=True, capture_output=True, encoding="utf-8", errors="replace")
+    output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         raise AssertionError(
             "command failed with exit code {}\n{}\n{}".format(
@@ -54,6 +56,96 @@ def require_temp_dir_removed(db_path):
         raise AssertionError("temporary directory was not removed: {}".format(temp_dir))
 
 
+def dos_date_time():
+    return 0x5B21, 0x0000
+
+
+def create_stored_zip(path, raw_name, payload, utf8_flag=False, force_zip64=False):
+    flags = 0x800 if utf8_flag else 0
+    method = 0
+    mod_date, mod_time = dos_date_time()
+    crc = binascii.crc32(payload) & 0xFFFFFFFF
+    comp_size = len(payload)
+    uncomp_size = len(payload)
+
+    local_extra = b""
+    local_comp_size = comp_size
+    local_uncomp_size = uncomp_size
+    cd_extra = b""
+    cd_comp_size = comp_size
+    cd_uncomp_size = uncomp_size
+    if force_zip64:
+        local_extra = struct.pack("<HHQQ", 0x0001, 16, uncomp_size, comp_size)
+        local_comp_size = 0xFFFFFFFF
+        local_uncomp_size = 0xFFFFFFFF
+        cd_extra = local_extra
+        cd_comp_size = 0xFFFFFFFF
+        cd_uncomp_size = 0xFFFFFFFF
+
+    local_header = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50,
+        45 if force_zip64 else 20,
+        flags,
+        method,
+        mod_time,
+        mod_date,
+        crc,
+        local_comp_size,
+        local_uncomp_size,
+        len(raw_name),
+        len(local_extra),
+    )
+    local_offset = 0
+    body = local_header + raw_name + local_extra + payload
+
+    cd_offset = len(body)
+    central_header = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,
+        45 << 8,
+        45 if force_zip64 else 20,
+        flags,
+        method,
+        mod_time,
+        mod_date,
+        crc,
+        cd_comp_size,
+        cd_uncomp_size,
+        len(raw_name),
+        len(cd_extra),
+        0,
+        0,
+        0,
+        0,
+        local_offset,
+    )
+    central_dir = central_header + raw_name + cd_extra
+    cd_size = len(central_dir)
+
+    if force_zip64:
+        zip64_eocd_offset = cd_offset + cd_size
+        zip64_eocd = struct.pack(
+            "<IQHHIIQQQQ",
+            0x06064B50,
+            44,
+            45,
+            45,
+            0,
+            0,
+            1,
+            1,
+            cd_size,
+            cd_offset,
+        )
+        zip64_locator = struct.pack("<IIQI", 0x07064B50, 0, zip64_eocd_offset, 1)
+        eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+        path.write_bytes(body + central_dir + zip64_eocd + zip64_locator + eocd)
+    else:
+        eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, cd_size, cd_offset, 0)
+        path.write_bytes(body + central_dir + eocd)
+
+
 def create_fixtures(zip_dir):
     zip_dir.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +168,13 @@ def create_fixtures(zip_dir):
         zf.writestr("only_dir/", "")
         zf.writestr("only_dir/inside_dir.txt", "directory entry should be skipped")
 
-    return [small_zip, empty_zip, comment_zip, dirs_zip]
+    zip64_zip = zip_dir / "zip64_fixture.zip"
+    create_stored_zip(zip64_zip, b"zip64_payload.txt", b"zip64 fixture", utf8_flag=True, force_zip64=True)
+
+    non_utf8_zip = zip_dir / "non_utf8_fixture.zip"
+    create_stored_zip(non_utf8_zip, "中文_payload.txt".encode("mbcs"), b"non utf8 fixture", utf8_flag=False)
+
+    return [small_zip, empty_zip, comment_zip, dirs_zip, zip64_zip, non_utf8_zip]
 
 
 def write_zip_tsv(paths, tsv_path):
@@ -87,7 +185,7 @@ def write_zip_tsv(paths, tsv_path):
     tsv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_fixture_db(bench, tsv_path, db_path, expected_archives=4, expected_opened=4, expected_failed=0, expected_entries=4):
+def build_fixture_db(bench, tsv_path, db_path, expected_archives=6, expected_opened=6, expected_failed=0, expected_entries=6):
     build_output = run_command([str(bench), "build-zip-entries", str(tsv_path), str(db_path), "2"])
     require_field(build_output, "zip_archives_loaded", expected_archives)
     require_field(build_output, "zip_opened_archives", expected_opened)
@@ -106,6 +204,8 @@ def collect_deterministic_probe(bench, db_path):
     for name, args in {
         "entry_index": ["search-v2", str(db_path), "entry", "index_9146", "10"],
         "entry_comment": ["search-v2", str(db_path), "entry", "comment_payload", "10"],
+        "entry_zip64": ["search-v2", str(db_path), "entry", "zip64_payload", "10"],
+        "entry_non_utf8": ["search-v2", str(db_path), "entry", "中文_payload", "10"],
         "archive_small": ["search-v2", str(db_path), "archive", "small_fixture", "10"],
         "query_entries": ["query-entries", str(db_path), "entry", "index_9146", "0", "10"],
         "wildcard": ["search-v2", str(db_path), "entry", "*_9146.js", "10"],
@@ -143,10 +243,10 @@ def main():
     first_probe = collect_deterministic_probe(bench, db_path)
 
     info_output = run_command([str(bench), "info", str(db_path)])
-    require_field(info_output, "records", 4)
-    require_field(info_output, "entries", 4)
-    require_field(info_output, "active_entries", 4)
-    require_field(info_output, "base_entries", 4)
+    require_field(info_output, "records", 6)
+    require_field(info_output, "entries", 6)
+    require_field(info_output, "active_entries", 6)
+    require_field(info_output, "base_entries", 6)
     require_field(info_output, "delta_entries", 0)
 
     index_output = run_command([str(bench), "search-v2", str(db_path), "entry", "index_9146", "10"])
@@ -160,6 +260,15 @@ def main():
     dir_output = run_command([str(bench), "search-v2", str(db_path), "entry", "inside_dir", "10"])
     require_field(dir_output, "returned", 1)
     require_contains(dir_output, "only_dir/inside_dir.txt")
+
+    zip64_output = run_command([str(bench), "search-v2", str(db_path), "entry", "zip64_payload", "10"])
+    require_field(zip64_output, "returned", 1)
+    require_contains(zip64_output, "zip64_payload.txt")
+
+    non_utf8_output = run_command([str(bench), "search-v2", str(db_path), "entry", "中文_payload", "10"])
+    require_field(non_utf8_output, "returned", 1)
+    require_contains(non_utf8_output, "中文_payload.txt")
+    require_contains(non_utf8_output, "raw=")
 
     archive_output = run_command([str(bench), "search-v2", str(db_path), "archive", "small_fixture", "10"])
     require_field(archive_output, "returned", 1)
