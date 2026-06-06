@@ -1883,25 +1883,8 @@ static int compact_entry_source_next(void* user_data, EzdbEntryRecord* out_recor
         out_record->original_size = detail.original_size;
         out_record->modified_time = detail.modified_time;
         if (detail.raw_len) {
-            source->raw_path = malloc(detail.raw_len);
+            source->raw_path = ezdb_entries_copy_raw_path(&path_store, id, &detail);
             if (!source->raw_path) return EZDB_ERR_MEMORY;
-            rc = bitset_get(db->delta_entry_bits, id)
-                ? ezdb_entries_copy_delta_blob_range(db->fp,
-                                                     db->delta_entry_refs[id].raw_offset,
-                                                     detail.raw_len,
-                                                     (unsigned char*)source->raw_path)
-                : ezdb_entries_copy_raw_blob_range(db->fp,
-                                                   db->raw_blob_pages,
-                                                   (uint32_t)db->header.raw_blob_page_count,
-                                                   db->header.raw_blob_offset,
-                                                   db->header.raw_blob_raw_size,
-                                                   db->raw_blob_cache,
-                                                   EZDB_RAW_BLOB_CACHE_PAGES,
-                                                   &db->cache_tick,
-                                                   detail.raw_offset,
-                                                   detail.raw_len,
-                                                   (unsigned char*)source->raw_path);
-            if (rc != EZDB_OK) return rc;
             out_record->entry_raw_path = source->raw_path;
             out_record->entry_raw_path_len = detail.raw_len;
         }
@@ -3943,30 +3926,10 @@ int ezdb_get_entry(Ezdb* db, uint32_t id, EzdbEntryResult* out_result)
     out_result->original_size = detail.original_size;
     out_result->modified_time = detail.modified_time;
     if (detail.raw_len) {
-        out_result->entry_raw_path = malloc(detail.raw_len);
+        out_result->entry_raw_path = ezdb_entries_copy_raw_path(&path_store, id, &detail);
         if (!out_result->entry_raw_path) {
             ezdb_free_entry_result(out_result);
             return EZDB_ERR_MEMORY;
-        }
-        rc = bitset_get(db->delta_entry_bits, id)
-            ? ezdb_entries_copy_delta_blob_range(db->fp,
-                                                 db->delta_entry_refs[id].raw_offset,
-                                                 detail.raw_len,
-                                                 (unsigned char*)out_result->entry_raw_path)
-            : ezdb_entries_copy_raw_blob_range(db->fp,
-                                               db->raw_blob_pages,
-                                               (uint32_t)db->header.raw_blob_page_count,
-                                               db->header.raw_blob_offset,
-                                               db->header.raw_blob_raw_size,
-                                               db->raw_blob_cache,
-                                               EZDB_RAW_BLOB_CACHE_PAGES,
-                                               &db->cache_tick,
-                                               detail.raw_offset,
-                                               detail.raw_len,
-                                               (unsigned char*)out_result->entry_raw_path);
-        if (rc != EZDB_OK) {
-            ezdb_free_entry_result(out_result);
-            return rc;
         }
         out_result->entry_raw_path_len = detail.raw_len;
     }
@@ -4204,27 +4167,12 @@ static int ezdb_emit_entry_result_with_path(Ezdb* db, uint32_t id, char* entry_p
     out.original_size = detail.original_size;
     out.modified_time = detail.modified_time;
     if (detail.raw_len) {
-        out.entry_raw_path = malloc(detail.raw_len);
+        EzdbEntryPathStore path_store = entry_path_store(db);
+        out.entry_raw_path = ezdb_entries_copy_raw_path(&path_store, id, &detail);
         if (!out.entry_raw_path) {
             archive.path = NULL;
             ezdb_free_search_v2_result(&out);
             return EZDB_ERR_MEMORY;
-        }
-        rc = ezdb_entries_copy_raw_blob_range(db->fp,
-                                              db->raw_blob_pages,
-                                              (uint32_t)db->header.raw_blob_page_count,
-                                              db->header.raw_blob_offset,
-                                              db->header.raw_blob_raw_size,
-                                              db->raw_blob_cache,
-                                              EZDB_RAW_BLOB_CACHE_PAGES,
-                                              &db->cache_tick,
-                                              detail.raw_offset,
-                                              detail.raw_len,
-                                              (unsigned char*)out.entry_raw_path);
-        if (rc != EZDB_OK) {
-            archive.path = NULL;
-            ezdb_free_search_v2_result(&out);
-            return rc;
         }
         out.entry_raw_path_len = detail.raw_len;
     }

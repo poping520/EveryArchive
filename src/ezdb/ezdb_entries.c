@@ -203,6 +203,37 @@ char* ezdb_entries_copy_path(const EzdbEntryPathStore* store, uint32_t id)
     return out;
 }
 
+void* ezdb_entries_copy_raw_path(const EzdbEntryPathStore* store, uint32_t id, const EzdbDiskEntry* detail)
+{
+    if (!store || !store->fp || !detail || id >= store->entry_count) return NULL;
+    if (!detail->raw_len) return NULL;
+    void* out = malloc(detail->raw_len);
+    if (!out) return NULL;
+    int rc = entry_bitset_get(store->delta_bits, id)
+        ? (store->delta_refs
+               ? ezdb_entries_copy_delta_blob_range(store->fp,
+                                                    store->delta_refs[id].raw_offset,
+                                                    detail->raw_len,
+                                                    (unsigned char*)out)
+               : EZDB_ERR_ARG)
+        : ezdb_entries_copy_raw_blob_range(store->fp,
+                                           store->raw_blob_pages,
+                                           store->raw_blob_page_count,
+                                           store->raw_blob_section_offset,
+                                           store->raw_blob_raw_size,
+                                           store->raw_blob_cache,
+                                           store->raw_blob_cache_count,
+                                           store->cache_tick,
+                                           detail->raw_offset,
+                                           detail->raw_len,
+                                           (unsigned char*)out);
+    if (rc != EZDB_OK) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE])
 {
     uint32_t archive_id = entry ? entry->archive_id : 0;
