@@ -47,13 +47,6 @@ typedef struct EzdbDeltaRecord {
     uint32_t next_by_id;
 } EzdbDeltaRecord;
 
-typedef struct EzdbPageCacheEntry {
-    uint32_t page_id;
-    uint32_t size;
-    uint64_t tick;
-    unsigned char* data;
-} EzdbPageCacheEntry;
-
 typedef struct BuildDir {
     uint32_t name_offset;
     uint32_t name_len;
@@ -1089,15 +1082,6 @@ static int copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_writ
     free(buf);
     if (fclose(src) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
     return rc;
-}
-
-static void page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
-{
-    if (!cache) return;
-    for (uint32_t i = 0; i < count; ++i) {
-        free(cache[i].data);
-        memset(&cache[i], 0, sizeof(cache[i]));
-    }
 }
 
 static int load_page_cached(Ezdb* db,
@@ -3786,8 +3770,8 @@ static void ezdb_release_members(Ezdb* db, int free_path)
     free(db->delta_entry_refs);
     free(db->entry_detail_pages);
     free(db->raw_blob_pages);
-    page_cache_free(db->entry_detail_cache, EZDB_ENTRY_DETAIL_CACHE_PAGES);
-    page_cache_free(db->raw_blob_cache, EZDB_RAW_BLOB_CACHE_PAGES);
+    ezdb_entries_page_cache_free(db->entry_detail_cache, EZDB_ENTRY_DETAIL_CACHE_PAGES);
+    ezdb_entries_page_cache_free(db->raw_blob_cache, EZDB_RAW_BLOB_CACHE_PAGES);
     free(db->active_entry_bits);
     free(db->delta_entry_bits);
     free(db->dirs);

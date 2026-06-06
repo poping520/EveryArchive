@@ -11,6 +11,13 @@
 #define EZDB_RAW_BLOB_CACHE_PAGES 64u
 #define EZDB_ENTRY_CORE_RECORD_SIZE 12u
 
+typedef struct EzdbPageCacheEntry {
+    uint32_t page_id;
+    uint32_t size;
+    uint64_t tick;
+    unsigned char* data;
+} EzdbPageCacheEntry;
+
 typedef struct EzdbEntrySource {
     void* user_data;
     int (*reset)(void* user_data);
@@ -20,5 +27,6 @@ typedef struct EzdbEntrySource {
     void (*close_range)(struct EzdbEntrySource* source);
 } EzdbEntrySource;
 
+void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);

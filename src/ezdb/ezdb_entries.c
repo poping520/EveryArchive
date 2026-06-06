@@ -1,6 +1,16 @@
 #include "ezdb_entries.h"
 
+#include <stdlib.h>
 #include <string.h>
+
+void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
+{
+    if (!cache) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        free(cache[i].data);
+        memset(&cache[i], 0, sizeof(cache[i]));
+    }
+}
 
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE])
 {
