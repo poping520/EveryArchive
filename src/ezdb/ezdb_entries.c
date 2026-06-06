@@ -350,6 +350,93 @@ void ezdb_entries_section_build_free(EzdbEntrySectionBuild* build)
     memset(build, 0, sizeof(*build));
 }
 
+int ezdb_entries_collect_sections(EzdbEntryCollectResult* result,
+                                  EzdbEntrySource* source,
+                                  uint32_t entry_count,
+                                  uint32_t original_archive_count,
+                                  const uint32_t* original_to_final,
+                                  uint64_t final_archive_count,
+                                  const char* temp_dir,
+                                  int track_archive_counts,
+                                  EzdbEntryCollectPathCallback path_callback,
+                                  void* path_callback_user_data)
+{
+    if (!result || (!source && entry_count) || (!original_to_final && entry_count) || !temp_dir) return EZDB_ERR_ARG;
+    memset(result, 0, sizeof(*result));
+    result->last_entry_archive_id = UINT32_MAX;
+    int rc = ezdb_entries_section_build_begin(&result->sections, temp_dir);
+    if (rc != EZDB_OK) return rc;
+    result->sections_ready = 1;
+    if (track_archive_counts && original_archive_count) {
+        result->archive_entry_counts = (uint32_t*)calloc((size_t)original_archive_count, sizeof(uint32_t));
+        result->archive_entry_bases = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)original_archive_count);
+        if (!result->archive_entry_counts || !result->archive_entry_bases) {
+            ezdb_entries_collect_result_free(result);
+            return EZDB_ERR_MEMORY;
+        }
+        for (uint32_t i = 0; i < original_archive_count; ++i) result->archive_entry_bases[i] = UINT32_MAX;
+        result->parallel_count_possible = 1;
+    }
+    if (source && source->reset) {
+        rc = source->reset(source->user_data);
+        if (rc != EZDB_OK) {
+            ezdb_entries_collect_result_free(result);
+            return rc;
+        }
+    }
+    for (uint32_t i = 0; rc == EZDB_OK && i < entry_count; ++i) {
+        EzdbEntryRecord record;
+        memset(&record, 0, sizeof(record));
+        rc = source->next(source->user_data, &record);
+        if (rc != EZDB_OK) break;
+        if (!record.entry_path || record.archive_id >= original_archive_count ||
+            original_to_final[record.archive_id] == UINT32_MAX) {
+            rc = EZDB_ERR_ARG;
+            break;
+        }
+        uint32_t final_archive_id = original_to_final[record.archive_id];
+        if (final_archive_id >= final_archive_count) {
+            rc = EZDB_ERR_ARG;
+            break;
+        }
+        if (result->parallel_count_possible) {
+            if (result->last_entry_archive_id != UINT32_MAX && record.archive_id < result->last_entry_archive_id) {
+                rc = EZDB_ERR_ARG;
+                break;
+            }
+            if (result->archive_entry_bases[record.archive_id] == UINT32_MAX) {
+                result->archive_entry_bases[record.archive_id] = i;
+            } else if (i != result->archive_entry_bases[record.archive_id] +
+                            result->archive_entry_counts[record.archive_id]) {
+                rc = EZDB_ERR_ARG;
+                break;
+            }
+            result->archive_entry_counts[record.archive_id] += 1u;
+            result->last_entry_archive_id = record.archive_id;
+        }
+        rc = ezdb_entries_section_build_add(&result->sections, &record, final_archive_id);
+        if (rc != EZDB_OK) break;
+        if (path_callback) {
+            rc = path_callback(path_callback_user_data, record.entry_path, i);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    if (rc == EZDB_OK) {
+        rc = ezdb_entries_section_build_finish(&result->sections);
+    }
+    if (rc != EZDB_OK) ezdb_entries_collect_result_free(result);
+    return rc;
+}
+
+void ezdb_entries_collect_result_free(EzdbEntryCollectResult* result)
+{
+    if (!result) return;
+    if (result->sections_ready) ezdb_entries_section_build_free(&result->sections);
+    free(result->archive_entry_counts);
+    free(result->archive_entry_bases);
+    memset(result, 0, sizeof(*result));
+}
+
 int ezdb_entries_load_page_cached(FILE* fp,
                                   EzdbDiskPage* pages,
                                   uint32_t page_count,

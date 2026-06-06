@@ -65,6 +65,17 @@ typedef struct EzdbEntrySectionBuild {
     int writer_ready;
 } EzdbEntrySectionBuild;
 
+typedef int (*EzdbEntryCollectPathCallback)(void* user_data, const char* entry_path, uint32_t entry_id);
+
+typedef struct EzdbEntryCollectResult {
+    EzdbEntrySectionBuild sections;
+    uint32_t* archive_entry_counts;
+    uint32_t* archive_entry_bases;
+    uint32_t last_entry_archive_id;
+    int parallel_count_possible;
+    int sections_ready;
+} EzdbEntryCollectResult;
+
 typedef struct EzdbEntryDetailStore {
     FILE* fp;
     EzdbDiskPage* pages;
@@ -131,6 +142,17 @@ int ezdb_entries_section_build_write_core(EzdbEntrySectionBuild* build,
 int ezdb_entries_section_build_write_detail(EzdbEntrySectionBuild* build, FILE* out, EzdbHeader* header);
 int ezdb_entries_section_build_write_raw(EzdbEntrySectionBuild* build, FILE* out, EzdbHeader* header);
 void ezdb_entries_section_build_free(EzdbEntrySectionBuild* build);
+int ezdb_entries_collect_sections(EzdbEntryCollectResult* result,
+                                  EzdbEntrySource* source,
+                                  uint32_t entry_count,
+                                  uint32_t original_archive_count,
+                                  const uint32_t* original_to_final,
+                                  uint64_t final_archive_count,
+                                  const char* temp_dir,
+                                  int track_archive_counts,
+                                  EzdbEntryCollectPathCallback path_callback,
+                                  void* path_callback_user_data);
+void ezdb_entries_collect_result_free(EzdbEntryCollectResult* result);
 int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size);
 void ezdb_entries_paged_writer_free(EzdbEntryPagedWriter* writer);
 int ezdb_entries_paged_writer_write(EzdbEntryPagedWriter* writer, const void* data, uint32_t len);
