@@ -1,6 +1,8 @@
 #include "ezdb_entries.h"
 #include "ezdb_io.h"
 
+#include <direct.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +28,44 @@ static int entries_ensure_capacity(void** data, size_t elem_size, uint32_t* capa
     *data = p;
     *capacity = cap;
     return EZDB_OK;
+}
+
+static int entries_ensure_directory_exists(const char* path)
+{
+    if (!path || !path[0]) return EZDB_ERR_ARG;
+    if (_mkdir(path) == 0 || errno == EEXIST) return EZDB_OK;
+    return EZDB_ERR_IO;
+}
+
+static int entries_copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_written)
+{
+    if (!dst || !src_path || !out_written) return EZDB_ERR_ARG;
+    *out_written = 0;
+    FILE* src = fopen(src_path, "rb");
+    if (!src) return EZDB_ERR_IO;
+    unsigned char* buf = (unsigned char*)malloc(1024u * 1024u);
+    if (!buf) {
+        fclose(src);
+        return EZDB_ERR_MEMORY;
+    }
+    int rc = EZDB_OK;
+    for (;;) {
+        size_t n = fread(buf, 1, 1024u * 1024u, src);
+        if (n) {
+            if (fwrite(buf, 1, n, dst) != n) {
+                rc = EZDB_ERR_IO;
+                break;
+            }
+            *out_written += (uint64_t)n;
+        }
+        if (n < 1024u * 1024u) {
+            if (ferror(src)) rc = EZDB_ERR_IO;
+            break;
+        }
+    }
+    free(buf);
+    if (fclose(src) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    return rc;
 }
 
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
@@ -191,6 +231,123 @@ int ezdb_entries_section_writer_finish(EzdbEntrySectionWriter* writer)
     int rc = ezdb_entries_paged_writer_finish(&writer->detail_writer);
     if (rc == EZDB_OK) rc = ezdb_entries_paged_writer_finish(&writer->raw_writer);
     return rc;
+}
+
+int ezdb_entries_section_build_begin(EzdbEntrySectionBuild* build, const char* temp_dir)
+{
+    if (!build || !temp_dir) return EZDB_ERR_ARG;
+    memset(build, 0, sizeof(*build));
+    if (snprintf(build->core_path, sizeof(build->core_path), "%s\\entry_core.tmp", temp_dir) >= (int)sizeof(build->core_path) ||
+        snprintf(build->detail_path, sizeof(build->detail_path), "%s\\entry_detail.tmp", temp_dir) >= (int)sizeof(build->detail_path) ||
+        snprintf(build->raw_path, sizeof(build->raw_path), "%s\\entry_raw.tmp", temp_dir) >= (int)sizeof(build->raw_path)) {
+        return EZDB_ERR_ARG;
+    }
+    int rc = entries_ensure_directory_exists(temp_dir);
+    if (rc != EZDB_OK) return rc;
+    build->core_fp = fopen(build->core_path, "wb");
+    build->detail_fp = fopen(build->detail_path, "wb");
+    build->raw_fp = fopen(build->raw_path, "wb");
+    if (!build->core_fp || !build->detail_fp || !build->raw_fp) {
+        ezdb_entries_section_build_free(build);
+        return EZDB_ERR_IO;
+    }
+    rc = ezdb_entries_section_writer_init(&build->writer, build->core_fp, build->detail_fp, build->raw_fp);
+    if (rc != EZDB_OK) {
+        ezdb_entries_section_build_free(build);
+        return rc;
+    }
+    build->writer_ready = 1;
+    return EZDB_OK;
+}
+
+int ezdb_entries_section_build_add(EzdbEntrySectionBuild* build,
+                                   const EzdbEntryRecord* record,
+                                   uint32_t final_archive_id)
+{
+    if (!build || !build->writer_ready) return EZDB_ERR_ARG;
+    return ezdb_entries_section_writer_add(&build->writer, record, final_archive_id);
+}
+
+int ezdb_entries_section_build_finish(EzdbEntrySectionBuild* build)
+{
+    if (!build || !build->writer_ready) return EZDB_ERR_ARG;
+    int rc = ezdb_entries_section_writer_finish(&build->writer);
+    if (build->core_fp && fclose(build->core_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    build->core_fp = NULL;
+    if (build->detail_fp && fclose(build->detail_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    build->detail_fp = NULL;
+    if (build->raw_fp && fclose(build->raw_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
+    build->raw_fp = NULL;
+    return rc;
+}
+
+int ezdb_entries_section_build_write_core(EzdbEntrySectionBuild* build,
+                                          FILE* out,
+                                          EzdbHeader* header,
+                                          uint32_t entry_count)
+{
+    if (!build || !out || !header) return EZDB_ERR_ARG;
+    uint64_t written = 0;
+    header->entry_records_offset = (uint64_t)ftell(out);
+    header->entry_records_raw_size = EZDB_ENTRY_CORE_RECORD_SIZE * (uint64_t)entry_count;
+    header->entry_records_flags = 0;
+    int rc = entries_copy_file_payload(out, build->core_path, &written);
+    header->entry_records_size = written;
+    return rc;
+}
+
+int ezdb_entries_section_build_write_detail(EzdbEntrySectionBuild* build, FILE* out, EzdbHeader* header)
+{
+    if (!build || !out || !header) return EZDB_ERR_ARG;
+    uint64_t detail_written = 0;
+    header->entry_detail_offset = (uint64_t)ftell(out);
+    int rc = entries_copy_file_payload(out, build->detail_path, &detail_written);
+    header->entry_detail_size = detail_written;
+    header->entry_detail_index_offset = (uint64_t)ftell(out);
+    header->entry_detail_page_count = build->writer.detail_writer.page_count;
+    header->entry_page_size = EZDB_ENTRY_PAGE_SIZE;
+    if (rc == EZDB_OK && build->writer.detail_writer.page_count &&
+        fwrite(build->writer.detail_writer.pages,
+               sizeof(EzdbDiskPage),
+               build->writer.detail_writer.page_count,
+               out) != build->writer.detail_writer.page_count) {
+        rc = EZDB_ERR_IO;
+    }
+    return rc;
+}
+
+int ezdb_entries_section_build_write_raw(EzdbEntrySectionBuild* build, FILE* out, EzdbHeader* header)
+{
+    if (!build || !out || !header) return EZDB_ERR_ARG;
+    uint64_t raw_written = 0;
+    header->raw_blob_offset = (uint64_t)ftell(out);
+    header->raw_blob_raw_size = build->writer.raw_writer.raw_size;
+    int rc = entries_copy_file_payload(out, build->raw_path, &raw_written);
+    header->raw_blob_size = raw_written;
+    header->raw_blob_index_offset = (uint64_t)ftell(out);
+    header->raw_blob_page_count = build->writer.raw_writer.page_count;
+    header->raw_blob_page_size = EZDB_RAW_BLOB_PAGE_SIZE;
+    if (rc == EZDB_OK && build->writer.raw_writer.page_count &&
+        fwrite(build->writer.raw_writer.pages,
+               sizeof(EzdbDiskPage),
+               build->writer.raw_writer.page_count,
+               out) != build->writer.raw_writer.page_count) {
+        rc = EZDB_ERR_IO;
+    }
+    return rc;
+}
+
+void ezdb_entries_section_build_free(EzdbEntrySectionBuild* build)
+{
+    if (!build) return;
+    if (build->core_fp) fclose(build->core_fp);
+    if (build->detail_fp) fclose(build->detail_fp);
+    if (build->raw_fp) fclose(build->raw_fp);
+    if (build->writer_ready) ezdb_entries_section_writer_free(&build->writer);
+    remove(build->core_path);
+    remove(build->detail_path);
+    remove(build->raw_path);
+    memset(build, 0, sizeof(*build));
 }
 
 int ezdb_entries_load_page_cached(FILE* fp,

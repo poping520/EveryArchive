@@ -33,10 +33,10 @@ ezdb v13 的目标是为 `build-zip-entries` 建立一个更快、更低内存�
 | 多线程 postings 构建 | 已完成 | pass 1 count、reduce、slice prepare、pass 2 fill 已并行化 |
 | query 主流程拆分 | 部分完成 | parser/helper 已迁出，`search/search-v2/query_entries` 主流程仍在 `ezdb.c` |
 | delta 模块拆分 | 未开始 | insert/update/delete/compact 仍在 `ezdb.c` |
-| entries 模块拆分 | 部分完成 | entry source、读路径 helper、分页 writer 和 section writer 已迁入；entry 构建编排仍在 `ezdb.c` |
+| entries 模块拆分 | 部分完成 | entry source、读路径 helper、分页 writer 和 section build 会话已迁入；postings/外层构建编排仍在 `ezdb.c` |
 | build 模块拆分 | 未开始 | snapshot build 编排仍在 `ezdb.c` |
 
-当前总体进度估算：约 `68%`。已完成 ZIP CD scan、spool/stream、postings、多线程 postings 和测试体系；剩余主要是 entries/build/query/delta/core 的模块边界继续收敛，以及 `EzdbHeader` 运行期映射依赖收敛。
+当前总体进度估算：约 `70%`。已完成 ZIP CD scan、spool/stream、postings、多线程 postings 和测试体系；entries 写入边界已从单条 record helper 推进到 temp file/header section 会话，剩余主要是 build/query/delta/core 的模块边界继续收敛，以及 `EzdbHeader` 运行期映射依赖收敛。
 
 ## 已完成工作
 
@@ -360,7 +360,7 @@ typedef struct EzdbSectionDesc {
 - entry core writer/reader（已迁出 core 12 字节 encode/decode helper）
 - entry detail page writer/reader（已迁出 entry detail reader helper）
 - raw blob page writer/reader（已迁出 entry paged writer helper、base raw blob range copy helper 和 delta blob range copy helper）
-- entry section writer（已迁出单条 entry core/detail/raw blob 写入 helper，构建编排仍在 `ezdb.c`）
+- entry section writer/build session（已迁出单条 entry core/detail/raw blob 写入、temp file 生命周期、payload copy、page index 写入和 header section 字段填充；postings/外层构建编排仍在 `ezdb.c`）
 - entry page cache（已迁出 cache entry 类型、加载 helper 和释放 helper）
 - entry path/raw path copy helpers（已迁出 entry path copy helper、entry raw path copy helper、base raw blob range copy helper 和 delta blob range copy helper）
 - archive -> entry link rebuild
@@ -373,7 +373,8 @@ typedef struct EzdbSectionDesc {
 4. 迁出 compact entry source。（已完成）
 5. 迁出 array entry source。（已完成）
 6. 迁出单条 entry section writer。（已完成：`EzdbEntrySectionWriter` 负责 core/detail/raw blob 写入）
-7. 与 v13 section descriptor 对接。
+7. 迁出 entry section build session。（已完成：`EzdbEntrySectionBuild` 负责 temp file、finish、payload copy、page index 和 header section 字段）
+8. 与 v13 section descriptor 对接。
 
 ### 4. query 模块拆分
 
@@ -494,7 +495,7 @@ v13 调整：
 状态：部分完成。
 
 - [x] 新建 `ezdb_entries.c/.h`。
-- [ ] 迁出 entry core/detail/raw blob 读写。（已迁出 core encode/decode、detail/raw blob 读路径、分页 writer、array source 和单条 entry section writer；entry 构建编排仍在 `ezdb.c`）
+- [ ] 迁出 entry core/detail/raw blob 读写。（已迁出 core encode/decode、detail/raw blob 读路径、分页 writer、array source、entry section writer 和 section build session；postings/外层构建编排仍在 `ezdb.c`）
 - [x] 新建 `ezdb_query.c/.h`。
 - [x] 迁出 query parser。
 - [ ] 迁出 archive/entry search。
@@ -561,7 +562,7 @@ v13 调整：
 - 已提交阶段性重构：`b5a52f6 Refactor ezdb v13 format and query modules`。
 - 已修复 v13 live entry append 重新 open：v13 header 严格保留 `base_archive_count/base_entry_count`，并修复 delta replay 中读取 entry path 后未恢复文件位置的问题。
 - Debug/Release 构建 `EzdbBench` 通过。
-- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper、entry detail reader helper、entry paged writer helper、array entry source 与 `EzdbEntrySectionWriter`；entry 构建编排仍待继续迁出。
+- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper、entry detail reader helper、entry paged writer helper、array entry source、`EzdbEntrySectionWriter` 与 `EzdbEntrySectionBuild`；postings/外层 entry 构建编排仍待继续迁出。
 - `EzdbEntrySource` 内部 stream interface、`EzdbArrayEntrySource` 和 `EzdbCompactEntrySource` 已迁入 `ezdb_entries.c/.h`，array source 保留 `open_range/close_range` 以支持并行 entry index 构建。
 - entry detail/raw blob page cache 的 cache entry 类型、加载 helper 和释放 helper 已迁入 `ezdb_entries.c/.h`；entry detail reader helper、entry path copy helper、entry raw path copy helper、base raw blob range copy helper 和 delta blob range copy helper 已迁出，`search-v2` entry emit raw path 读取已统一走 entries helper。
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。
@@ -576,6 +577,8 @@ v13 调整：
 - 2026-06-06 本机继续阶段 B：迁出 `EzdbArrayEntrySource` 到 entries 模块；`cmake --build cmake-build-codex-release --config Release --target EzdbBench` 通过；`ctest --test-dir cmake-build-codex-release -C Release -R EzdbZipFixtureTests --output-on-failure` 通过。
 - 2026-06-06 本机继续阶段 B：新增 `EzdbEntrySectionWriter`，迁出单条 entry core/detail/raw blob 写入逻辑；Release `EzdbBench` 构建通过，`EzdbZipFixtureTests` 通过。
 - 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.473s`，`entry_total_seconds 14.628s`，`zip_total_parse_to_build_seconds 16.250s`，峰值工作集 `292.83MB`，输出 `97.46MB`。
+- 2026-06-06 本机继续阶段 B：新增 `EzdbEntrySectionBuild`，迁出 entry section temp file 生命周期、finish、payload copy、page index 写入和 header section 字段填充；同时删除 `ezdb.c` 中对应死 helper；Release `EzdbBench` 构建通过，`EzdbZipFixtureTests` 通过。
+- 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.414s`，`entry_total_seconds 16.417s`，`zip_total_parse_to_build_seconds 17.961s`，峰值工作集 `292.78MB`，输出 `97.46MB`。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -584,7 +587,7 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 B/C 的 entries/query/v13 header 收敛，优先继续把 `ezdb_write_entries_from_source` 的 temp file/header offset 编排拆入 entries/build 边界，或处理 `EzdbHeader` 运行期映射依赖。
+- 下一步继续阶段 B/C 的 entries/query/v13 header 收敛，优先继续把 `ezdb_write_entries_from_source` 的 archive remap/count collection 与 postings 编排拆入更清晰的 entries/build 边界，或处理 `EzdbHeader` 运行期映射依赖。
 
 ## 风险与注意事项
 
