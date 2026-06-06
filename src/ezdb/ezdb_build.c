@@ -10,6 +10,369 @@ typedef struct EzdbPublicEntryStreamRange {
     EzdbEntryStream stream;
 } EzdbPublicEntryStreamRange;
 
+static int build_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed)
+{
+    if (*capacity >= needed) return EZDB_OK;
+    uint32_t next = *capacity ? *capacity : 1024;
+    while (next < needed) {
+        if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
+        next *= 2u;
+    }
+    void* new_data = realloc(*data, elem_size * (size_t)next);
+    if (!new_data) return EZDB_ERR_MEMORY;
+    *data = new_data;
+    *capacity = next;
+    return EZDB_OK;
+}
+
+static uint32_t build_fnv1a_bytes(const char* text, size_t len)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= (unsigned char)text[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int build_append_string(char** data, uint32_t* size, uint32_t* cap, const char* text, uint32_t len, uint32_t* out_offset)
+{
+    if (build_ensure_capacity((void**)data, 1, cap, *size + len + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    *out_offset = *size;
+    memcpy(*data + *size, text, len);
+    *size += len;
+    (*data)[(*size)++] = '\0';
+    return EZDB_OK;
+}
+
+static int build_init_u32_buckets(uint32_t** buckets, uint32_t count)
+{
+    *buckets = (uint32_t*)malloc(sizeof(uint32_t) * count);
+    if (!*buckets) return EZDB_ERR_MEMORY;
+    for (uint32_t i = 0; i < count; ++i) (*buckets)[i] = UINT32_MAX;
+    return EZDB_OK;
+}
+
+static int build_find_or_add_string(EzdbArchiveBuildTree* tree, const char* text, uint32_t len, uint32_t* out_offset)
+{
+    if (!tree->string_buckets) {
+        tree->string_bucket_count = 65536u;
+        if (build_init_u32_buckets(&tree->string_buckets, tree->string_bucket_count) != EZDB_OK) return EZDB_ERR_MEMORY;
+    }
+    uint32_t hash = build_fnv1a_bytes(text, len);
+    uint32_t bucket = hash & (tree->string_bucket_count - 1u);
+    for (uint32_t i = tree->string_buckets[bucket]; i != UINT32_MAX; i = tree->string_entries[i].next) {
+        if (tree->string_entries[i].len == len &&
+            memcmp(tree->string_pool + tree->string_entries[i].offset, text, len) == 0) {
+            *out_offset = tree->string_entries[i].offset;
+            return EZDB_OK;
+        }
+    }
+
+    uint32_t offset = 0;
+    if (build_append_string(&tree->string_pool, &tree->string_size, &tree->string_cap, text, len, &offset) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    if (build_ensure_capacity((void**)&tree->string_entries,
+                              sizeof(EzdbBuildStringHashEntry),
+                              &tree->string_entry_cap,
+                              tree->string_entry_count + 1) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    EzdbBuildStringHashEntry* e = &tree->string_entries[tree->string_entry_count];
+    e->offset = offset;
+    e->len = len;
+    e->next = tree->string_buckets[bucket];
+    tree->string_buckets[bucket] = tree->string_entry_count;
+    tree->string_entry_count += 1;
+    *out_offset = offset;
+    return EZDB_OK;
+}
+
+static uint32_t build_find_or_add_dir(EzdbArchiveBuildTree* tree,
+                                      uint32_t parent,
+                                      const char* name,
+                                      uint32_t name_len)
+{
+    if (!tree->dir_buckets) {
+        tree->dir_bucket_count = 262144u;
+        if (build_init_u32_buckets(&tree->dir_buckets, tree->dir_bucket_count) != EZDB_OK) return UINT32_MAX;
+    }
+    uint32_t hash = build_fnv1a_bytes(name, name_len) ^ (parent * 16777619u);
+    uint32_t bucket = hash & (tree->dir_bucket_count - 1u);
+    for (uint32_t i = tree->dir_buckets[bucket]; i != UINT32_MAX; i = tree->dir_hash_entries[i].next) {
+        EzdbBuildDirHashEntry* he = &tree->dir_hash_entries[i];
+        if (he->parent == parent && he->name_len == name_len &&
+            memcmp(tree->string_pool + he->name_offset, name, name_len) == 0) {
+            return he->dir_id;
+        }
+    }
+
+    if (build_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, tree->dir_count + 1) != EZDB_OK) {
+        return UINT32_MAX;
+    }
+    uint32_t name_offset = 0;
+    if (build_find_or_add_string(tree, name, name_len, &name_offset) != EZDB_OK) return UINT32_MAX;
+
+    uint32_t id = tree->dir_count;
+    EzdbBuildDir* dir = &tree->dirs[id];
+    memset(dir, 0, sizeof(*dir));
+    dir->name_offset = name_offset;
+    dir->name_len = name_len;
+    dir->parent = parent;
+    dir->first_child = UINT32_MAX;
+    dir->next_sibling = UINT32_MAX;
+    dir->first_file = UINT32_MAX;
+    dir->old_first_file = UINT32_MAX;
+    if (id != parent && parent != UINT32_MAX) {
+        dir->next_sibling = tree->dirs[parent].first_child;
+        tree->dirs[parent].first_child = id;
+    }
+    tree->dir_count += 1;
+
+    if (build_ensure_capacity((void**)&tree->dir_hash_entries,
+                              sizeof(EzdbBuildDirHashEntry),
+                              &tree->dir_hash_cap,
+                              tree->dir_hash_count + 1) != EZDB_OK) {
+        return UINT32_MAX;
+    }
+    EzdbBuildDirHashEntry* he = &tree->dir_hash_entries[tree->dir_hash_count];
+    he->parent = parent;
+    he->name_offset = name_offset;
+    he->name_len = name_len;
+    he->dir_id = id;
+    he->next = tree->dir_buckets[bucket];
+    tree->dir_buckets[bucket] = tree->dir_hash_count;
+    tree->dir_hash_count += 1;
+    return id;
+}
+
+static uint32_t build_get_or_create_path_dir(EzdbArchiveBuildTree* tree, const char* path, uint32_t path_len)
+{
+    uint32_t parent = 0;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i <= path_len; ++i) {
+        if (i == path_len || path[i] == '\\' || path[i] == '/') {
+            if (i > start) {
+                parent = build_find_or_add_dir(tree, parent, path + start, i - start);
+                if (parent == UINT32_MAX) return UINT32_MAX;
+            }
+            start = i + 1;
+        }
+    }
+    return parent;
+}
+
+static int build_append_file(EzdbArchiveBuildTree* tree,
+                             uint32_t dir_id,
+                             const char* name,
+                             uint32_t name_len,
+                             uint32_t original_id,
+                             uint64_t size,
+                             uint64_t modified_time,
+                             char drive_letter,
+                             uint64_t file_ref_number,
+                             int64_t usn)
+{
+    if (build_ensure_capacity((void**)&tree->old_files, sizeof(EzdbBuildFile), &tree->file_cap, tree->file_count + 1) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    uint32_t name_offset = 0;
+    if (build_find_or_add_string(tree, name, name_len, &name_offset) != EZDB_OK) return EZDB_ERR_MEMORY;
+    uint32_t id = tree->file_count;
+    EzdbBuildFile* f = &tree->old_files[id];
+    memset(f, 0, sizeof(*f));
+    f->name_offset = name_offset;
+    f->name_len = name_len;
+    f->parent_dir = dir_id;
+    f->original_id = original_id;
+    f->size = size;
+    f->modified_time = modified_time;
+    f->drive_letter = drive_letter;
+    f->file_ref_number = file_ref_number;
+    f->usn = usn;
+    f->next_in_dir = tree->dirs[dir_id].old_first_file;
+    tree->dirs[dir_id].old_first_file = id;
+    tree->dirs[dir_id].old_file_count += 1;
+    tree->file_count += 1;
+    return EZDB_OK;
+}
+
+static int build_append_varuint(unsigned char** data, uint32_t* size, uint32_t* cap, uint32_t value)
+{
+    unsigned char bytes[5];
+    uint32_t count = 0;
+    do {
+        bytes[count] = (unsigned char)(value & 0x7fu);
+        value >>= 7u;
+        if (value) bytes[count] |= 0x80u;
+        ++count;
+    } while (value);
+    if (*size + count > *cap) {
+        uint32_t next = *cap ? *cap : 256u;
+        while (next < *size + count) {
+            if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
+            next *= 2u;
+        }
+        unsigned char* new_data = (unsigned char*)realloc(*data, next);
+        if (!new_data) return EZDB_ERR_MEMORY;
+        *data = new_data;
+        *cap = next;
+    }
+    memcpy(*data + *size, bytes, count);
+    *size += count;
+    return EZDB_OK;
+}
+
+static int build_append_varuint64(unsigned char** data, uint32_t* size, uint32_t* cap, uint64_t value)
+{
+    unsigned char bytes[10];
+    uint32_t count = 0;
+    do {
+        bytes[count] = (unsigned char)(value & 0x7fu);
+        value >>= 7u;
+        if (value) bytes[count] |= 0x80u;
+        ++count;
+    } while (value);
+    if (*size + count > *cap) {
+        uint32_t next = *cap ? *cap : 256u;
+        while (next < *size + count) {
+            if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
+            next *= 2u;
+        }
+        unsigned char* new_data = (unsigned char*)realloc(*data, next);
+        if (!new_data) return EZDB_ERR_MEMORY;
+        *data = new_data;
+        *cap = next;
+    }
+    memcpy(*data + *size, bytes, count);
+    *size += count;
+    return EZDB_OK;
+}
+
+static uint32_t build_dfs_assign(EzdbBuildDir* dirs,
+                                 EzdbBuildFile* old_files,
+                                 EzdbBuildFile* new_files,
+                                 uint32_t dir_id,
+                                 uint32_t next_file,
+                                 uint32_t* original_to_final)
+{
+    EzdbBuildDir* dir = &dirs[dir_id];
+    dir->first_file_id = next_file;
+    for (uint32_t old = dir->old_first_file; old != UINT32_MAX; old = old_files[old].next_in_dir) {
+        new_files[next_file] = old_files[old];
+        new_files[next_file].parent_dir = dir_id;
+        if (original_to_final) original_to_final[old_files[old].original_id] = next_file;
+        ++next_file;
+    }
+    for (uint32_t child = dir->first_child; child != UINT32_MAX; child = dirs[child].next_sibling) {
+        next_file = build_dfs_assign(dirs, old_files, new_files, child, next_file, original_to_final);
+    }
+    dir->file_count = next_file - dir->first_file_id;
+    return next_file;
+}
+
+int ezdb_build_archive_tree_init(EzdbArchiveBuildTree* tree)
+{
+    if (!tree) return EZDB_ERR_ARG;
+    memset(tree, 0, sizeof(*tree));
+    if (build_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, 1) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    memset(&tree->dirs[0], 0, sizeof(EzdbBuildDir));
+    tree->dirs[0].parent = 0;
+    tree->dirs[0].first_child = UINT32_MAX;
+    tree->dirs[0].next_sibling = UINT32_MAX;
+    tree->dirs[0].first_file = UINT32_MAX;
+    tree->dirs[0].old_first_file = UINT32_MAX;
+    tree->dir_count = 1;
+    return EZDB_OK;
+}
+
+int ezdb_build_archive_tree_add_archives(EzdbArchiveBuildTree* tree,
+                                         const EzdbArchiveRecord* archives,
+                                         uint32_t archive_count)
+{
+    if (!tree || (!archives && archive_count)) return EZDB_ERR_ARG;
+    for (uint32_t i = 0; i < archive_count; ++i) {
+        const EzdbArchiveRecord* archive = &archives[i];
+        const char* path = archive->file_path;
+        if (!path || !*path) return EZDB_ERR_ARG;
+        char* slash = strrchr(path, '\\');
+        char* fslash = strrchr(path, '/');
+        if (!slash || (fslash && fslash > slash)) slash = fslash;
+        const char* name = slash ? slash + 1 : path;
+        uint32_t name_len = (uint32_t)strlen(name);
+        uint32_t dir_id = 0;
+        if (slash) {
+            dir_id = build_get_or_create_path_dir(tree, path, (uint32_t)(slash - path));
+            if (dir_id == UINT32_MAX) return EZDB_ERR_MEMORY;
+        }
+        int rc = build_append_file(tree,
+                                   dir_id,
+                                   name,
+                                   name_len,
+                                   i,
+                                   archive->file_size,
+                                   archive->modified_time,
+                                   archive->drive_letter,
+                                   archive->file_ref_number,
+                                   archive->usn);
+        if (rc != EZDB_OK) return rc;
+    }
+    return EZDB_OK;
+}
+
+int ezdb_build_archive_tree_assign(EzdbArchiveBuildTree* tree, uint32_t* original_to_final)
+{
+    if (!tree) return EZDB_ERR_ARG;
+    tree->files = (EzdbBuildFile*)malloc(sizeof(EzdbBuildFile) * (size_t)tree->file_count);
+    if (!tree->files && tree->file_count) return EZDB_ERR_MEMORY;
+    uint32_t assigned = build_dfs_assign(tree->dirs, tree->old_files, tree->files, 0, 0, original_to_final);
+    if (assigned != tree->file_count) return EZDB_ERR_FORMAT;
+    free(tree->old_files);
+    tree->old_files = NULL;
+    return EZDB_OK;
+}
+
+void ezdb_build_archive_tree_free(EzdbArchiveBuildTree* tree)
+{
+    if (!tree) return;
+    free(tree->dirs);
+    free(tree->old_files);
+    free(tree->files);
+    free(tree->dir_hash_entries);
+    free(tree->dir_buckets);
+    free(tree->string_pool);
+    free(tree->string_entries);
+    free(tree->string_buckets);
+    memset(tree, 0, sizeof(*tree));
+}
+
+int ezdb_build_encode_file_records_compact(const EzdbBuildFile* files,
+                                           uint32_t file_count,
+                                           unsigned char** out_data,
+                                           uint64_t* out_size)
+{
+    if ((!files && file_count) || !out_data || !out_size) return EZDB_ERR_ARG;
+    unsigned char* data = NULL;
+    uint32_t size = 0, cap = 0;
+    for (uint32_t i = 0; i < file_count; ++i) {
+        int rc = build_append_varuint(&data, &size, &cap, files[i].parent_dir);
+        if (rc == EZDB_OK) rc = build_append_varuint(&data, &size, &cap, files[i].name_offset);
+        if (rc == EZDB_OK) rc = build_append_varuint(&data, &size, &cap, files[i].name_len);
+        if (rc == EZDB_OK) rc = build_append_varuint64(&data, &size, &cap, files[i].size);
+        if (rc == EZDB_OK) rc = build_append_varuint64(&data, &size, &cap, files[i].modified_time);
+        if (rc != EZDB_OK) {
+            free(data);
+            return rc;
+        }
+    }
+    *out_data = data;
+    *out_size = size;
+    return EZDB_OK;
+}
+
 static void public_entry_stream_close_range(EzdbEntrySource* source);
 
 static int public_entry_stream_reset(void* user_data)
