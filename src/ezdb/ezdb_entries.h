@@ -76,6 +76,13 @@ typedef struct EzdbEntryCollectResult {
     int sections_ready;
 } EzdbEntryCollectResult;
 
+typedef struct EzdbEntryFinalizeStats {
+    double write_core_ms;
+    double write_detail_ms;
+    double write_raw_ms;
+    double finalize_ms;
+} EzdbEntryFinalizeStats;
+
 typedef struct EzdbEntryDetailStore {
     FILE* fp;
     EzdbDiskPage* pages;
@@ -152,6 +159,11 @@ int ezdb_entries_collect_sections(EzdbEntryCollectResult* result,
                                   int track_archive_counts,
                                   EzdbEntryCollectPathCallback path_callback,
                                   void* path_callback_user_data);
+int ezdb_entries_write_collected_sections(EzdbEntryCollectResult* result,
+                                          FILE* out,
+                                          EzdbHeader* header,
+                                          uint32_t entry_count,
+                                          EzdbEntryFinalizeStats* stats);
 void ezdb_entries_collect_result_free(EzdbEntryCollectResult* result);
 int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size);
 void ezdb_entries_paged_writer_free(EzdbEntryPagedWriter* writer);

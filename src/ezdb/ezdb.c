@@ -1650,26 +1650,24 @@ static int ezdb_write_entries_from_source(FILE* out,
     if (!out || !header || (!source && entry_count)) return EZDB_ERR_ARG;
     int rc = EZDB_OK;
     EzdbEntryCollectResult entry_collect;
+    EzdbEntryFinalizeStats entry_finalize_stats;
     PostingBuilder entry_builder;
     int entry_builder_ready = 0;
     EzdbDiskIndex* entry_index = NULL;
     EzdbEntryIndexBuildStats entry_index_stats;
     double total_start_ms = ezdb_now_ms();
     double stream_total_ms = 0.0;
-    double write_core_ms = 0.0;
-    double write_detail_ms = 0.0;
-    double write_raw_ms = 0.0;
     double index_count_ms = 0.0;
     double index_reduce_ms = 0.0;
     double index_prepare_ms = 0.0;
     double index_fill_ms = 0.0;
     double postings_build_ms = 0.0;
     double write_postings_ms = 0.0;
-    double finalize_ms = 0.0;
     int parallel_count_possible = 0;
 
     if (!options) return EZDB_ERR_ARG;
     memset(&entry_collect, 0, sizeof(entry_collect));
+    memset(&entry_finalize_stats, 0, sizeof(entry_finalize_stats));
     memset(&entry_builder, 0, sizeof(entry_builder));
     memset(&entry_index_stats, 0, sizeof(entry_index_stats));
     if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
@@ -1721,41 +1719,18 @@ static int ezdb_write_entries_from_source(FILE* out,
     }
     postings_build_ms = index_count_ms + index_prepare_ms + index_fill_ms;
     if (rc == EZDB_OK) {
-        stage_start_ms = ezdb_now_ms();
-        rc = ezdb_entries_section_build_write_core(&entry_collect.sections, out, header, entry_count);
-        write_core_ms = ezdb_now_ms() - stage_start_ms;
-    }
-    if (rc == EZDB_OK) {
-        stage_start_ms = ezdb_now_ms();
-        rc = ezdb_entries_section_build_write_detail(&entry_collect.sections, out, header);
-        write_detail_ms = ezdb_now_ms() - stage_start_ms;
-    }
-    if (rc == EZDB_OK) {
-        stage_start_ms = ezdb_now_ms();
-        rc = ezdb_entries_section_build_write_raw(&entry_collect.sections, out, header);
-        write_raw_ms = ezdb_now_ms() - stage_start_ms;
-    }
-    if (rc == EZDB_OK) {
-        stage_start_ms = ezdb_now_ms();
-        header->entry_count = entry_count;
-        header->active_entry_count = entry_count;
-        header->base_entry_count = entry_count;
-        header->reserved_offset = (uint64_t)ftell(out);
-        header->reserved_size = 0;
-        header->delta_offset = header->reserved_offset;
-        header->delta_size = 0;
-        finalize_ms = ezdb_now_ms() - stage_start_ms;
+        rc = ezdb_entries_write_collected_sections(&entry_collect, out, header, entry_count, &entry_finalize_stats);
     }
     if (rc == EZDB_OK) {
         double total_ms = ezdb_now_ms() - total_start_ms;
         printf("entry_collect_seconds: %.3f\n", stream_total_ms / 1000.0);
-        printf("stream_entry_core_seconds: %.3f\n", write_core_ms / 1000.0);
-        printf("stream_entry_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
-        printf("stream_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
+        printf("stream_entry_core_seconds: %.3f\n", entry_finalize_stats.write_core_ms / 1000.0);
+        printf("stream_entry_detail_seconds: %.3f\n", entry_finalize_stats.write_detail_ms / 1000.0);
+        printf("stream_raw_blob_seconds: %.3f\n", entry_finalize_stats.write_raw_ms / 1000.0);
         printf("stream_postings_build_seconds: %.3f\n", postings_build_ms / 1000.0);
-        printf("entry_write_core_seconds: %.3f\n", write_core_ms / 1000.0);
-        printf("entry_write_detail_seconds: %.3f\n", write_detail_ms / 1000.0);
-        printf("entry_write_raw_blob_seconds: %.3f\n", write_raw_ms / 1000.0);
+        printf("entry_write_core_seconds: %.3f\n", entry_finalize_stats.write_core_ms / 1000.0);
+        printf("entry_write_detail_seconds: %.3f\n", entry_finalize_stats.write_detail_ms / 1000.0);
+        printf("entry_write_raw_blob_seconds: %.3f\n", entry_finalize_stats.write_raw_ms / 1000.0);
         printf("entry_index_threads: %u\n", options->index_threads);
         printf("entry_index_count_seconds: %.3f\n", index_count_ms / 1000.0);
         printf("entry_index_count_parallel_seconds: %.3f\n", index_count_ms / 1000.0);
@@ -1778,7 +1753,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         printf("entry_postings_fwrite_seconds: %.3f\n", entry_index_stats.write_stats.fwrite_ms / 1000.0);
         printf("entry_postings_index_meta_seconds: %.3f\n", entry_index_stats.write_stats.index_meta_ms / 1000.0);
         printf("entry_write_index_seconds: %.3f\n", entry_index_stats.write_index_ms / 1000.0);
-        printf("entry_finalize_seconds: %.3f\n", finalize_ms / 1000.0);
+        printf("entry_finalize_seconds: %.3f\n", entry_finalize_stats.finalize_ms / 1000.0);
         printf("entry_total_seconds: %.3f\n", total_ms / 1000.0);
         printf("entry_raw_blob_mb: %.2f\n", (double)entry_collect.sections.writer.raw_writer.raw_size / 1024.0 / 1024.0);
         printf("entry_records_mb: %.2f\n", (double)header->entry_records_size / 1024.0 / 1024.0);

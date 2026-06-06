@@ -5,6 +5,12 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double entries_now_ms(void)
+{
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
 
 static int entry_bitset_get(const unsigned char* bits, uint32_t id)
 {
@@ -425,6 +431,43 @@ int ezdb_entries_collect_sections(EzdbEntryCollectResult* result,
         rc = ezdb_entries_section_build_finish(&result->sections);
     }
     if (rc != EZDB_OK) ezdb_entries_collect_result_free(result);
+    return rc;
+}
+
+int ezdb_entries_write_collected_sections(EzdbEntryCollectResult* result,
+                                          FILE* out,
+                                          EzdbHeader* header,
+                                          uint32_t entry_count,
+                                          EzdbEntryFinalizeStats* stats)
+{
+    if (!result || !out || !header) return EZDB_ERR_ARG;
+    if (stats) memset(stats, 0, sizeof(*stats));
+
+    double stage_start_ms = entries_now_ms();
+    int rc = ezdb_entries_section_build_write_core(&result->sections, out, header, entry_count);
+    if (stats) stats->write_core_ms = entries_now_ms() - stage_start_ms;
+
+    if (rc == EZDB_OK) {
+        stage_start_ms = entries_now_ms();
+        rc = ezdb_entries_section_build_write_detail(&result->sections, out, header);
+        if (stats) stats->write_detail_ms = entries_now_ms() - stage_start_ms;
+    }
+    if (rc == EZDB_OK) {
+        stage_start_ms = entries_now_ms();
+        rc = ezdb_entries_section_build_write_raw(&result->sections, out, header);
+        if (stats) stats->write_raw_ms = entries_now_ms() - stage_start_ms;
+    }
+    if (rc == EZDB_OK) {
+        stage_start_ms = entries_now_ms();
+        header->entry_count = entry_count;
+        header->active_entry_count = entry_count;
+        header->base_entry_count = entry_count;
+        header->reserved_offset = (uint64_t)ftell(out);
+        header->reserved_size = 0;
+        header->delta_offset = header->reserved_offset;
+        header->delta_size = 0;
+        if (stats) stats->finalize_ms = entries_now_ms() - stage_start_ms;
+    }
     return rc;
 }
 
