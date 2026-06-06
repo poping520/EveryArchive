@@ -50,5 +50,6 @@ int ezdb_entries_copy_raw_blob_range(FILE* fp,
                                      uint32_t offset,
                                      uint32_t len,
                                      unsigned char* out);
+int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, unsigned char* out);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);

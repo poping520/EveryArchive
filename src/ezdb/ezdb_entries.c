@@ -108,6 +108,14 @@ int ezdb_entries_copy_raw_blob_range(FILE* fp,
     return EZDB_OK;
 }
 
+int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, unsigned char* out)
+{
+    if (!fp || (!out && len)) return EZDB_ERR_ARG;
+    if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+    if (len && fread(out, 1, len, fp) != len) return EZDB_ERR_IO;
+    return EZDB_OK;
+}
+
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE])
 {
     uint32_t archive_id = entry ? entry->archive_id : 0;

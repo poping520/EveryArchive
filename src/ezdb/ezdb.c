@@ -114,7 +114,6 @@ static uint64_t ezdb_delta_append_offset(Ezdb* db);
 static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out);
 static char* entry_path_copy_by_id(Ezdb* db, uint32_t id);
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path);
-static int copy_delta_blob_range(Ezdb* db, uint64_t offset, uint32_t len, unsigned char* out);
 
 typedef struct EzdbCompactEntrySource {
     Ezdb* db;
@@ -1146,14 +1145,6 @@ static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out)
     return EZDB_OK;
 }
 
-static int copy_delta_blob_range(Ezdb* db, uint64_t offset, uint32_t len, unsigned char* out)
-{
-    if (!db || (!out && len)) return EZDB_ERR_ARG;
-    if (fseek(db->fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
-    if (len && fread(out, 1, len, db->fp) != len) return EZDB_ERR_IO;
-    return EZDB_OK;
-}
-
 static char* entry_path_copy_by_id(Ezdb* db, uint32_t id)
 {
     if (!db || id >= db->header.entry_count) return NULL;
@@ -1162,7 +1153,7 @@ static char* entry_path_copy_by_id(Ezdb* db, uint32_t id)
     if (!out) return NULL;
     long saved_pos = db->fp ? ftell(db->fp) : -1L;
     int rc = bitset_get(db->delta_entry_bits, id)
-        ? copy_delta_blob_range(db, db->delta_entry_refs[id].path_offset, len, (unsigned char*)out)
+        ? ezdb_entries_copy_delta_blob_range(db->fp, db->delta_entry_refs[id].path_offset, len, (unsigned char*)out)
         : ezdb_entries_copy_raw_blob_range(db->fp,
                                            db->raw_blob_pages,
                                            (uint32_t)db->header.raw_blob_page_count,
@@ -1919,7 +1910,10 @@ static int compact_entry_source_next(void* user_data, EzdbEntryRecord* out_recor
             source->raw_path = malloc(detail.raw_len);
             if (!source->raw_path) return EZDB_ERR_MEMORY;
             rc = bitset_get(db->delta_entry_bits, id)
-                ? copy_delta_blob_range(db, db->delta_entry_refs[id].raw_offset, detail.raw_len, (unsigned char*)source->raw_path)
+                ? ezdb_entries_copy_delta_blob_range(db->fp,
+                                                     db->delta_entry_refs[id].raw_offset,
+                                                     detail.raw_len,
+                                                     (unsigned char*)source->raw_path)
                 : ezdb_entries_copy_raw_blob_range(db->fp,
                                                    db->raw_blob_pages,
                                                    (uint32_t)db->header.raw_blob_page_count,
@@ -3977,7 +3971,10 @@ int ezdb_get_entry(Ezdb* db, uint32_t id, EzdbEntryResult* out_result)
             return EZDB_ERR_MEMORY;
         }
         rc = bitset_get(db->delta_entry_bits, id)
-            ? copy_delta_blob_range(db, db->delta_entry_refs[id].raw_offset, detail.raw_len, (unsigned char*)out_result->entry_raw_path)
+            ? ezdb_entries_copy_delta_blob_range(db->fp,
+                                                 db->delta_entry_refs[id].raw_offset,
+                                                 detail.raw_len,
+                                                 (unsigned char*)out_result->entry_raw_path)
             : ezdb_entries_copy_raw_blob_range(db->fp,
                                                db->raw_blob_pages,
                                                (uint32_t)db->header.raw_blob_page_count,
