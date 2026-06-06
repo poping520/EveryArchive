@@ -326,6 +326,100 @@ void* ezdb_entries_copy_raw_path(const EzdbEntryPathStore* store, uint32_t id, c
     return out;
 }
 
+static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record);
+static int array_entry_source_reset(void* user_data);
+static int array_entry_source_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end);
+static int array_entry_source_open_range(void* user_data,
+                                         uint32_t archive_begin,
+                                         uint32_t archive_end,
+                                         EzdbEntrySource* out_source);
+static void array_entry_source_close_range(EzdbEntrySource* source);
+
+static void array_entry_source_bind(EzdbEntrySource* source, EzdbArrayEntrySource* array_source)
+{
+    if (!source || !array_source) return;
+    memset(source, 0, sizeof(*source));
+    source->user_data = array_source;
+    source->reset = array_entry_source_reset;
+    source->reset_range = array_entry_source_reset_range;
+    source->next = array_entry_source_next;
+    source->open_range = array_entry_source_open_range;
+    source->close_range = array_entry_source_close_range;
+}
+
+static int array_entry_source_reset(void* user_data)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source) return EZDB_ERR_ARG;
+    source->index = 0;
+    source->archive_begin = 0;
+    source->archive_end = UINT32_MAX;
+    return EZDB_OK;
+}
+
+static int array_entry_source_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source || archive_begin > archive_end) return EZDB_ERR_ARG;
+    source->index = 0;
+    source->archive_begin = archive_begin;
+    source->archive_end = archive_end;
+    return EZDB_OK;
+}
+
+static int array_entry_source_open_range(void* user_data,
+                                         uint32_t archive_begin,
+                                         uint32_t archive_end,
+                                         EzdbEntrySource* out_source)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source || !out_source || archive_begin > archive_end) return EZDB_ERR_ARG;
+    EzdbArrayEntrySource* range_source = (EzdbArrayEntrySource*)malloc(sizeof(*range_source));
+    if (!range_source) return EZDB_ERR_MEMORY;
+    *range_source = *source;
+    int rc = array_entry_source_reset_range(range_source, archive_begin, archive_end);
+    if (rc != EZDB_OK) {
+        free(range_source);
+        return rc;
+    }
+    array_entry_source_bind(out_source, range_source);
+    return EZDB_OK;
+}
+
+static void array_entry_source_close_range(EzdbEntrySource* source)
+{
+    if (!source) return;
+    free(source->user_data);
+    memset(source, 0, sizeof(*source));
+}
+
+static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record)
+{
+    EzdbArrayEntrySource* source = (EzdbArrayEntrySource*)user_data;
+    if (!source || !out_record) return EZDB_ERR_ARG;
+    while (source->index < source->count) {
+        const EzdbEntryRecord* record = &source->entries[source->index++];
+        if (record->archive_id >= source->archive_begin && record->archive_id < source->archive_end) {
+            *out_record = *record;
+            return EZDB_OK;
+        }
+    }
+    return EZDB_ERR_NOT_FOUND;
+}
+
+void ezdb_entries_array_source_init(EzdbEntrySource* source,
+                                    EzdbArrayEntrySource* array_source,
+                                    const EzdbEntryRecord* entries,
+                                    uint32_t count)
+{
+    if (!source || !array_source) return;
+    memset(array_source, 0, sizeof(*array_source));
+    array_source->entries = entries;
+    array_source->count = count;
+    array_source->archive_end = UINT32_MAX;
+    array_entry_source_bind(source, array_source);
+}
+
 static int compact_entry_is_searchable(const EzdbCompactEntrySource* source, uint32_t entry_id)
 {
     if (!source || entry_id >= source->detail_store.entry_count ||

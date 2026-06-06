@@ -28,6 +28,14 @@ typedef struct EzdbEntrySource {
     void (*close_range)(struct EzdbEntrySource* source);
 } EzdbEntrySource;
 
+typedef struct EzdbArrayEntrySource {
+    const EzdbEntryRecord* entries;
+    uint32_t index;
+    uint32_t count;
+    uint32_t archive_begin;
+    uint32_t archive_end;
+} EzdbArrayEntrySource;
+
 typedef struct EzdbEntryPagedWriter {
     FILE* out;
     uint32_t page_size;
@@ -114,6 +122,10 @@ int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, 
 int ezdb_entries_load_detail(const EzdbEntryDetailStore* store, uint32_t id, EzdbDiskEntry* out);
 char* ezdb_entries_copy_path(const EzdbEntryPathStore* store, uint32_t id);
 void* ezdb_entries_copy_raw_path(const EzdbEntryPathStore* store, uint32_t id, const EzdbDiskEntry* detail);
+void ezdb_entries_array_source_init(EzdbEntrySource* source,
+                                    EzdbArrayEntrySource* array_source,
+                                    const EzdbEntryRecord* entries,
+                                    uint32_t count);
 void ezdb_entries_compact_source_clear_current(EzdbCompactEntrySource* source);
 int ezdb_entries_compact_source_reset(void* user_data);
 int ezdb_entries_compact_source_next(void* user_data, EzdbEntryRecord* out_record);

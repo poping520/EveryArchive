@@ -33,7 +33,7 @@ ezdb v13 的目标是为 `build-zip-entries` 建立一个更快、更低内存�
 | 多线程 postings 构建 | 已完成 | pass 1 count、reduce、slice prepare、pass 2 fill 已并行化 |
 | query 主流程拆分 | 部分完成 | parser/helper 已迁出，`search/search-v2/query_entries` 主流程仍在 `ezdb.c` |
 | delta 模块拆分 | 未开始 | insert/update/delete/compact 仍在 `ezdb.c` |
-| entries 模块拆分 | 部分完成 | entry 写入相关还在 `ezdb.c`，stream 数据结构已存在 |
+| entries 模块拆分 | 部分完成 | entry source、读路径 helper 和分页 writer 已迁入；entry section 写入编排仍在 `ezdb.c` |
 | build 模块拆分 | 未开始 | snapshot build 编排仍在 `ezdb.c` |
 
 ## 已完成工作
@@ -352,6 +352,7 @@ typedef struct EzdbSectionDesc {
 计划迁入：
 
 - `EzdbEntrySource`（已迁入 `ezdb_entries.h`）
+- `EzdbArrayEntrySource`（已迁入 `ezdb_entries.c/.h`，保留 `open_range/close_range` 并行读取接口）
 - `EzdbCompactEntrySource`（已迁入 `ezdb_entries.c/.h`）
 - entry stream reader/writer（已迁出 entry paged writer helper）
 - entry core writer/reader（已迁出 core 12 字节 encode/decode helper）
@@ -367,7 +368,8 @@ typedef struct EzdbSectionDesc {
 2. 迁出 entry detail/raw blob page cache。（已开始：cache entry 类型、加载 helper 和释放 helper 已迁入 `ezdb_entries.c/.h`）
 3. 迁出 `entry_path_copy_by_id`、`load_entry_detail`。（已完成二者读取逻辑迁出）
 4. 迁出 compact entry source。（已完成）
-5. 与 v13 section descriptor 对接。
+5. 迁出 array entry source。（已完成）
+6. 与 v13 section descriptor 对接。
 
 ### 4. query 模块拆分
 
@@ -488,7 +490,7 @@ v13 调整：
 状态：部分完成。
 
 - [x] 新建 `ezdb_entries.c/.h`。
-- [ ] 迁出 entry core/detail/raw blob 读写。
+- [ ] 迁出 entry core/detail/raw blob 读写。（已迁出 core encode/decode、detail/raw blob 读路径、分页 writer 和 array source；entry section 写入编排仍在 `ezdb.c`）
 - [x] 新建 `ezdb_query.c/.h`。
 - [x] 迁出 query parser。
 - [ ] 迁出 archive/entry search。
@@ -554,9 +556,9 @@ v13 调整：
 
 - 已提交阶段性重构：`b5a52f6 Refactor ezdb v13 format and query modules`。
 - 已修复 v13 live entry append 重新 open：v13 header 严格保留 `base_archive_count/base_entry_count`，并修复 delta replay 中读取 entry path 后未恢复文件位置的问题。
-- Debug 构建 `EzdbBench` 通过。
-- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper、entry detail reader helper 与 entry paged writer helper；entry section 写入循环仍待继续迁出。
-- `EzdbEntrySource` 内部 stream interface 和 `EzdbCompactEntrySource` 已迁入 `ezdb_entries.c/.h`，build 仍先复用 `ezdb.c` 中的 source 实现。
+- Debug/Release 构建 `EzdbBench` 通过。
+- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper、entry detail reader helper、entry paged writer helper 与 array entry source；entry section 写入循环仍待继续迁出。
+- `EzdbEntrySource` 内部 stream interface、`EzdbArrayEntrySource` 和 `EzdbCompactEntrySource` 已迁入 `ezdb_entries.c/.h`，array source 保留 `open_range/close_range` 以支持并行 entry index 构建。
 - entry detail/raw blob page cache 的 cache entry 类型、加载 helper 和释放 helper 已迁入 `ezdb_entries.c/.h`；entry detail reader helper、entry path copy helper、entry raw path copy helper、base raw blob range copy helper 和 delta blob range copy helper 已迁出，`search-v2` entry emit raw path 读取已统一走 entries helper。
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper。
@@ -567,6 +569,7 @@ v13 调整：
 - `EzdbBench` 已新增 `query-entries` 命令，`EzdbZipFixtureTests` 已覆盖 `query_entries`、wildcard、archive insert/update/delete 和 compact 后 entry 查询回归。
 - `EzdbZipFixtureTests` 已覆盖连续两次 fresh build 的关键查询确定性、`build-zip-entries` temp dir 成功清理和缺失 ZIP 解析失败路径；同时修复 compact 使用同一 archive id map 导致 entry archive remap 被覆盖的问题。
 - `EzdbZipFixtureTests` 已加入手写最小 ZIP64 central directory fixture 和非 UTF-8 raw entry name fixture，覆盖 ZIP64 extra 解析、ACP raw path 解码和 raw path 保留。
+- 2026-06-06 本机继续阶段 B：迁出 `EzdbArrayEntrySource` 到 entries 模块；`cmake --build cmake-build-codex-release --config Release --target EzdbBench` 通过；`ctest --test-dir cmake-build-codex-release -C Release -R EzdbZipFixtureTests --output-on-failure` 通过。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -575,7 +578,7 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 B/C 的 entries/query/v13 header 收敛，优先继续迁出 entry detail/raw blob 读写，或处理 `EzdbHeader` 运行期映射依赖。
+- 下一步继续阶段 B/C 的 entries/query/v13 header 收敛，优先把 `ezdb_write_entries_from_source` 的 entry section 写入编排继续拆入 entries/build 边界，或处理 `EzdbHeader` 运行期映射依赖。
 
 ## 风险与注意事项
 
