@@ -18,6 +18,7 @@
  */
 
 #include "ezdb.h"
+#include "ezdb_entries.h"
 #include "ezdb_internal.h"
 #include "ezdb_io.h"
 #include "ezdb_postings.h"
@@ -35,11 +36,6 @@
 #include <psapi.h>
 
 #define EZDB_WRITE_TXN_ACTIVE 1u
-#define EZDB_ENTRY_PAGE_SIZE 4096u
-#define EZDB_RAW_BLOB_PAGE_SIZE (256u * 1024u)
-#define EZDB_ENTRY_DETAIL_CACHE_PAGES 8u
-#define EZDB_RAW_BLOB_CACHE_PAGES 64u
-#define EZDB_ENTRY_CORE_RECORD_SIZE 12u
 
 typedef struct EzdbDeltaRecord {
     uint32_t id;
@@ -1172,16 +1168,15 @@ static int decode_entry_core(Ezdb* db, const unsigned char* raw, uint64_t raw_si
     if (!db->header.entry_count) return EZDB_OK;
     for (uint32_t i = 0; i < db->header.entry_count; ++i) {
         const unsigned char* p = raw + (uint64_t)i * EZDB_ENTRY_CORE_RECORD_SIZE;
-        uint32_t archive_id = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-        uint32_t path_offset = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
-        uint32_t path_len = (uint32_t)p[8] | ((uint32_t)p[9] << 8) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
-        if (archive_id >= db->header.file_count ||
-            (uint64_t)path_offset + path_len > db->header.raw_blob_raw_size) {
+        EzdbDiskEntry core;
+        ezdb_entries_decode_core(p, &core);
+        if (core.archive_id >= db->header.file_count ||
+            (uint64_t)core.entry_path_offset + core.entry_path_len > db->header.raw_blob_raw_size) {
             return EZDB_ERR_FORMAT;
         }
-        db->entry_archive_ids[i] = archive_id;
-        db->entry_path_offsets[i] = path_offset;
-        db->entry_path_lens[i] = path_len;
+        db->entry_archive_ids[i] = core.archive_id;
+        db->entry_path_offsets[i] = core.entry_path_offset;
+        db->entry_path_lens[i] = core.entry_path_len;
     }
     return EZDB_OK;
 }
@@ -2448,18 +2443,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         if (rc != EZDB_OK) break;
 
         unsigned char core[EZDB_ENTRY_CORE_RECORD_SIZE];
-        core[0] = (unsigned char)(disk_entry.archive_id & 0xffu);
-        core[1] = (unsigned char)((disk_entry.archive_id >> 8) & 0xffu);
-        core[2] = (unsigned char)((disk_entry.archive_id >> 16) & 0xffu);
-        core[3] = (unsigned char)((disk_entry.archive_id >> 24) & 0xffu);
-        core[4] = (unsigned char)(disk_entry.entry_path_offset & 0xffu);
-        core[5] = (unsigned char)((disk_entry.entry_path_offset >> 8) & 0xffu);
-        core[6] = (unsigned char)((disk_entry.entry_path_offset >> 16) & 0xffu);
-        core[7] = (unsigned char)((disk_entry.entry_path_offset >> 24) & 0xffu);
-        core[8] = (unsigned char)(disk_entry.entry_path_len & 0xffu);
-        core[9] = (unsigned char)((disk_entry.entry_path_len >> 8) & 0xffu);
-        core[10] = (unsigned char)((disk_entry.entry_path_len >> 16) & 0xffu);
-        core[11] = (unsigned char)((disk_entry.entry_path_len >> 24) & 0xffu);
+        ezdb_entries_encode_core(&disk_entry, core);
         if (fwrite(core, 1, sizeof(core), core_fp) != sizeof(core)) {
             rc = EZDB_ERR_IO;
             break;
