@@ -44,6 +44,22 @@ typedef struct EzdbEntryDetailStore {
     const EzdbDeltaEntryRef* delta_refs;
 } EzdbEntryDetailStore;
 
+typedef struct EzdbEntryPathStore {
+    FILE* fp;
+    uint32_t entry_count;
+    const uint32_t* path_offsets;
+    const uint32_t* path_lens;
+    const unsigned char* delta_bits;
+    const EzdbDeltaEntryRef* delta_refs;
+    EzdbDiskPage* raw_blob_pages;
+    uint32_t raw_blob_page_count;
+    uint64_t raw_blob_section_offset;
+    uint64_t raw_blob_raw_size;
+    EzdbPageCacheEntry* raw_blob_cache;
+    uint32_t raw_blob_cache_count;
+    uint64_t* cache_tick;
+} EzdbEntryPathStore;
+
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
 int ezdb_entries_load_page_cached(FILE* fp,
                                   EzdbDiskPage* pages,
@@ -68,5 +84,6 @@ int ezdb_entries_copy_raw_blob_range(FILE* fp,
                                      unsigned char* out);
 int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, unsigned char* out);
 int ezdb_entries_load_detail(const EzdbEntryDetailStore* store, uint32_t id, EzdbDiskEntry* out);
+char* ezdb_entries_copy_path(const EzdbEntryPathStore* store, uint32_t id);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);

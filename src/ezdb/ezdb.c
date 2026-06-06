@@ -112,7 +112,7 @@ static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, cons
 static int entry_is_searchable(Ezdb* db, uint32_t entry_id);
 static uint64_t ezdb_delta_append_offset(Ezdb* db);
 static EzdbEntryDetailStore entry_detail_store(Ezdb* db);
-static char* entry_path_copy_by_id(Ezdb* db, uint32_t id);
+static EzdbEntryPathStore entry_path_store(Ezdb* db);
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path);
 
 typedef struct EzdbCompactEntrySource {
@@ -718,6 +718,7 @@ static int deactivate_entries_for_archive(Ezdb* db, uint32_t archive_id)
 {
     if (!db || archive_id >= db->header.file_count) return EZDB_ERR_NOT_FOUND;
     if (!db->archive_first_entry_ids || !db->entry_next_in_archive) return EZDB_OK;
+    EzdbEntryPathStore path_store = entry_path_store(db);
     uint32_t e = db->archive_first_entry_ids[archive_id];
     db->archive_first_entry_ids[archive_id] = UINT32_MAX;
     while (e != UINT32_MAX && e < db->header.entry_count) {
@@ -725,7 +726,7 @@ static int deactivate_entries_for_archive(Ezdb* db, uint32_t archive_id)
         db->entry_next_in_archive[e] = UINT32_MAX;
         if (db->entry_archive_ids[e] == archive_id && bitset_get(db->active_entry_bits, e)) {
             if (bitset_get(db->delta_entry_bits, e)) {
-                char* entry_path = entry_path_copy_by_id(db, e);
+                char* entry_path = ezdb_entries_copy_path(&path_store, e);
                 if (entry_path) {
                     int rc = delta_entry_index_remove_path(db, e, entry_path);
                     free(entry_path);
@@ -821,9 +822,10 @@ static int rebuild_delta_entry_index(Ezdb* db)
     ezdb_postings_builder_free(&db->delta_entry_index);
     memset(&db->delta_entry_index, 0, sizeof(db->delta_entry_index));
     db->delta_entry_index_ready = 0;
+    EzdbEntryPathStore path_store = entry_path_store(db);
     for (uint32_t e = 0; e < db->header.entry_count; ++e) {
         if (!bitset_get(db->active_entry_bits, e) || !bitset_get(db->delta_entry_bits, e)) continue;
-        char* entry_path = entry_path_copy_by_id(db, e);
+        char* entry_path = ezdb_entries_copy_path(&path_store, e);
         if (!entry_path) continue;
         int rc = delta_entry_index_add_path(db, e, entry_path);
         free(entry_path);
@@ -1124,33 +1126,25 @@ static EzdbEntryDetailStore entry_detail_store(Ezdb* db)
     return store;
 }
 
-static char* entry_path_copy_by_id(Ezdb* db, uint32_t id)
+static EzdbEntryPathStore entry_path_store(Ezdb* db)
 {
-    if (!db || id >= db->header.entry_count) return NULL;
-    uint32_t len = db->entry_path_lens[id];
-    char* out = (char*)malloc((size_t)len + 1u);
-    if (!out) return NULL;
-    long saved_pos = db->fp ? ftell(db->fp) : -1L;
-    int rc = bitset_get(db->delta_entry_bits, id)
-        ? ezdb_entries_copy_delta_blob_range(db->fp, db->delta_entry_refs[id].path_offset, len, (unsigned char*)out)
-        : ezdb_entries_copy_raw_blob_range(db->fp,
-                                           db->raw_blob_pages,
-                                           (uint32_t)db->header.raw_blob_page_count,
-                                           db->header.raw_blob_offset,
-                                           db->header.raw_blob_raw_size,
-                                           db->raw_blob_cache,
-                                           EZDB_RAW_BLOB_CACHE_PAGES,
-                                           &db->cache_tick,
-                                           db->entry_path_offsets[id],
-                                           len,
-                                           (unsigned char*)out);
-    if (saved_pos >= 0 && fseek(db->fp, saved_pos, SEEK_SET) != 0) rc = EZDB_ERR_IO;
-    if (rc != EZDB_OK) {
-        free(out);
-        return NULL;
-    }
-    out[len] = '\0';
-    return out;
+    EzdbEntryPathStore store;
+    memset(&store, 0, sizeof(store));
+    if (!db) return store;
+    store.fp = db->fp;
+    store.entry_count = (uint32_t)db->header.entry_count;
+    store.path_offsets = db->entry_path_offsets;
+    store.path_lens = db->entry_path_lens;
+    store.delta_bits = db->delta_entry_bits;
+    store.delta_refs = db->delta_entry_refs;
+    store.raw_blob_pages = db->raw_blob_pages;
+    store.raw_blob_page_count = (uint32_t)db->header.raw_blob_page_count;
+    store.raw_blob_section_offset = db->header.raw_blob_offset;
+    store.raw_blob_raw_size = db->header.raw_blob_raw_size;
+    store.raw_blob_cache = db->raw_blob_cache;
+    store.raw_blob_cache_count = EZDB_RAW_BLOB_CACHE_PAGES;
+    store.cache_tick = &db->cache_tick;
+    return store;
 }
 
 static int replay_delta_log(Ezdb* db)
@@ -1196,7 +1190,8 @@ static int replay_delta_log(Ezdb* db)
             bitset_set(db->active_entry_bits, eh.id, 1);
             bitset_set(db->delta_entry_bits, eh.id, 1);
             link_entry_to_archive(db, eh.id, eh.archive_id);
-            char* entry_path = entry_path_copy_by_id(db, eh.id);
+            EzdbEntryPathStore path_store = entry_path_store(db);
+            char* entry_path = ezdb_entries_copy_path(&path_store, eh.id);
             if (entry_path) {
                 int rc = delta_entry_index_add_path(db, eh.id, entry_path);
                 free(entry_path);
@@ -1878,7 +1873,8 @@ static int compact_entry_source_next(void* user_data, EzdbEntryRecord* out_recor
         int rc = ezdb_entries_load_detail(&store, id, &detail);
         if (rc != EZDB_OK) return rc;
         if (detail.archive_id >= db->header.file_count || source->archive_id_map[detail.archive_id] == UINT32_MAX) continue;
-        source->entry_path = entry_path_copy_by_id(db, id);
+        EzdbEntryPathStore path_store = entry_path_store(db);
+        source->entry_path = ezdb_entries_copy_path(&path_store, id);
         if (!source->entry_path) return EZDB_ERR_MEMORY;
         memset(out_record, 0, sizeof(*out_record));
         out_record->archive_id = source->archive_id_map[detail.archive_id];
@@ -3928,7 +3924,8 @@ int ezdb_get_entry(Ezdb* db, uint32_t id, EzdbEntryResult* out_result)
     int rc = ezdb_entries_load_detail(&store, id, &detail);
     if (rc != EZDB_OK) return rc;
     if (detail.archive_id >= db->header.file_count || !bitset_get(db->active_bits, detail.archive_id)) return EZDB_ERR_NOT_FOUND;
-    char* entry_path = entry_path_copy_by_id(db, id);
+    EzdbEntryPathStore path_store = entry_path_store(db);
+    char* entry_path = ezdb_entries_copy_path(&path_store, id);
     if (!entry_path) return EZDB_ERR_MEMORY;
 
     memset(out_result, 0, sizeof(*out_result));
@@ -4277,6 +4274,7 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
         ezdb_query_node_free(root);
         return EZDB_OK;
     }
+    EzdbEntryPathStore path_store = entry_path_store(db);
     for (uint32_t id = 0; rc == EZDB_OK && id < db->header.entry_count; ++id) {
         if (limit && emitted >= limit) break;
         if (full_entry_scan) {
@@ -4286,7 +4284,7 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
         }
         uint32_t archive_id = db->entry_archive_ids[id];
         if (archive_id >= db->header.file_count || !bitset_get(db->active_bits, archive_id)) continue;
-        char* entry_path = entry_path_copy_by_id(db, id);
+        char* entry_path = ezdb_entries_copy_path(&path_store, id);
         if (!entry_path) continue;
         uint32_t entry_path_len = db->entry_path_lens[id];
         int matched = 0;
@@ -4436,6 +4434,7 @@ static int ezdb_collect_matching_entry_ids(Ezdb* db, const char* keyword, uint32
         return EZDB_OK;
     }
 
+    EzdbEntryPathStore path_store = entry_path_store(db);
     for (uint32_t id = 0; rc == EZDB_OK && id < db->header.entry_count; ++id) {
         if (full_entry_scan) {
             if (!bitset_get(db->active_entry_bits, id)) continue;
@@ -4444,7 +4443,7 @@ static int ezdb_collect_matching_entry_ids(Ezdb* db, const char* keyword, uint32
         }
         uint32_t archive_id = db->entry_archive_ids[id];
         if (archive_id >= db->header.file_count || !bitset_get(db->active_bits, archive_id)) continue;
-        char* entry_path = entry_path_copy_by_id(db, id);
+        char* entry_path = ezdb_entries_copy_path(&path_store, id);
         if (!entry_path) continue;
         int matched = 0;
         rc = ezdb_entry_matches_query_scope(db,
