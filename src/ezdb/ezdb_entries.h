@@ -28,6 +28,18 @@ typedef struct EzdbEntrySource {
     void (*close_range)(struct EzdbEntrySource* source);
 } EzdbEntrySource;
 
+typedef struct EzdbEntryPagedWriter {
+    FILE* out;
+    uint32_t page_size;
+    unsigned char* page;
+    uint32_t page_len;
+    EzdbDiskPage* pages;
+    uint32_t page_count;
+    uint32_t page_cap;
+    uint64_t written;
+    uint64_t raw_size;
+} EzdbEntryPagedWriter;
+
 typedef struct EzdbEntryDetailStore {
     FILE* fp;
     EzdbDiskPage* pages;
@@ -73,6 +85,10 @@ typedef struct EzdbCompactEntrySource {
 } EzdbCompactEntrySource;
 
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
+int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size);
+void ezdb_entries_paged_writer_free(EzdbEntryPagedWriter* writer);
+int ezdb_entries_paged_writer_write(EzdbEntryPagedWriter* writer, const void* data, uint32_t len);
+int ezdb_entries_paged_writer_finish(EzdbEntryPagedWriter* writer);
 int ezdb_entries_load_page_cached(FILE* fp,
                                   EzdbDiskPage* pages,
                                   uint32_t page_count,

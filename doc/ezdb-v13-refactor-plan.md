@@ -353,10 +353,10 @@ typedef struct EzdbSectionDesc {
 
 - `EzdbEntrySource`（已迁入 `ezdb_entries.h`）
 - `EzdbCompactEntrySource`（已迁入 `ezdb_entries.c/.h`）
-- entry stream reader/writer
+- entry stream reader/writer（已迁出 entry paged writer helper）
 - entry core writer/reader（已迁出 core 12 字节 encode/decode helper）
 - entry detail page writer/reader（已迁出 entry detail reader helper）
-- raw blob page writer/reader（已迁出 base raw blob range copy helper 和 delta blob range copy helper）
+- raw blob page writer/reader（已迁出 entry paged writer helper、base raw blob range copy helper 和 delta blob range copy helper）
 - entry page cache（已迁出 cache entry 类型、加载 helper 和释放 helper）
 - entry path/raw path copy helpers（已迁出 entry path copy helper、entry raw path copy helper、base raw blob range copy helper 和 delta blob range copy helper）
 - archive -> entry link rebuild
@@ -555,7 +555,7 @@ v13 调整：
 - 已提交阶段性重构：`b5a52f6 Refactor ezdb v13 format and query modules`。
 - 已修复 v13 live entry append 重新 open：v13 header 严格保留 `base_archive_count/base_entry_count`，并修复 delta replay 中读取 entry path 后未恢复文件位置的问题。
 - Debug 构建 `EzdbBench` 通过。
-- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper 与 entry detail reader helper；raw blob 写入仍待继续迁出。
+- `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper、entry detail reader helper 与 entry paged writer helper；entry section 写入循环仍待继续迁出。
 - `EzdbEntrySource` 内部 stream interface 和 `EzdbCompactEntrySource` 已迁入 `ezdb_entries.c/.h`，build 仍先复用 `ezdb.c` 中的 source 实现。
 - entry detail/raw blob page cache 的 cache entry 类型、加载 helper 和释放 helper 已迁入 `ezdb_entries.c/.h`；entry detail reader helper、entry path copy helper、entry raw path copy helper、base raw blob range copy helper 和 delta blob range copy helper 已迁出，`search-v2` entry emit raw path 读取已统一走 entries helper。
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ezdb v7 path-tree index
  * =======================
  *
@@ -95,18 +95,6 @@ typedef struct EzdbBuildOptionsResolved {
     uint32_t index_threads;
     uint32_t zip_threads;
 } EzdbBuildOptionsResolved;
-
-typedef struct StreamPagedWriter {
-    FILE* out;
-    uint32_t page_size;
-    unsigned char* page;
-    uint32_t page_len;
-    EzdbDiskPage* pages;
-    uint32_t page_count;
-    uint32_t page_cap;
-    uint64_t written;
-    uint64_t raw_size;
-} StreamPagedWriter;
 
 static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, const void* bytes, uint32_t len, uint32_t extra_nul, uint32_t* out_offset);
 static int entry_is_searchable(Ezdb* db, uint32_t entry_id);
@@ -975,74 +963,6 @@ static int ensure_directory_exists(const char* path)
     if (!path || !path[0]) return EZDB_ERR_ARG;
     if (_mkdir(path) == 0 || errno == EEXIST) return EZDB_OK;
     return EZDB_ERR_IO;
-}
-
-static int stream_paged_writer_init(StreamPagedWriter* writer, FILE* out, uint32_t page_size)
-{
-    if (!writer || !out || !page_size) return EZDB_ERR_ARG;
-    memset(writer, 0, sizeof(*writer));
-    writer->out = out;
-    writer->page_size = page_size;
-    writer->page = (unsigned char*)malloc(page_size);
-    if (!writer->page) return EZDB_ERR_MEMORY;
-    return EZDB_OK;
-}
-
-static void stream_paged_writer_free(StreamPagedWriter* writer)
-{
-    if (!writer) return;
-    free(writer->page);
-    free(writer->pages);
-    memset(writer, 0, sizeof(*writer));
-}
-
-static int stream_paged_writer_flush_page(StreamPagedWriter* writer)
-{
-    if (!writer || !writer->out) return EZDB_ERR_ARG;
-    if (!writer->page_len) return EZDB_OK;
-    if (ensure_capacity((void**)&writer->pages, sizeof(EzdbDiskPage), &writer->page_cap, writer->page_count + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
-    unsigned char* payload = NULL;
-    uint64_t payload_size = 0;
-    uint32_t flags = 0;
-    int rc = maybe_compress_section(writer->page, writer->page_len, &payload, &payload_size, &flags);
-    if (rc != EZDB_OK) return rc;
-    EzdbDiskPage* page = &writer->pages[writer->page_count++];
-    page->offset = writer->written;
-    page->encoded_size = (uint32_t)payload_size;
-    page->raw_size = writer->page_len;
-    page->flags = flags;
-    page->reserved = 0;
-    if (payload_size && fwrite(payload, 1, (size_t)payload_size, writer->out) != (size_t)payload_size) rc = EZDB_ERR_IO;
-    free(payload);
-    if (rc != EZDB_OK) return rc;
-    writer->written += payload_size;
-    writer->page_len = 0;
-    return EZDB_OK;
-}
-
-static int stream_paged_writer_write(StreamPagedWriter* writer, const void* data, uint32_t len)
-{
-    if (!writer || (!data && len)) return EZDB_ERR_ARG;
-    const unsigned char* p = (const unsigned char*)data;
-    while (len) {
-        uint32_t room = writer->page_size - writer->page_len;
-        uint32_t take = len < room ? len : room;
-        memcpy(writer->page + writer->page_len, p, take);
-        writer->page_len += take;
-        writer->raw_size += take;
-        p += take;
-        len -= take;
-        if (writer->page_len == writer->page_size) {
-            int rc = stream_paged_writer_flush_page(writer);
-            if (rc != EZDB_OK) return rc;
-        }
-    }
-    return EZDB_OK;
-}
-
-static int stream_paged_writer_finish(StreamPagedWriter* writer)
-{
-    return stream_paged_writer_flush_page(writer);
 }
 
 static int copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_written)
@@ -2113,8 +2033,8 @@ static int ezdb_write_entries_from_source(FILE* out,
     FILE* core_fp = NULL;
     FILE* detail_fp = NULL;
     FILE* raw_fp = NULL;
-    StreamPagedWriter detail_writer;
-    StreamPagedWriter raw_writer;
+    EzdbEntryPagedWriter detail_writer;
+    EzdbEntryPagedWriter raw_writer;
     PostingBuilder entry_builder;
     int detail_writer_ready = 0;
     int raw_writer_ready = 0;
@@ -2163,11 +2083,11 @@ static int ezdb_write_entries_from_source(FILE* out,
         if (!core_fp || !detail_fp || !raw_fp) rc = EZDB_ERR_IO;
     }
     if (rc == EZDB_OK) {
-        rc = stream_paged_writer_init(&detail_writer, detail_fp, sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE);
+        rc = ezdb_entries_paged_writer_init(&detail_writer, detail_fp, sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE);
         if (rc == EZDB_OK) detail_writer_ready = 1;
     }
     if (rc == EZDB_OK) {
-        rc = stream_paged_writer_init(&raw_writer, raw_fp, EZDB_RAW_BLOB_PAGE_SIZE);
+        rc = ezdb_entries_paged_writer_init(&raw_writer, raw_fp, EZDB_RAW_BLOB_PAGE_SIZE);
         if (rc == EZDB_OK) raw_writer_ready = 1;
     }
     if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
@@ -2223,10 +2143,10 @@ static int ezdb_write_entries_from_source(FILE* out,
             break;
         }
         uint32_t path_offset = (uint32_t)raw_writer.raw_size;
-        rc = stream_paged_writer_write(&raw_writer, record.entry_path, path_len);
+        rc = ezdb_entries_paged_writer_write(&raw_writer, record.entry_path, path_len);
         if (rc == EZDB_OK) {
             unsigned char zero = 0;
-            rc = stream_paged_writer_write(&raw_writer, &zero, 1u);
+            rc = ezdb_entries_paged_writer_write(&raw_writer, &zero, 1u);
         }
         if (rc != EZDB_OK) break;
         EzdbDiskEntry disk_entry;
@@ -2244,10 +2164,10 @@ static int ezdb_write_entries_from_source(FILE* out,
             }
             disk_entry.raw_offset = (uint32_t)raw_writer.raw_size;
             disk_entry.raw_len = record.entry_raw_path_len;
-            rc = stream_paged_writer_write(&raw_writer, record.entry_raw_path, record.entry_raw_path_len);
+            rc = ezdb_entries_paged_writer_write(&raw_writer, record.entry_raw_path, record.entry_raw_path_len);
             if (rc != EZDB_OK) break;
         }
-        rc = stream_paged_writer_write(&detail_writer, &disk_entry, sizeof(disk_entry));
+        rc = ezdb_entries_paged_writer_write(&detail_writer, &disk_entry, sizeof(disk_entry));
         if (rc != EZDB_OK) break;
 
         unsigned char core[EZDB_ENTRY_CORE_RECORD_SIZE];
@@ -2265,8 +2185,8 @@ static int ezdb_write_entries_from_source(FILE* out,
     stream_total_ms = ezdb_now_ms() - stage_start_ms;
     index_count_ms = parallel_count_possible ? 0.0 : stream_total_ms;
     if (rc == EZDB_OK) {
-        if (stream_paged_writer_finish(&detail_writer) != EZDB_OK) rc = EZDB_ERR_IO;
-        if (rc == EZDB_OK && stream_paged_writer_finish(&raw_writer) != EZDB_OK) rc = EZDB_ERR_IO;
+        if (ezdb_entries_paged_writer_finish(&detail_writer) != EZDB_OK) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK && ezdb_entries_paged_writer_finish(&raw_writer) != EZDB_OK) rc = EZDB_ERR_IO;
         if (core_fp && fclose(core_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
         core_fp = NULL;
         if (detail_fp && fclose(detail_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
@@ -2444,8 +2364,8 @@ static int ezdb_write_entries_from_source(FILE* out,
     entry_index_parallel_state_free(&parallel_state);
     free(archive_entry_counts);
     free(archive_entry_bases);
-    if (detail_writer_ready) stream_paged_writer_free(&detail_writer);
-    if (raw_writer_ready) stream_paged_writer_free(&raw_writer);
+    if (detail_writer_ready) ezdb_entries_paged_writer_free(&detail_writer);
+    if (raw_writer_ready) ezdb_entries_paged_writer_free(&raw_writer);
     remove(core_path);
     remove(detail_path);
     remove(raw_path);

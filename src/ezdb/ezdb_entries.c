@@ -9,6 +9,25 @@ static int entry_bitset_get(const unsigned char* bits, uint32_t id)
     return bits && (bits[id >> 3u] & (unsigned char)(1u << (id & 7u)));
 }
 
+static int entries_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed)
+{
+    if (!data || !capacity || !elem_size) return EZDB_ERR_ARG;
+    if (needed <= *capacity) return EZDB_OK;
+    uint32_t cap = *capacity ? *capacity : 16u;
+    while (cap < needed) {
+        if (cap > UINT32_MAX / 2u) {
+            cap = needed;
+            break;
+        }
+        cap *= 2u;
+    }
+    void* p = realloc(*data, elem_size * (size_t)cap);
+    if (!p) return EZDB_ERR_MEMORY;
+    *data = p;
+    *capacity = cap;
+    return EZDB_OK;
+}
+
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
 {
     if (!cache) return;
@@ -16,6 +35,79 @@ void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
         free(cache[i].data);
         memset(&cache[i], 0, sizeof(cache[i]));
     }
+}
+
+int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size)
+{
+    if (!writer || !out || !page_size) return EZDB_ERR_ARG;
+    memset(writer, 0, sizeof(*writer));
+    writer->out = out;
+    writer->page_size = page_size;
+    writer->page = (unsigned char*)malloc(page_size);
+    if (!writer->page) return EZDB_ERR_MEMORY;
+    return EZDB_OK;
+}
+
+void ezdb_entries_paged_writer_free(EzdbEntryPagedWriter* writer)
+{
+    if (!writer) return;
+    free(writer->page);
+    free(writer->pages);
+    memset(writer, 0, sizeof(*writer));
+}
+
+static int entries_paged_writer_flush_page(EzdbEntryPagedWriter* writer)
+{
+    if (!writer || !writer->out) return EZDB_ERR_ARG;
+    if (!writer->page_len) return EZDB_OK;
+    if (entries_ensure_capacity((void**)&writer->pages,
+                                sizeof(EzdbDiskPage),
+                                &writer->page_cap,
+                                writer->page_count + 1u) != EZDB_OK) {
+        return EZDB_ERR_MEMORY;
+    }
+    unsigned char* payload = NULL;
+    uint64_t payload_size = 0;
+    uint32_t flags = 0;
+    int rc = ezdb_io_maybe_compress_section(writer->page, writer->page_len, &payload, &payload_size, &flags);
+    if (rc != EZDB_OK) return rc;
+    EzdbDiskPage* page = &writer->pages[writer->page_count++];
+    page->offset = writer->written;
+    page->encoded_size = (uint32_t)payload_size;
+    page->raw_size = writer->page_len;
+    page->flags = flags;
+    page->reserved = 0;
+    if (payload_size && fwrite(payload, 1, (size_t)payload_size, writer->out) != (size_t)payload_size) rc = EZDB_ERR_IO;
+    free(payload);
+    if (rc != EZDB_OK) return rc;
+    writer->written += payload_size;
+    writer->page_len = 0;
+    return EZDB_OK;
+}
+
+int ezdb_entries_paged_writer_write(EzdbEntryPagedWriter* writer, const void* data, uint32_t len)
+{
+    if (!writer || (!data && len)) return EZDB_ERR_ARG;
+    const unsigned char* p = (const unsigned char*)data;
+    while (len) {
+        uint32_t room = writer->page_size - writer->page_len;
+        uint32_t take = len < room ? len : room;
+        memcpy(writer->page + writer->page_len, p, take);
+        writer->page_len += take;
+        writer->raw_size += take;
+        p += take;
+        len -= take;
+        if (writer->page_len == writer->page_size) {
+            int rc = entries_paged_writer_flush_page(writer);
+            if (rc != EZDB_OK) return rc;
+        }
+    }
+    return EZDB_OK;
+}
+
+int ezdb_entries_paged_writer_finish(EzdbEntryPagedWriter* writer)
+{
+    return entries_paged_writer_flush_page(writer);
 }
 
 int ezdb_entries_load_page_cached(FILE* fp,
