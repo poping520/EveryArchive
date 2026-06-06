@@ -48,6 +48,12 @@ typedef struct EzdbEntryPagedWriter {
     uint64_t raw_size;
 } EzdbEntryPagedWriter;
 
+typedef struct EzdbEntrySectionWriter {
+    FILE* core_out;
+    EzdbEntryPagedWriter detail_writer;
+    EzdbEntryPagedWriter raw_writer;
+} EzdbEntrySectionWriter;
+
 typedef struct EzdbEntryDetailStore {
     FILE* fp;
     EzdbDiskPage* pages;
@@ -93,6 +99,15 @@ typedef struct EzdbCompactEntrySource {
 } EzdbCompactEntrySource;
 
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
+int ezdb_entries_section_writer_init(EzdbEntrySectionWriter* writer,
+                                     FILE* core_out,
+                                     FILE* detail_out,
+                                     FILE* raw_out);
+void ezdb_entries_section_writer_free(EzdbEntrySectionWriter* writer);
+int ezdb_entries_section_writer_add(EzdbEntrySectionWriter* writer,
+                                    const EzdbEntryRecord* record,
+                                    uint32_t final_archive_id);
+int ezdb_entries_section_writer_finish(EzdbEntrySectionWriter* writer);
 int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size);
 void ezdb_entries_paged_writer_free(EzdbEntryPagedWriter* writer);
 int ezdb_entries_paged_writer_write(EzdbEntryPagedWriter* writer, const void* data, uint32_t len);

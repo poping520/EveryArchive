@@ -1959,11 +1959,9 @@ static int ezdb_write_entries_from_source(FILE* out,
     FILE* core_fp = NULL;
     FILE* detail_fp = NULL;
     FILE* raw_fp = NULL;
-    EzdbEntryPagedWriter detail_writer;
-    EzdbEntryPagedWriter raw_writer;
+    EzdbEntrySectionWriter section_writer;
     PostingBuilder entry_builder;
-    int detail_writer_ready = 0;
-    int raw_writer_ready = 0;
+    int section_writer_ready = 0;
     int entry_builder_ready = 0;
     EzdbDiskIndex* entry_index = NULL;
     uint32_t entry_index_count = 0;
@@ -1992,8 +1990,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     memset(&entry_posting_stats, 0, sizeof(entry_posting_stats));
 
     if (!options) return EZDB_ERR_ARG;
-    memset(&detail_writer, 0, sizeof(detail_writer));
-    memset(&raw_writer, 0, sizeof(raw_writer));
+    memset(&section_writer, 0, sizeof(section_writer));
     memset(&entry_builder, 0, sizeof(entry_builder));
     memset(&parallel_state, 0, sizeof(parallel_state));
     if (snprintf(core_path, sizeof(core_path), "%s\\entry_core.tmp", options->temp_dir) >= (int)sizeof(core_path) ||
@@ -2009,12 +2006,8 @@ static int ezdb_write_entries_from_source(FILE* out,
         if (!core_fp || !detail_fp || !raw_fp) rc = EZDB_ERR_IO;
     }
     if (rc == EZDB_OK) {
-        rc = ezdb_entries_paged_writer_init(&detail_writer, detail_fp, sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE);
-        if (rc == EZDB_OK) detail_writer_ready = 1;
-    }
-    if (rc == EZDB_OK) {
-        rc = ezdb_entries_paged_writer_init(&raw_writer, raw_fp, EZDB_RAW_BLOB_PAGE_SIZE);
-        if (rc == EZDB_OK) raw_writer_ready = 1;
+        rc = ezdb_entries_section_writer_init(&section_writer, core_fp, detail_fp, raw_fp);
+        if (rc == EZDB_OK) section_writer_ready = 1;
     }
     if (rc == EZDB_OK && entry_count && (options->flags & EZDB_BUILD_ENTRY_INDEX)) {
         rc = ezdb_postings_builder_init(&entry_builder, 262144u);
@@ -2063,45 +2056,8 @@ static int ezdb_write_entries_from_source(FILE* out,
             archive_entry_counts[record.archive_id] += 1u;
             last_entry_archive_id = record.archive_id;
         }
-        uint32_t path_len = (uint32_t)strlen(record.entry_path);
-        if (raw_writer.raw_size > UINT32_MAX || raw_writer.raw_size + path_len + 1u > UINT32_MAX) {
-            rc = EZDB_ERR_MEMORY;
-            break;
-        }
-        uint32_t path_offset = (uint32_t)raw_writer.raw_size;
-        rc = ezdb_entries_paged_writer_write(&raw_writer, record.entry_path, path_len);
-        if (rc == EZDB_OK) {
-            unsigned char zero = 0;
-            rc = ezdb_entries_paged_writer_write(&raw_writer, &zero, 1u);
-        }
+        rc = ezdb_entries_section_writer_add(&section_writer, &record, final_archive_id);
         if (rc != EZDB_OK) break;
-        EzdbDiskEntry disk_entry;
-        memset(&disk_entry, 0, sizeof(disk_entry));
-        disk_entry.archive_id = final_archive_id;
-        disk_entry.entry_path_offset = path_offset;
-        disk_entry.entry_path_len = path_len;
-        disk_entry.compressed_size = record.compressed_size;
-        disk_entry.original_size = record.original_size;
-        disk_entry.modified_time = record.modified_time;
-        if (record.entry_raw_path && record.entry_raw_path_len) {
-            if (raw_writer.raw_size > UINT32_MAX || raw_writer.raw_size + record.entry_raw_path_len > UINT32_MAX) {
-                rc = EZDB_ERR_MEMORY;
-                break;
-            }
-            disk_entry.raw_offset = (uint32_t)raw_writer.raw_size;
-            disk_entry.raw_len = record.entry_raw_path_len;
-            rc = ezdb_entries_paged_writer_write(&raw_writer, record.entry_raw_path, record.entry_raw_path_len);
-            if (rc != EZDB_OK) break;
-        }
-        rc = ezdb_entries_paged_writer_write(&detail_writer, &disk_entry, sizeof(disk_entry));
-        if (rc != EZDB_OK) break;
-
-        unsigned char core[EZDB_ENTRY_CORE_RECORD_SIZE];
-        ezdb_entries_encode_core(&disk_entry, core);
-        if (fwrite(core, 1, sizeof(core), core_fp) != sizeof(core)) {
-            rc = EZDB_ERR_IO;
-            break;
-        }
 
         if (entry_builder_ready && !parallel_count_possible) {
             rc = ezdb_postings_count_text_grams(&entry_builder, record.entry_path, i);
@@ -2111,8 +2067,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     stream_total_ms = ezdb_now_ms() - stage_start_ms;
     index_count_ms = parallel_count_possible ? 0.0 : stream_total_ms;
     if (rc == EZDB_OK) {
-        if (ezdb_entries_paged_writer_finish(&detail_writer) != EZDB_OK) rc = EZDB_ERR_IO;
-        if (rc == EZDB_OK && ezdb_entries_paged_writer_finish(&raw_writer) != EZDB_OK) rc = EZDB_ERR_IO;
+        if (ezdb_entries_section_writer_finish(&section_writer) != EZDB_OK) rc = EZDB_ERR_IO;
         if (core_fp && fclose(core_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
         core_fp = NULL;
         if (detail_fp && fclose(detail_fp) != 0 && rc == EZDB_OK) rc = EZDB_ERR_IO;
@@ -2199,24 +2154,30 @@ static int ezdb_write_entries_from_source(FILE* out,
         rc = copy_file_payload(out, detail_path, &detail_written);
         header->entry_detail_size = detail_written;
         header->entry_detail_index_offset = (uint64_t)ftell(out);
-        header->entry_detail_page_count = detail_writer.page_count;
+        header->entry_detail_page_count = section_writer.detail_writer.page_count;
         header->entry_page_size = EZDB_ENTRY_PAGE_SIZE;
-        if (rc == EZDB_OK && detail_writer.page_count &&
-            fwrite(detail_writer.pages, sizeof(EzdbDiskPage), detail_writer.page_count, out) != detail_writer.page_count) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK && section_writer.detail_writer.page_count &&
+            fwrite(section_writer.detail_writer.pages,
+                   sizeof(EzdbDiskPage),
+                   section_writer.detail_writer.page_count,
+                   out) != section_writer.detail_writer.page_count) rc = EZDB_ERR_IO;
         write_detail_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
         stage_start_ms = ezdb_now_ms();
         uint64_t raw_written = 0;
         header->raw_blob_offset = (uint64_t)ftell(out);
-        header->raw_blob_raw_size = raw_writer.raw_size;
+        header->raw_blob_raw_size = section_writer.raw_writer.raw_size;
         rc = copy_file_payload(out, raw_path, &raw_written);
         header->raw_blob_size = raw_written;
         header->raw_blob_index_offset = (uint64_t)ftell(out);
-        header->raw_blob_page_count = raw_writer.page_count;
+        header->raw_blob_page_count = section_writer.raw_writer.page_count;
         header->raw_blob_page_size = EZDB_RAW_BLOB_PAGE_SIZE;
-        if (rc == EZDB_OK && raw_writer.page_count &&
-            fwrite(raw_writer.pages, sizeof(EzdbDiskPage), raw_writer.page_count, out) != raw_writer.page_count) rc = EZDB_ERR_IO;
+        if (rc == EZDB_OK && section_writer.raw_writer.page_count &&
+            fwrite(section_writer.raw_writer.pages,
+                   sizeof(EzdbDiskPage),
+                   section_writer.raw_writer.page_count,
+                   out) != section_writer.raw_writer.page_count) rc = EZDB_ERR_IO;
         write_raw_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK && entry_index_count) {
@@ -2270,7 +2231,7 @@ static int ezdb_write_entries_from_source(FILE* out,
         printf("entry_write_index_seconds: %.3f\n", write_index_ms / 1000.0);
         printf("entry_finalize_seconds: %.3f\n", finalize_ms / 1000.0);
         printf("entry_total_seconds: %.3f\n", total_ms / 1000.0);
-        printf("entry_raw_blob_mb: %.2f\n", (double)raw_writer.raw_size / 1024.0 / 1024.0);
+        printf("entry_raw_blob_mb: %.2f\n", (double)section_writer.raw_writer.raw_size / 1024.0 / 1024.0);
         printf("entry_records_mb: %.2f\n", (double)header->entry_records_size / 1024.0 / 1024.0);
         printf("entry_detail_mb: %.2f\n", (double)header->entry_detail_size / 1024.0 / 1024.0);
         printf("entry_postings_mb: %.2f\n", (double)entry_postings_size / 1024.0 / 1024.0);
@@ -2290,8 +2251,7 @@ static int ezdb_write_entries_from_source(FILE* out,
     entry_index_parallel_state_free(&parallel_state);
     free(archive_entry_counts);
     free(archive_entry_bases);
-    if (detail_writer_ready) ezdb_entries_paged_writer_free(&detail_writer);
-    if (raw_writer_ready) ezdb_entries_paged_writer_free(&raw_writer);
+    if (section_writer_ready) ezdb_entries_section_writer_free(&section_writer);
     remove(core_path);
     remove(detail_path);
     remove(raw_path);

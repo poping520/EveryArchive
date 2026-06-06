@@ -37,6 +37,34 @@ void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
     }
 }
 
+int ezdb_entries_section_writer_init(EzdbEntrySectionWriter* writer,
+                                     FILE* core_out,
+                                     FILE* detail_out,
+                                     FILE* raw_out)
+{
+    if (!writer || !core_out || !detail_out || !raw_out) return EZDB_ERR_ARG;
+    memset(writer, 0, sizeof(*writer));
+    writer->core_out = core_out;
+    int rc = ezdb_entries_paged_writer_init(&writer->detail_writer,
+                                            detail_out,
+                                            sizeof(EzdbDiskEntry) * EZDB_ENTRY_PAGE_SIZE);
+    if (rc != EZDB_OK) return rc;
+    rc = ezdb_entries_paged_writer_init(&writer->raw_writer, raw_out, EZDB_RAW_BLOB_PAGE_SIZE);
+    if (rc != EZDB_OK) {
+        ezdb_entries_paged_writer_free(&writer->detail_writer);
+        memset(writer, 0, sizeof(*writer));
+    }
+    return rc;
+}
+
+void ezdb_entries_section_writer_free(EzdbEntrySectionWriter* writer)
+{
+    if (!writer) return;
+    ezdb_entries_paged_writer_free(&writer->detail_writer);
+    ezdb_entries_paged_writer_free(&writer->raw_writer);
+    memset(writer, 0, sizeof(*writer));
+}
+
 int ezdb_entries_paged_writer_init(EzdbEntryPagedWriter* writer, FILE* out, uint32_t page_size)
 {
     if (!writer || !out || !page_size) return EZDB_ERR_ARG;
@@ -108,6 +136,61 @@ int ezdb_entries_paged_writer_write(EzdbEntryPagedWriter* writer, const void* da
 int ezdb_entries_paged_writer_finish(EzdbEntryPagedWriter* writer)
 {
     return entries_paged_writer_flush_page(writer);
+}
+
+int ezdb_entries_section_writer_add(EzdbEntrySectionWriter* writer,
+                                    const EzdbEntryRecord* record,
+                                    uint32_t final_archive_id)
+{
+    if (!writer || !writer->core_out || !record || !record->entry_path) return EZDB_ERR_ARG;
+    uint32_t path_len = (uint32_t)strlen(record->entry_path);
+    if (writer->raw_writer.raw_size > UINT32_MAX ||
+        writer->raw_writer.raw_size + path_len + 1u > UINT32_MAX) {
+        return EZDB_ERR_MEMORY;
+    }
+    uint32_t path_offset = (uint32_t)writer->raw_writer.raw_size;
+    int rc = ezdb_entries_paged_writer_write(&writer->raw_writer, record->entry_path, path_len);
+    if (rc == EZDB_OK) {
+        unsigned char zero = 0;
+        rc = ezdb_entries_paged_writer_write(&writer->raw_writer, &zero, 1u);
+    }
+    if (rc != EZDB_OK) return rc;
+
+    EzdbDiskEntry disk_entry;
+    memset(&disk_entry, 0, sizeof(disk_entry));
+    disk_entry.archive_id = final_archive_id;
+    disk_entry.entry_path_offset = path_offset;
+    disk_entry.entry_path_len = path_len;
+    disk_entry.compressed_size = record->compressed_size;
+    disk_entry.original_size = record->original_size;
+    disk_entry.modified_time = record->modified_time;
+    if (record->entry_raw_path && record->entry_raw_path_len) {
+        if (writer->raw_writer.raw_size > UINT32_MAX ||
+            writer->raw_writer.raw_size + record->entry_raw_path_len > UINT32_MAX) {
+            return EZDB_ERR_MEMORY;
+        }
+        disk_entry.raw_offset = (uint32_t)writer->raw_writer.raw_size;
+        disk_entry.raw_len = record->entry_raw_path_len;
+        rc = ezdb_entries_paged_writer_write(&writer->raw_writer,
+                                             record->entry_raw_path,
+                                             record->entry_raw_path_len);
+        if (rc != EZDB_OK) return rc;
+    }
+    rc = ezdb_entries_paged_writer_write(&writer->detail_writer, &disk_entry, sizeof(disk_entry));
+    if (rc != EZDB_OK) return rc;
+
+    unsigned char core[EZDB_ENTRY_CORE_RECORD_SIZE];
+    ezdb_entries_encode_core(&disk_entry, core);
+    if (fwrite(core, 1, sizeof(core), writer->core_out) != sizeof(core)) return EZDB_ERR_IO;
+    return EZDB_OK;
+}
+
+int ezdb_entries_section_writer_finish(EzdbEntrySectionWriter* writer)
+{
+    if (!writer) return EZDB_ERR_ARG;
+    int rc = ezdb_entries_paged_writer_finish(&writer->detail_writer);
+    if (rc == EZDB_OK) rc = ezdb_entries_paged_writer_finish(&writer->raw_writer);
+    return rc;
 }
 
 int ezdb_entries_load_page_cached(FILE* fp,
