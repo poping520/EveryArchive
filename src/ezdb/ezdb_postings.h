@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ezdb_entries.h"
 #include "ezdb_internal.h"
 
 #include <stddef.h>
@@ -61,6 +62,21 @@ typedef struct GramKeyCallback {
     void* user_data;
 } GramKeyCallback;
 
+typedef struct EzdbEntryIndexBuildStats {
+    double count_ms;
+    double reduce_ms;
+    double prepare_ms;
+    double fill_ms;
+    double write_ms;
+    double write_index_ms;
+    int parallel_count_enabled;
+    int parallel_fill_enabled;
+    PostingWriteStats write_stats;
+    uint32_t index_count;
+    uint64_t postings_size;
+    uint64_t index_offset;
+} EzdbEntryIndexBuildStats;
+
 int ezdb_postings_utf8_token_len(const unsigned char* s, size_t remain);
 uint32_t ezdb_postings_make_gram_key_from_span(const char* text, uint32_t offset, uint32_t len, uint32_t token_count);
 int ezdb_postings_enumerate_text_gram_keys(const char* text, const GramKeyCallback* callback);
@@ -77,6 +93,7 @@ int ezdb_postings_add_text_grams(PostingBuilder* builder, const char* text, uint
 int ezdb_postings_count_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
 int ezdb_postings_fill_text_grams(PostingBuilder* builder, const char* text, uint32_t id);
 int ezdb_postings_fill_text_grams_sliced(PostingBuilder* builder, PostingBuilder* slice_builder, const char* text, uint32_t id);
+int ezdb_postings_count_entry_path_callback(void* user_data, const char* entry_path, uint32_t entry_id);
 EzdbDiskIndex* ezdb_postings_find_index(EzdbDiskIndex* index, uint64_t count, uint32_t key);
 int ezdb_postings_load(FILE* fp, uint64_t postings_offset, const EzdbDiskIndex* idx, uint32_t** out_ids);
 int ezdb_postings_load_intersected(FILE* fp,
@@ -99,3 +116,13 @@ int ezdb_postings_write(FILE* out,
                    uint32_t* out_index_count,
                    uint64_t* out_written,
                    PostingWriteStats* stats);
+int ezdb_postings_build_entry_index(FILE* out,
+                                    uint64_t postings_offset,
+                                    EzdbEntrySource* source,
+                                    const EzdbEntryCollectResult* collect,
+                                    uint32_t entry_count,
+                                    uint32_t original_archive_count,
+                                    uint32_t index_threads,
+                                    PostingBuilder* builder,
+                                    EzdbDiskIndex** out_index,
+                                    EzdbEntryIndexBuildStats* stats);
