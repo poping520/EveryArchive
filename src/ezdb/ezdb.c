@@ -111,7 +111,7 @@ typedef struct StreamPagedWriter {
 static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, const void* bytes, uint32_t len, uint32_t extra_nul, uint32_t* out_offset);
 static int entry_is_searchable(Ezdb* db, uint32_t entry_id);
 static uint64_t ezdb_delta_append_offset(Ezdb* db);
-static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out);
+static EzdbEntryDetailStore entry_detail_store(Ezdb* db);
 static char* entry_path_copy_by_id(Ezdb* db, uint32_t id);
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path);
 
@@ -1103,46 +1103,25 @@ static int decode_entry_core(Ezdb* db, const unsigned char* raw, uint64_t raw_si
     return EZDB_OK;
 }
 
-static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out)
+static EzdbEntryDetailStore entry_detail_store(Ezdb* db)
 {
-    if (!db || !out || id >= db->header.entry_count) return EZDB_ERR_ARG;
-    if (bitset_get(db->delta_entry_bits, id)) {
-        EzdbDeltaEntryRef* ref = &db->delta_entry_refs[id];
-        memset(out, 0, sizeof(*out));
-        out->archive_id = db->entry_archive_ids[id];
-        out->entry_path_offset = db->entry_path_offsets[id];
-        out->entry_path_len = db->entry_path_lens[id];
-        out->raw_offset = ref->raw_offset > UINT32_MAX ? UINT32_MAX : (uint32_t)ref->raw_offset;
-        out->raw_len = ref->raw_len;
-        out->compressed_size = ref->compressed_size;
-        out->original_size = ref->original_size;
-        out->modified_time = ref->modified_time;
-        return EZDB_OK;
-    }
-    uint32_t page_id = id / EZDB_ENTRY_PAGE_SIZE;
-    uint32_t index_in_page = id % EZDB_ENTRY_PAGE_SIZE;
-    const unsigned char* page = NULL;
-    uint32_t page_size = 0;
-    int rc = ezdb_entries_load_page_cached(db->fp,
-                                           db->entry_detail_pages,
-                                           (uint32_t)db->header.entry_detail_page_count,
-                                           db->header.entry_detail_offset,
-                                           page_id,
-                                           db->entry_detail_cache,
-                                           EZDB_ENTRY_DETAIL_CACHE_PAGES,
-                                           &db->cache_tick,
-                                           &page,
-                                           &page_size);
-    if (rc != EZDB_OK) return rc;
-    size_t offset = sizeof(EzdbDiskEntry) * (size_t)index_in_page;
-    if (offset + sizeof(EzdbDiskEntry) > page_size) return EZDB_ERR_FORMAT;
-    memcpy(out, page + offset, sizeof(*out));
-    if (out->archive_id != db->entry_archive_ids[id] ||
-        out->entry_path_offset != db->entry_path_offsets[id] ||
-        out->entry_path_len != db->entry_path_lens[id]) {
-        return EZDB_ERR_FORMAT;
-    }
-    return EZDB_OK;
+    EzdbEntryDetailStore store;
+    memset(&store, 0, sizeof(store));
+    if (!db) return store;
+    store.fp = db->fp;
+    store.pages = db->entry_detail_pages;
+    store.page_count = (uint32_t)db->header.entry_detail_page_count;
+    store.section_offset = db->header.entry_detail_offset;
+    store.cache = db->entry_detail_cache;
+    store.cache_count = EZDB_ENTRY_DETAIL_CACHE_PAGES;
+    store.cache_tick = &db->cache_tick;
+    store.entry_count = (uint32_t)db->header.entry_count;
+    store.archive_ids = db->entry_archive_ids;
+    store.path_offsets = db->entry_path_offsets;
+    store.path_lens = db->entry_path_lens;
+    store.delta_bits = db->delta_entry_bits;
+    store.delta_refs = db->delta_entry_refs;
+    return store;
 }
 
 static char* entry_path_copy_by_id(Ezdb* db, uint32_t id)
@@ -1895,7 +1874,8 @@ static int compact_entry_source_next(void* user_data, EzdbEntryRecord* out_recor
         uint32_t id = source->next_entry_id++;
         if (!entry_is_searchable(db, id)) continue;
         EzdbDiskEntry detail;
-        int rc = load_entry_detail(db, id, &detail);
+        EzdbEntryDetailStore store = entry_detail_store(db);
+        int rc = ezdb_entries_load_detail(&store, id, &detail);
         if (rc != EZDB_OK) return rc;
         if (detail.archive_id >= db->header.file_count || source->archive_id_map[detail.archive_id] == UINT32_MAX) continue;
         source->entry_path = entry_path_copy_by_id(db, id);
@@ -3944,7 +3924,8 @@ int ezdb_get_entry(Ezdb* db, uint32_t id, EzdbEntryResult* out_result)
     if (!db || !out_result) return EZDB_ERR_ARG;
     if (id >= db->header.entry_count || !bitset_get(db->active_entry_bits, id)) return EZDB_ERR_NOT_FOUND;
     EzdbDiskEntry detail;
-    int rc = load_entry_detail(db, id, &detail);
+    EzdbEntryDetailStore store = entry_detail_store(db);
+    int rc = ezdb_entries_load_detail(&store, id, &detail);
     if (rc != EZDB_OK) return rc;
     if (detail.archive_id >= db->header.file_count || !bitset_get(db->active_bits, detail.archive_id)) return EZDB_ERR_NOT_FOUND;
     char* entry_path = entry_path_copy_by_id(db, id);
@@ -4209,7 +4190,8 @@ static int ezdb_emit_entry_result_with_path(Ezdb* db, uint32_t id, char* entry_p
 {
     if (!entry_path) return ezdb_emit_entry_result(db, id, callback, user_data);
     EzdbDiskEntry detail;
-    int rc = load_entry_detail(db, id, &detail);
+    EzdbEntryDetailStore store = entry_detail_store(db);
+    int rc = ezdb_entries_load_detail(&store, id, &detail);
     if (rc != EZDB_OK) return rc;
     EzdbSearchResult archive;
     rc = build_result_path(db, detail.archive_id, &archive);
@@ -4524,7 +4506,9 @@ static int ezdb_compare_entry_ids(Ezdb* db, uint32_t lhs, uint32_t rhs, int sort
         }
     } else if (sort_column == 3 || sort_column == 4 || sort_column == 5) {
         EzdbDiskEntry ad, bd;
-        if (load_entry_detail(db, lhs, &ad) != EZDB_OK || load_entry_detail(db, rhs, &bd) != EZDB_OK) {
+        EzdbEntryDetailStore store = entry_detail_store(db);
+        if (ezdb_entries_load_detail(&store, lhs, &ad) != EZDB_OK ||
+            ezdb_entries_load_detail(&store, rhs, &bd) != EZDB_OK) {
             cmp = 0;
         } else if (sort_column == 3) {
             int a_missing = ad.compressed_size < 0;

@@ -28,6 +28,22 @@ typedef struct EzdbEntrySource {
     void (*close_range)(struct EzdbEntrySource* source);
 } EzdbEntrySource;
 
+typedef struct EzdbEntryDetailStore {
+    FILE* fp;
+    EzdbDiskPage* pages;
+    uint32_t page_count;
+    uint64_t section_offset;
+    EzdbPageCacheEntry* cache;
+    uint32_t cache_count;
+    uint64_t* cache_tick;
+    uint32_t entry_count;
+    const uint32_t* archive_ids;
+    const uint32_t* path_offsets;
+    const uint32_t* path_lens;
+    const unsigned char* delta_bits;
+    const EzdbDeltaEntryRef* delta_refs;
+} EzdbEntryDetailStore;
+
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
 int ezdb_entries_load_page_cached(FILE* fp,
                                   EzdbDiskPage* pages,
@@ -51,5 +67,6 @@ int ezdb_entries_copy_raw_blob_range(FILE* fp,
                                      uint32_t len,
                                      unsigned char* out);
 int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, unsigned char* out);
+int ezdb_entries_load_detail(const EzdbEntryDetailStore* store, uint32_t id, EzdbDiskEntry* out);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);

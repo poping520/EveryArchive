@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int entry_bitset_get(const unsigned char* bits, uint32_t id)
+{
+    return bits && (bits[id >> 3u] & (unsigned char)(1u << (id & 7u)));
+}
+
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count)
 {
     if (!cache) return;
@@ -113,6 +118,52 @@ int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, 
     if (!fp || (!out && len)) return EZDB_ERR_ARG;
     if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     if (len && fread(out, 1, len, fp) != len) return EZDB_ERR_IO;
+    return EZDB_OK;
+}
+
+int ezdb_entries_load_detail(const EzdbEntryDetailStore* store, uint32_t id, EzdbDiskEntry* out)
+{
+    if (!store || !out || id >= store->entry_count || !store->archive_ids ||
+        !store->path_offsets || !store->path_lens) {
+        return EZDB_ERR_ARG;
+    }
+    if (entry_bitset_get(store->delta_bits, id)) {
+        if (!store->delta_refs) return EZDB_ERR_ARG;
+        const EzdbDeltaEntryRef* ref = &store->delta_refs[id];
+        memset(out, 0, sizeof(*out));
+        out->archive_id = store->archive_ids[id];
+        out->entry_path_offset = store->path_offsets[id];
+        out->entry_path_len = store->path_lens[id];
+        out->raw_offset = ref->raw_offset > UINT32_MAX ? UINT32_MAX : (uint32_t)ref->raw_offset;
+        out->raw_len = ref->raw_len;
+        out->compressed_size = ref->compressed_size;
+        out->original_size = ref->original_size;
+        out->modified_time = ref->modified_time;
+        return EZDB_OK;
+    }
+    uint32_t page_id = id / EZDB_ENTRY_PAGE_SIZE;
+    uint32_t index_in_page = id % EZDB_ENTRY_PAGE_SIZE;
+    const unsigned char* page = NULL;
+    uint32_t page_size = 0;
+    int rc = ezdb_entries_load_page_cached(store->fp,
+                                           store->pages,
+                                           store->page_count,
+                                           store->section_offset,
+                                           page_id,
+                                           store->cache,
+                                           store->cache_count,
+                                           store->cache_tick,
+                                           &page,
+                                           &page_size);
+    if (rc != EZDB_OK) return rc;
+    size_t offset = sizeof(EzdbDiskEntry) * (size_t)index_in_page;
+    if (offset + sizeof(EzdbDiskEntry) > page_size) return EZDB_ERR_FORMAT;
+    memcpy(out, page + offset, sizeof(*out));
+    if (out->archive_id != store->archive_ids[id] ||
+        out->entry_path_offset != store->path_offsets[id] ||
+        out->entry_path_len != store->path_lens[id]) {
+        return EZDB_ERR_FORMAT;
+    }
     return EZDB_OK;
 }
 
