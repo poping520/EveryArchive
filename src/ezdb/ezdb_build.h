@@ -88,6 +88,10 @@ typedef struct EzdbBuildArchivePostingsResult {
     double dir_index_ms;
 } EzdbBuildArchivePostingsResult;
 
+typedef struct EzdbBuildArchiveBaseStats {
+    double write_ms;
+} EzdbBuildArchiveBaseStats;
+
 int ezdb_build_resolve_options(const char* output_ezdb,
                                const EzdbBuildOptions* options,
                                EzdbBuildOptionsResolved* out);
@@ -101,6 +105,10 @@ int ezdb_build_encode_file_records_compact(const EzdbBuildFile* files,
                                            uint32_t file_count,
                                            unsigned char** out_data,
                                            uint64_t* out_size);
+int ezdb_build_write_archive_base_sections(FILE* out,
+                                           const EzdbArchiveBuildTree* tree,
+                                           EzdbHeader* header,
+                                           EzdbBuildArchiveBaseStats* stats);
 int ezdb_build_write_archive_postings(FILE* out,
                                       const EzdbArchiveBuildTree* tree,
                                       EzdbBuildArchivePostingsResult* result);

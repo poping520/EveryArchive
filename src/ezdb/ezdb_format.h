@@ -141,6 +141,18 @@ int ezdb_format_write_section_table(FILE* fp,
                                     uint32_t section_count,
                                     uint64_t* out_offset,
                                     uint64_t* out_size);
+int ezdb_format_build_v13_sections_from_header(const EzdbHeader* header,
+                                               EzdbSectionDesc* sections,
+                                               uint32_t section_cap,
+                                               uint32_t* out_section_count);
+int ezdb_format_write_v13_disk_header(FILE* fp,
+                                      const EzdbHeader* header,
+                                      uint32_t section_count,
+                                      uint64_t section_table_offset);
+int ezdb_format_write_v13_header_and_section_table(FILE* fp,
+                                                   const EzdbHeader* header,
+                                                   uint64_t* out_table_offset,
+                                                   uint64_t* out_table_size);
 int ezdb_format_read_section_table(FILE* fp,
                                    const EzdbV13Header* header,
                                    uint64_t file_size,

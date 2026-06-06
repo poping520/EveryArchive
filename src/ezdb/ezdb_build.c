@@ -1,6 +1,7 @@
 #include "ezdb_build.h"
 
 #include "ezdb_internal.h"
+#include "ezdb_io.h"
 #include "ezdb_postings.h"
 
 #include <stdio.h>
@@ -378,6 +379,99 @@ int ezdb_build_encode_file_records_compact(const EzdbBuildFile* files,
     *out_data = data;
     *out_size = size;
     return EZDB_OK;
+}
+
+int ezdb_build_write_archive_base_sections(FILE* out,
+                                           const EzdbArchiveBuildTree* tree,
+                                           EzdbHeader* header,
+                                           EzdbBuildArchiveBaseStats* stats)
+{
+    if (!out || !tree || !header) return EZDB_ERR_ARG;
+    if (stats) memset(stats, 0, sizeof(*stats));
+    double stage_start_ms = build_now_ms();
+
+    header->file_records_offset = (uint64_t)ftell(out);
+    unsigned char* file_records_raw = NULL;
+    uint64_t file_records_raw_size = 0;
+    uint64_t file_records_written = 0;
+    int rc = ezdb_build_encode_file_records_compact(tree->files,
+                                                    tree->file_count,
+                                                    &file_records_raw,
+                                                    &file_records_raw_size);
+    if (rc == EZDB_OK) {
+        rc = write_compressed_section(out,
+                                      file_records_raw,
+                                      file_records_raw_size,
+                                      &file_records_written,
+                                      &header->file_records_flags);
+    }
+    free(file_records_raw);
+    header->file_records_raw_size = file_records_raw_size;
+    header->file_records_size = file_records_written;
+
+    if (rc == EZDB_OK) {
+        header->archive_meta_offset = (uint64_t)ftell(out);
+        uint64_t archive_meta_raw_size = sizeof(EzdbDiskArchiveMeta) * (uint64_t)tree->file_count;
+        EzdbDiskArchiveMeta* archive_meta_raw =
+            (EzdbDiskArchiveMeta*)calloc((size_t)(tree->file_count ? tree->file_count : 1u),
+                                         sizeof(EzdbDiskArchiveMeta));
+        if (!archive_meta_raw) {
+            rc = EZDB_ERR_MEMORY;
+        } else {
+            for (uint32_t i = 0; i < tree->file_count; ++i) {
+                archive_meta_raw[i].file_ref_number = tree->files[i].file_ref_number;
+                archive_meta_raw[i].usn = tree->files[i].usn;
+                archive_meta_raw[i].drive_letter = (unsigned char)tree->files[i].drive_letter;
+            }
+            uint64_t archive_meta_written = 0;
+            rc = write_compressed_section(out,
+                                          (const unsigned char*)archive_meta_raw,
+                                          archive_meta_raw_size,
+                                          &archive_meta_written,
+                                          &header->archive_meta_flags);
+            header->archive_meta_raw_size = archive_meta_raw_size;
+            header->archive_meta_size = archive_meta_written;
+            free(archive_meta_raw);
+        }
+    }
+
+    header->dir_records_offset = (uint64_t)ftell(out);
+    uint64_t dir_records_raw_size = sizeof(EzdbDiskDir) * (uint64_t)tree->dir_count;
+    EzdbDiskDir* dir_records_raw = (EzdbDiskDir*)malloc(dir_records_raw_size ? (size_t)dir_records_raw_size : 1u);
+    if (!dir_records_raw && rc == EZDB_OK) rc = EZDB_ERR_MEMORY;
+    for (uint32_t i = 0; i < tree->dir_count && rc == EZDB_OK; ++i) {
+        dir_records_raw[i].parent_dir_id = tree->dirs[i].parent;
+        dir_records_raw[i].name_offset = tree->dirs[i].name_offset;
+        dir_records_raw[i].name_len = tree->dirs[i].name_len;
+        dir_records_raw[i].first_file_id = tree->dirs[i].first_file_id;
+        dir_records_raw[i].file_count = tree->dirs[i].file_count;
+    }
+    uint64_t dir_records_written = 0;
+    if (rc == EZDB_OK) {
+        rc = write_compressed_section(out,
+                                      (const unsigned char*)dir_records_raw,
+                                      dir_records_raw_size,
+                                      &dir_records_written,
+                                      &header->dir_records_flags);
+    }
+    free(dir_records_raw);
+    header->dir_records_raw_size = dir_records_raw_size;
+    header->dir_records_size = dir_records_written;
+
+    header->strings_offset = (uint64_t)ftell(out);
+    header->strings_raw_size = tree->string_size;
+    uint64_t strings_written = 0;
+    if (rc == EZDB_OK) {
+        rc = write_compressed_section(out,
+                                      (const unsigned char*)tree->string_pool,
+                                      tree->string_size,
+                                      &strings_written,
+                                      &header->strings_flags);
+    }
+    header->strings_size = strings_written;
+
+    if (stats) stats->write_ms = build_now_ms() - stage_start_ms;
+    return rc;
 }
 
 int ezdb_build_write_archive_postings(FILE* out,
