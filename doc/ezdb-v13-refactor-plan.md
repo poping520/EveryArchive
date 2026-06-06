@@ -34,9 +34,9 @@ ezdb v13 的目标是为 `build-zip-entries` 建立一个更快、更低内存�
 | query 主流程拆分 | 部分完成 | parser/helper 已迁出，`search/search-v2/query_entries` 主流程仍在 `ezdb.c` |
 | delta 模块拆分 | 未开始 | insert/update/delete/compact 仍在 `ezdb.c` |
 | entries 模块拆分 | 部分完成 | entry source、读路径 helper、分页 writer、section build 会话、collect 主循环和 collected section finalize 编排已迁入；外层 build orchestration 仍在 `ezdb.c` |
-| build 模块拆分 | 未开始 | snapshot build 编排仍在 `ezdb.c` |
+| build 模块拆分 | 部分完成 | 已新增 `ezdb_build.c/.h`，公开 build API wrapper、build options resolve 和 public stream adapter 已迁入；archive-base core builder 暂留 `ezdb.c` |
 
-当前总体进度估算：约 `82%`。已完成 ZIP CD scan、spool/stream、postings、多线程 postings 和测试体系；entries 写入边界已推进到 collect 主循环、temp/header section 会话和 collected section finalize 编排，entry index build/write 编排已收敛进 postings 模块，剩余主要是 build/query/delta/core 的模块边界继续收敛，以及 `EzdbHeader` 运行期映射依赖收敛。
+当前总体进度估算：约 `87%`。已完成 ZIP CD scan、spool/stream、postings、多线程 postings 和测试体系；entries 写入边界已推进到 collect 主循环、temp/header section 会话和 collected section finalize 编排，entry index build/write 编排已收敛进 postings 模块，build 模块已开始承接公开 API wrapper 和 public stream adapter，剩余主要是 archive-base core builder、query/delta/core 的模块边界继续收敛，以及 `EzdbHeader` 运行期映射依赖收敛。
 
 ## 已完成工作
 
@@ -445,7 +445,7 @@ v13 调整：
 
 ### 6. build 模块拆分
 
-状态：未开始。
+状态：部分完成。
 
 目标文件：
 
@@ -454,13 +454,14 @@ v13 调整：
 
 计划迁入：
 
-- snapshot build 编排。
+- snapshot build 编排。（已开始：公开 `ezdb_build_snapshot*` API wrapper 已迁入 `ezdb_build.c`）
 - archive tree 构建。
 - directory hash/string pool。
-- `ezdb_build_snapshot_*` API 实现。
-- build options resolve。
+- `ezdb_build_snapshot_*` API 实现。（已迁入 `ezdb_build.c`）
+- build options resolve。（已通过 `ezdb_build_resolve_options(...)` 暴露到 build 模块，compact rebuild 已改用该接口）
 - build stats/log 输出。
 - spool temp dir 清理。
+- public `EzdbEntryStream` -> internal `EzdbEntrySource` adapter。（已迁入 `ezdb_build.c`，保留 `open_range/close_range`）
 
 拆分后目标：
 
@@ -578,6 +579,7 @@ v13 调整：
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper 和 entry index build/write 编排。
 - `src/ezdb/ezdb_format.c/.h` 已接管 v13 header 与 section table helper。
+- `src/ezdb/ezdb_build.c/.h` 已加入 CMake，并迁入公开 `ezdb_build_snapshot*` API wrapper、build options resolve 边界和 public `EzdbEntryStream` 到 internal `EzdbEntrySource` adapter；`ezdb.c` 暂时保留 archive-base core builder，并通过 `ezdb_build_write_archive_base_core(...)` 供 build/compact 调用。
 - 阶段 D 已完成独立 archive range reader 准备：核心 stream API 透传 `open_range/close_range`，zip spool stream 可创建 per-range reader。
 - 阶段 D 已完成 pass 1 parallel count、reduce、slice offset prepare 和 pass 2 parallel fill；当前剩余优化点转向 ZIP fixture/测试体系、模块拆分和后续大样本复测。
 - 阶段 E 已新增 `EzdbZipFixtureTests`，运行时生成小 ZIP、空 ZIP、带 central directory comment 的 ZIP、含目录 entry 的 ZIP，并验证 `build-zip-entries`、`info`、`search-v2 archive/entry` 回归。
@@ -595,6 +597,8 @@ v13 调整：
 - 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.388s`，`entry_total_seconds 14.658s`，`zip_total_parse_to_build_seconds 16.161s`，峰值工作集 `293.00MB`，输出 `97.46MB`。
 - 2026-06-06 本机继续阶段 B/F：新增 `EzdbEntryFinalizeStats` / `ezdb_entries_write_collected_sections(...)`，迁出 collected entry section 的 core/detail/raw 写入顺序、entry count/final header 字段和阶段耗时统计；`ezdb_write_entries_from_source` 进一步收缩为 collect + postings + entries finalize 编排。Release `EzdbBench` 构建通过，`EzdbZipFixtureTests` 通过。
 - 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.580s`，`entry_total_seconds 12.666s`，`zip_total_parse_to_build_seconds 14.375s`，峰值工作集 `292.78MB`，输出 `97.46MB`。
+- 2026-06-06 本机继续阶段 F：新增 `ezdb_build.c/.h` 并接入 CMake；迁出公开 build snapshot API wrapper、public stream adapter 和 build options resolve 边界；compact rebuild 改走 `ezdb_build_resolve_options(...)` / `ezdb_build_write_archive_base_core(...)`。Release `EzdbBench` 构建通过，`EzdbZipFixtureTests` 通过。
+- 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.621s`，`entry_total_seconds 14.446s`，`zip_total_parse_to_build_seconds 16.250s`，峰值工作集 `292.86MB`，输出 `97.46MB`。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -603,7 +607,7 @@ v13 调整：
 
 下次继续的首要断点：
 
-- 下一步继续阶段 B/C/F 的 entries/build/v13 header 收敛，优先启动 `ezdb_build.c/.h` 外层 build orchestration 拆分，或处理 `EzdbHeader` 运行期映射依赖。
+- 下一步继续阶段 F/C 的 build/v13 header 收敛，优先把 archive tree/string pool/base section 写入和 file/dir postings 编排继续迁入 `ezdb_build.c`，或先切走 `EzdbHeader` v13 运行期映射依赖。
 
 ## 风险与注意事项
 
