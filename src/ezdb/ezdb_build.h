@@ -3,6 +3,7 @@
 #include "ezdb_entries.h"
 
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct EzdbBuildOptionsResolved {
     char temp_dir[1024];
@@ -76,6 +77,17 @@ typedef struct EzdbArchiveBuildTree {
     uint32_t* string_buckets;
 } EzdbArchiveBuildTree;
 
+typedef struct EzdbBuildArchivePostingsResult {
+    EzdbDiskIndex* file_index;
+    EzdbDiskIndex* dir_index;
+    uint32_t file_index_count;
+    uint32_t dir_index_count;
+    uint64_t file_postings_size;
+    uint64_t dir_postings_size;
+    double file_index_ms;
+    double dir_index_ms;
+} EzdbBuildArchivePostingsResult;
+
 int ezdb_build_resolve_options(const char* output_ezdb,
                                const EzdbBuildOptions* options,
                                EzdbBuildOptionsResolved* out);
@@ -89,6 +101,10 @@ int ezdb_build_encode_file_records_compact(const EzdbBuildFile* files,
                                            uint32_t file_count,
                                            unsigned char** out_data,
                                            uint64_t* out_size);
+int ezdb_build_write_archive_postings(FILE* out,
+                                      const EzdbArchiveBuildTree* tree,
+                                      EzdbBuildArchivePostingsResult* result);
+void ezdb_build_archive_postings_result_free(EzdbBuildArchivePostingsResult* result);
 int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
                                        uint32_t archive_count,
                                        const EzdbEntryRecord* entries,

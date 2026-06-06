@@ -1,14 +1,21 @@
 #include "ezdb_build.h"
 
 #include "ezdb_internal.h"
+#include "ezdb_postings.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct EzdbPublicEntryStreamRange {
     EzdbEntryStream stream;
 } EzdbPublicEntryStreamRange;
+
+static double build_now_ms(void)
+{
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
 
 static int build_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed)
 {
@@ -371,6 +378,94 @@ int ezdb_build_encode_file_records_compact(const EzdbBuildFile* files,
     *out_data = data;
     *out_size = size;
     return EZDB_OK;
+}
+
+int ezdb_build_write_archive_postings(FILE* out,
+                                      const EzdbArchiveBuildTree* tree,
+                                      EzdbBuildArchivePostingsResult* result)
+{
+    if (!out || !tree || !result) return EZDB_ERR_ARG;
+    memset(result, 0, sizeof(*result));
+    PostingBuilder file_builder;
+    PostingBuilder dir_builder;
+    int file_builder_ready = 0;
+    int dir_builder_ready = 0;
+    memset(&file_builder, 0, sizeof(file_builder));
+    memset(&dir_builder, 0, sizeof(dir_builder));
+
+    double stage_start_ms = build_now_ms();
+    int rc = ezdb_postings_builder_init(&file_builder, 262144u);
+    if (rc == EZDB_OK) file_builder_ready = 1;
+    if (rc == EZDB_OK) {
+        for (uint32_t i = 0; i < tree->file_count; ++i) {
+            rc = ezdb_postings_count_text_grams(&file_builder, tree->string_pool + tree->files[i].name_offset, i);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&file_builder);
+    if (rc == EZDB_OK) {
+        for (uint32_t i = 0; i < tree->file_count; ++i) {
+            rc = ezdb_postings_fill_text_grams(&file_builder, tree->string_pool + tree->files[i].name_offset, i);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    if (rc == EZDB_OK) {
+        rc = ezdb_postings_write(out,
+                                 &file_builder,
+                                 tree->file_count,
+                                 &result->file_index,
+                                 &result->file_index_count,
+                                 &result->file_postings_size,
+                                 NULL);
+    }
+    if (rc == EZDB_OK) result->file_index_ms = build_now_ms() - stage_start_ms;
+    if (file_builder_ready) {
+        ezdb_postings_builder_free(&file_builder);
+        file_builder_ready = 0;
+    }
+
+    if (rc == EZDB_OK) {
+        stage_start_ms = build_now_ms();
+        rc = ezdb_postings_builder_init(&dir_builder, 131072u);
+        if (rc == EZDB_OK) dir_builder_ready = 1;
+    }
+    if (rc == EZDB_OK) {
+        for (uint32_t i = 1; i < tree->dir_count; ++i) {
+            rc = ezdb_postings_count_text_grams(&dir_builder, tree->string_pool + tree->dirs[i].name_offset, i);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&dir_builder);
+    if (rc == EZDB_OK) {
+        for (uint32_t i = 1; i < tree->dir_count; ++i) {
+            rc = ezdb_postings_fill_text_grams(&dir_builder, tree->string_pool + tree->dirs[i].name_offset, i);
+            if (rc != EZDB_OK) break;
+        }
+    }
+    if (rc == EZDB_OK) {
+        rc = ezdb_postings_write(out,
+                                 &dir_builder,
+                                 tree->dir_count,
+                                 &result->dir_index,
+                                 &result->dir_index_count,
+                                 &result->dir_postings_size,
+                                 NULL);
+    }
+    if (rc == EZDB_OK) result->dir_index_ms = build_now_ms() - stage_start_ms;
+    if (dir_builder_ready) {
+        ezdb_postings_builder_free(&dir_builder);
+        dir_builder_ready = 0;
+    }
+    if (rc != EZDB_OK) ezdb_build_archive_postings_result_free(result);
+    return rc;
+}
+
+void ezdb_build_archive_postings_result_free(EzdbBuildArchivePostingsResult* result)
+{
+    if (!result) return;
+    free(result->file_index);
+    free(result->dir_index);
+    memset(result, 0, sizeof(*result));
 }
 
 static void public_entry_stream_close_range(EzdbEntrySource* source);

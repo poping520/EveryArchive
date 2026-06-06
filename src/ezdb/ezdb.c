@@ -1792,14 +1792,11 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
     double dir_index_ms = 0.0;
 
     EzdbArchiveBuildTree tree;
-    uint32_t* file_name_offsets = NULL;
-    PostingBuilder file_builder;
-    PostingBuilder dir_builder;
-    int file_builder_ready = 0;
-    int dir_builder_ready = 0;
+    EzdbBuildArchivePostingsResult archive_postings;
     int rc = EZDB_OK;
 
     memset(&tree, 0, sizeof(tree));
+    memset(&archive_postings, 0, sizeof(archive_postings));
     rc = ezdb_build_archive_tree_init(&tree);
     if (rc != EZDB_OK) return rc;
 
@@ -1839,14 +1836,6 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
             free(file_records_raw);
             header.file_records_raw_size = file_records_raw_size;
             header.file_records_size = file_records_written;
-            if (rc == EZDB_OK) {
-                file_name_offsets = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)(tree.file_count ? tree.file_count : 1u));
-                if (!file_name_offsets) {
-                    rc = EZDB_ERR_MEMORY;
-                } else {
-                    for (uint32_t i = 0; i < tree.file_count; ++i) file_name_offsets[i] = tree.files[i].name_offset;
-                }
-            }
             if (rc == EZDB_OK) {
                 header.archive_meta_offset = (uint64_t)ftell(out);
                 uint64_t archive_meta_raw_size = sizeof(EzdbDiskArchiveMeta) * (uint64_t)tree.file_count;
@@ -1892,59 +1881,12 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
             write_base_ms = ezdb_now_ms() - stage_start_ms;
 
             header.postings_offset = (uint64_t)ftell(out);
-            EzdbDiskIndex* file_index = NULL;
-            EzdbDiskIndex* dir_index = NULL;
-            uint32_t file_index_count = 0, dir_index_count = 0;
-            uint64_t file_postings_size = 0, dir_postings_size = 0;
+            rc = ezdb_build_write_archive_postings(out, &tree, &archive_postings);
             if (rc == EZDB_OK) {
-                stage_start_ms = ezdb_now_ms();
-                rc = ezdb_postings_builder_init(&file_builder, 262144u);
-                if (rc == EZDB_OK) file_builder_ready = 1;
+                file_index_ms = archive_postings.file_index_ms;
+                dir_index_ms = archive_postings.dir_index_ms;
             }
-            if (rc == EZDB_OK) {
-                for (uint32_t i = 0; i < tree.file_count; ++i) {
-                    rc = ezdb_postings_count_text_grams(&file_builder, tree.string_pool + file_name_offsets[i], i);
-                    if (rc != EZDB_OK) break;
-                }
-            }
-            if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&file_builder);
-            if (rc == EZDB_OK) {
-                for (uint32_t i = 0; i < tree.file_count; ++i) {
-                    rc = ezdb_postings_fill_text_grams(&file_builder, tree.string_pool + file_name_offsets[i], i);
-                    if (rc != EZDB_OK) break;
-                }
-            }
-            if (rc == EZDB_OK) rc = ezdb_postings_write(out, &file_builder, tree.file_count, &file_index, &file_index_count, &file_postings_size, NULL);
-            if (rc == EZDB_OK) file_index_ms = ezdb_now_ms() - stage_start_ms;
-            if (file_builder_ready) {
-                ezdb_postings_builder_free(&file_builder);
-                file_builder_ready = 0;
-            }
-            if (rc == EZDB_OK) {
-                stage_start_ms = ezdb_now_ms();
-                rc = ezdb_postings_builder_init(&dir_builder, 131072u);
-                if (rc == EZDB_OK) dir_builder_ready = 1;
-            }
-            if (rc == EZDB_OK) {
-                for (uint32_t i = 1; i < tree.dir_count; ++i) {
-                    rc = ezdb_postings_count_text_grams(&dir_builder, tree.string_pool + tree.dirs[i].name_offset, i);
-                    if (rc != EZDB_OK) break;
-                }
-            }
-            if (rc == EZDB_OK) rc = ezdb_postings_builder_prepare_fill(&dir_builder);
-            if (rc == EZDB_OK) {
-                for (uint32_t i = 1; i < tree.dir_count; ++i) {
-                    rc = ezdb_postings_fill_text_grams(&dir_builder, tree.string_pool + tree.dirs[i].name_offset, i);
-                    if (rc != EZDB_OK) break;
-                }
-            }
-            if (rc == EZDB_OK) rc = ezdb_postings_write(out, &dir_builder, tree.dir_count, &dir_index, &dir_index_count, &dir_postings_size, NULL);
-            if (rc == EZDB_OK) dir_index_ms = ezdb_now_ms() - stage_start_ms;
-            if (dir_builder_ready) {
-                ezdb_postings_builder_free(&dir_builder);
-                dir_builder_ready = 0;
-            }
-            header.postings_size = file_postings_size + dir_postings_size;
+            header.postings_size = archive_postings.file_postings_size + archive_postings.dir_postings_size;
 
             if (rc == EZDB_OK) {
                 if (entry_source) {
@@ -1955,25 +1897,35 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
             }
 
             header.file_index_offset = (uint64_t)ftell(out);
-            header.file_index_count = file_index_count;
-            if (rc == EZDB_OK && file_index_count && fwrite(file_index, sizeof(EzdbDiskIndex), file_index_count, out) != file_index_count) rc = EZDB_ERR_IO;
+            header.file_index_count = archive_postings.file_index_count;
+            if (rc == EZDB_OK && archive_postings.file_index_count &&
+                fwrite(archive_postings.file_index,
+                       sizeof(EzdbDiskIndex),
+                       archive_postings.file_index_count,
+                       out) != archive_postings.file_index_count) {
+                rc = EZDB_ERR_IO;
+            }
 
-            for (uint32_t i = 0; i < dir_index_count; ++i) dir_index[i].offset += file_postings_size;
+            for (uint32_t i = 0; i < archive_postings.dir_index_count; ++i) {
+                archive_postings.dir_index[i].offset += archive_postings.file_postings_size;
+            }
             header.dir_index_offset = (uint64_t)ftell(out);
-            header.dir_index_count = dir_index_count;
-            if (rc == EZDB_OK && dir_index_count && fwrite(dir_index, sizeof(EzdbDiskIndex), dir_index_count, out) != dir_index_count) rc = EZDB_ERR_IO;
+            header.dir_index_count = archive_postings.dir_index_count;
+            if (rc == EZDB_OK && archive_postings.dir_index_count &&
+                fwrite(archive_postings.dir_index,
+                       sizeof(EzdbDiskIndex),
+                       archive_postings.dir_index_count,
+                       out) != archive_postings.dir_index_count) {
+                rc = EZDB_ERR_IO;
+            }
 
             if (rc == EZDB_OK) rc = ezdb_write_v13_header_and_section_table(out, &header);
-            free(file_index);
-            free(dir_index);
             fclose(out);
         }
     }
 
-    free(file_name_offsets);
+    ezdb_build_archive_postings_result_free(&archive_postings);
     ezdb_build_archive_tree_free(&tree);
-    if (file_builder_ready) ezdb_postings_builder_free(&file_builder);
-    if (dir_builder_ready) ezdb_postings_builder_free(&dir_builder);
     if (rc == EZDB_OK) {
         double total_ms = ezdb_now_ms() - total_start_ms;
         printf("build_build_tree_seconds: %.3f\n", build_tree_ms / 1000.0);
