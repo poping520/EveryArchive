@@ -351,7 +351,7 @@ typedef struct EzdbSectionDesc {
 
 计划迁入：
 
-- `EzdbEntrySource`
+- `EzdbEntrySource`（已迁入 `ezdb_entries.h`）
 - `EzdbCompactEntrySource`
 - entry stream reader/writer
 - entry core writer/reader（已迁出 core 12 字节 encode/decode helper）
@@ -556,6 +556,7 @@ v13 调整：
 - 已修复 v13 live entry append 重新 open：v13 header 严格保留 `base_archive_count/base_entry_count`，并修复 delta replay 中读取 entry path 后未恢复文件位置的问题。
 - Debug 构建 `EzdbBench` 通过。
 - `src/ezdb/ezdb_entries.c/.h` 已加入 CMake，并迁出 entry core record 12 字节 encode/decode helper；detail/raw blob 读写仍待继续迁出。
+- `EzdbEntrySource` 内部 stream interface 已迁入 `ezdb_entries.h`，build/compact 仍先复用 `ezdb.c` 中的 source 实现。
 - `src/ezdb/ezdb_query.c/.h` 已加入 CMake。
 - `src/ezdb/ezdb_postings.c/.h` 已接管 postings write/read/intersect helper。
 - `src/ezdb/ezdb_format.c/.h` 已接管 v13 header 与 section table helper。

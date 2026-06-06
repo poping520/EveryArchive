@@ -124,15 +124,6 @@ static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char
 static int copy_raw_blob_range(Ezdb* db, uint32_t offset, uint32_t len, unsigned char* out);
 static int copy_delta_blob_range(Ezdb* db, uint64_t offset, uint32_t len, unsigned char* out);
 
-typedef struct EzdbEntrySource {
-    void* user_data;
-    int (*reset)(void* user_data);
-    int (*reset_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end);
-    int (*next)(void* user_data, EzdbEntryRecord* out_record);
-    int (*open_range)(void* user_data, uint32_t archive_begin, uint32_t archive_end, struct EzdbEntrySource* out_source);
-    void (*close_range)(struct EzdbEntrySource* source);
-} EzdbEntrySource;
-
 typedef struct EzdbCompactEntrySource {
     Ezdb* db;
     const uint32_t* archive_id_map;
