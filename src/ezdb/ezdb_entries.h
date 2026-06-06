@@ -39,5 +39,16 @@ int ezdb_entries_load_page_cached(FILE* fp,
                                   uint64_t* cache_tick,
                                   const unsigned char** out_data,
                                   uint32_t* out_size);
+int ezdb_entries_copy_raw_blob_range(FILE* fp,
+                                     EzdbDiskPage* pages,
+                                     uint32_t page_count,
+                                     uint64_t section_offset,
+                                     uint64_t raw_size,
+                                     EzdbPageCacheEntry* cache,
+                                     uint32_t cache_count,
+                                     uint64_t* cache_tick,
+                                     uint32_t offset,
+                                     uint32_t len,
+                                     unsigned char* out);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);

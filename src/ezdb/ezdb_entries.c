@@ -68,6 +68,46 @@ int ezdb_entries_load_page_cached(FILE* fp,
     return EZDB_OK;
 }
 
+int ezdb_entries_copy_raw_blob_range(FILE* fp,
+                                     EzdbDiskPage* pages,
+                                     uint32_t page_count,
+                                     uint64_t section_offset,
+                                     uint64_t raw_size,
+                                     EzdbPageCacheEntry* cache,
+                                     uint32_t cache_count,
+                                     uint64_t* cache_tick,
+                                     uint32_t offset,
+                                     uint32_t len,
+                                     unsigned char* out)
+{
+    if (!fp || !pages || (!out && len) || (uint64_t)offset + len > raw_size) return EZDB_ERR_FORMAT;
+    uint32_t copied = 0;
+    while (copied < len) {
+        uint32_t absolute = offset + copied;
+        uint32_t page_id = absolute / EZDB_RAW_BLOB_PAGE_SIZE;
+        uint32_t page_pos = absolute % EZDB_RAW_BLOB_PAGE_SIZE;
+        const unsigned char* page = NULL;
+        uint32_t page_size = 0;
+        int rc = ezdb_entries_load_page_cached(fp,
+                                               pages,
+                                               page_count,
+                                               section_offset,
+                                               page_id,
+                                               cache,
+                                               cache_count,
+                                               cache_tick,
+                                               &page,
+                                               &page_size);
+        if (rc != EZDB_OK) return rc;
+        if (page_pos >= page_size) return EZDB_ERR_FORMAT;
+        uint32_t chunk = page_size - page_pos;
+        if (chunk > len - copied) chunk = len - copied;
+        memcpy(out + copied, page + page_pos, chunk);
+        copied += chunk;
+    }
+    return EZDB_OK;
+}
+
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE])
 {
     uint32_t archive_id = entry ? entry->archive_id : 0;
