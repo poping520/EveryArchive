@@ -115,14 +115,6 @@ static EzdbEntryDetailStore entry_detail_store(Ezdb* db);
 static EzdbEntryPathStore entry_path_store(Ezdb* db);
 static int delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path);
 
-typedef struct EzdbCompactEntrySource {
-    Ezdb* db;
-    const uint32_t* archive_id_map;
-    uint32_t next_entry_id;
-    char* entry_path;
-    void* raw_path;
-} EzdbCompactEntrySource;
-
 struct Ezdb {
     FILE* fp;
     char* path;
@@ -1837,58 +1829,6 @@ static int array_entry_source_next(void* user_data, EzdbEntryRecord* out_record)
             *out_record = *record;
             return EZDB_OK;
         }
-    }
-    return EZDB_ERR_NOT_FOUND;
-}
-
-static void compact_entry_source_clear_current(EzdbCompactEntrySource* source)
-{
-    if (!source) return;
-    free(source->entry_path);
-    free(source->raw_path);
-    source->entry_path = NULL;
-    source->raw_path = NULL;
-}
-
-static int compact_entry_source_reset(void* user_data)
-{
-    EzdbCompactEntrySource* source = (EzdbCompactEntrySource*)user_data;
-    if (!source) return EZDB_ERR_ARG;
-    compact_entry_source_clear_current(source);
-    source->next_entry_id = 0;
-    return EZDB_OK;
-}
-
-static int compact_entry_source_next(void* user_data, EzdbEntryRecord* out_record)
-{
-    EzdbCompactEntrySource* source = (EzdbCompactEntrySource*)user_data;
-    if (!source || !source->db || !out_record) return EZDB_ERR_ARG;
-    compact_entry_source_clear_current(source);
-    Ezdb* db = source->db;
-    while (source->next_entry_id < db->header.entry_count) {
-        uint32_t id = source->next_entry_id++;
-        if (!entry_is_searchable(db, id)) continue;
-        EzdbDiskEntry detail;
-        EzdbEntryDetailStore store = entry_detail_store(db);
-        int rc = ezdb_entries_load_detail(&store, id, &detail);
-        if (rc != EZDB_OK) return rc;
-        if (detail.archive_id >= db->header.file_count || source->archive_id_map[detail.archive_id] == UINT32_MAX) continue;
-        EzdbEntryPathStore path_store = entry_path_store(db);
-        source->entry_path = ezdb_entries_copy_path(&path_store, id);
-        if (!source->entry_path) return EZDB_ERR_MEMORY;
-        memset(out_record, 0, sizeof(*out_record));
-        out_record->archive_id = source->archive_id_map[detail.archive_id];
-        out_record->entry_path = source->entry_path;
-        out_record->compressed_size = detail.compressed_size;
-        out_record->original_size = detail.original_size;
-        out_record->modified_time = detail.modified_time;
-        if (detail.raw_len) {
-            source->raw_path = ezdb_entries_copy_raw_path(&path_store, id, &detail);
-            if (!source->raw_path) return EZDB_ERR_MEMORY;
-            out_record->entry_raw_path = source->raw_path;
-            out_record->entry_raw_path_len = detail.raw_len;
-        }
-        return EZDB_OK;
     }
     return EZDB_ERR_NOT_FOUND;
 }
@@ -5172,13 +5112,17 @@ int ezdb_compact(Ezdb* db)
 
     EzdbCompactEntrySource compact_source;
     memset(&compact_source, 0, sizeof(compact_source));
-    compact_source.db = db;
     compact_source.archive_id_map = archive_id_map;
+    compact_source.active_entry_bits = db->active_entry_bits;
+    compact_source.active_archive_bits = db->active_bits;
+    compact_source.file_count = (uint32_t)db->header.file_count;
+    compact_source.detail_store = entry_detail_store(db);
+    compact_source.path_store = entry_path_store(db);
     EzdbEntrySource source;
     memset(&source, 0, sizeof(source));
     source.user_data = &compact_source;
-    source.reset = compact_entry_source_reset;
-    source.next = compact_entry_source_next;
+    source.reset = ezdb_entries_compact_source_reset;
+    source.next = ezdb_entries_compact_source_next;
 
     size_t path_len = strlen(db->path);
     char* tmp_path = (char*)malloc(path_len + 13u);
@@ -5192,7 +5136,7 @@ int ezdb_compact(Ezdb* db)
             rc = ezdb_write_archive_base(archives, out_archive_count, NULL, active_entries, tmp_path, build_archive_id_map, active_entries ? &source : NULL, &options);
         }
     }
-    compact_entry_source_clear_current(&compact_source);
+    ezdb_entries_compact_source_clear_current(&compact_source);
     if (rc == EZDB_OK) {
         if (db->fp) {
             fclose(db->fp);

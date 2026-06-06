@@ -234,6 +234,69 @@ void* ezdb_entries_copy_raw_path(const EzdbEntryPathStore* store, uint32_t id, c
     return out;
 }
 
+static int compact_entry_is_searchable(const EzdbCompactEntrySource* source, uint32_t entry_id)
+{
+    if (!source || entry_id >= source->detail_store.entry_count ||
+        !entry_bitset_get(source->active_entry_bits, entry_id)) {
+        return 0;
+    }
+    if (!source->detail_store.archive_ids) return 0;
+    uint32_t archive_id = source->detail_store.archive_ids[entry_id];
+    return archive_id < source->file_count && entry_bitset_get(source->active_archive_bits, archive_id);
+}
+
+void ezdb_entries_compact_source_clear_current(EzdbCompactEntrySource* source)
+{
+    if (!source) return;
+    free(source->entry_path);
+    free(source->raw_path);
+    source->entry_path = NULL;
+    source->raw_path = NULL;
+}
+
+int ezdb_entries_compact_source_reset(void* user_data)
+{
+    EzdbCompactEntrySource* source = (EzdbCompactEntrySource*)user_data;
+    if (!source) return EZDB_ERR_ARG;
+    ezdb_entries_compact_source_clear_current(source);
+    source->next_entry_id = 0;
+    return EZDB_OK;
+}
+
+int ezdb_entries_compact_source_next(void* user_data, EzdbEntryRecord* out_record)
+{
+    EzdbCompactEntrySource* source = (EzdbCompactEntrySource*)user_data;
+    if (!source || !out_record || !source->archive_id_map) return EZDB_ERR_ARG;
+    ezdb_entries_compact_source_clear_current(source);
+    while (source->next_entry_id < source->detail_store.entry_count) {
+        uint32_t id = source->next_entry_id++;
+        if (!compact_entry_is_searchable(source, id)) continue;
+        EzdbDiskEntry detail;
+        int rc = ezdb_entries_load_detail(&source->detail_store, id, &detail);
+        if (rc != EZDB_OK) return rc;
+        if (detail.archive_id >= source->file_count ||
+            source->archive_id_map[detail.archive_id] == UINT32_MAX) {
+            continue;
+        }
+        source->entry_path = ezdb_entries_copy_path(&source->path_store, id);
+        if (!source->entry_path) return EZDB_ERR_MEMORY;
+        memset(out_record, 0, sizeof(*out_record));
+        out_record->archive_id = source->archive_id_map[detail.archive_id];
+        out_record->entry_path = source->entry_path;
+        out_record->compressed_size = detail.compressed_size;
+        out_record->original_size = detail.original_size;
+        out_record->modified_time = detail.modified_time;
+        if (detail.raw_len) {
+            source->raw_path = ezdb_entries_copy_raw_path(&source->path_store, id, &detail);
+            if (!source->raw_path) return EZDB_ERR_MEMORY;
+            out_record->entry_raw_path = source->raw_path;
+            out_record->entry_raw_path_len = detail.raw_len;
+        }
+        return EZDB_OK;
+    }
+    return EZDB_ERR_NOT_FOUND;
+}
+
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE])
 {
     uint32_t archive_id = entry ? entry->archive_id : 0;
