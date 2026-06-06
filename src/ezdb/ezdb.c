@@ -1084,57 +1084,6 @@ static int copy_file_payload(FILE* dst, const char* src_path, uint64_t* out_writ
     return rc;
 }
 
-static int load_page_cached(Ezdb* db,
-                            EzdbDiskPage* pages,
-                            uint32_t page_count,
-                            uint64_t section_offset,
-                            uint32_t page_id,
-                            EzdbPageCacheEntry* cache,
-                            uint32_t cache_count,
-                            const unsigned char** out_data,
-                            uint32_t* out_size)
-{
-    if (!db || !pages || page_id >= page_count || !cache || !cache_count || !out_data || !out_size) return EZDB_ERR_ARG;
-    for (uint32_t i = 0; i < cache_count; ++i) {
-        if (cache[i].data && cache[i].page_id == page_id) {
-            cache[i].tick = ++db->cache_tick;
-            *out_data = cache[i].data;
-            *out_size = cache[i].size;
-            return EZDB_OK;
-        }
-    }
-    uint32_t slot = UINT32_MAX;
-    uint64_t oldest = UINT64_MAX;
-    for (uint32_t i = 0; i < cache_count; ++i) {
-        if (!cache[i].data) {
-            slot = i;
-            break;
-        }
-        if (cache[i].tick < oldest) {
-            oldest = cache[i].tick;
-            slot = i;
-        }
-    }
-    if (slot == UINT32_MAX) return EZDB_ERR_MEMORY;
-    EzdbDiskPage* page = &pages[page_id];
-    unsigned char* data = NULL;
-    int rc = read_section_payload(db->fp,
-                                  section_offset + page->offset,
-                                  page->encoded_size,
-                                  page->raw_size,
-                                  page->flags,
-                                  &data);
-    if (rc != EZDB_OK) return rc;
-    free(cache[slot].data);
-    cache[slot].data = data;
-    cache[slot].page_id = page_id;
-    cache[slot].size = page->raw_size;
-    cache[slot].tick = ++db->cache_tick;
-    *out_data = data;
-    *out_size = page->raw_size;
-    return EZDB_OK;
-}
-
 static int decode_entry_core(Ezdb* db, const unsigned char* raw, uint64_t raw_size)
 {
     if (!db) return EZDB_ERR_ARG;
@@ -1176,15 +1125,16 @@ static int load_entry_detail(Ezdb* db, uint32_t id, EzdbDiskEntry* out)
     uint32_t index_in_page = id % EZDB_ENTRY_PAGE_SIZE;
     const unsigned char* page = NULL;
     uint32_t page_size = 0;
-    int rc = load_page_cached(db,
-                              db->entry_detail_pages,
-                              (uint32_t)db->header.entry_detail_page_count,
-                              db->header.entry_detail_offset,
-                              page_id,
-                              db->entry_detail_cache,
-                              EZDB_ENTRY_DETAIL_CACHE_PAGES,
-                              &page,
-                              &page_size);
+    int rc = ezdb_entries_load_page_cached(db->fp,
+                                           db->entry_detail_pages,
+                                           (uint32_t)db->header.entry_detail_page_count,
+                                           db->header.entry_detail_offset,
+                                           page_id,
+                                           db->entry_detail_cache,
+                                           EZDB_ENTRY_DETAIL_CACHE_PAGES,
+                                           &db->cache_tick,
+                                           &page,
+                                           &page_size);
     if (rc != EZDB_OK) return rc;
     size_t offset = sizeof(EzdbDiskEntry) * (size_t)index_in_page;
     if (offset + sizeof(EzdbDiskEntry) > page_size) return EZDB_ERR_FORMAT;
@@ -1207,15 +1157,16 @@ static int copy_raw_blob_range(Ezdb* db, uint32_t offset, uint32_t len, unsigned
         uint32_t page_pos = absolute % EZDB_RAW_BLOB_PAGE_SIZE;
         const unsigned char* page = NULL;
         uint32_t page_size = 0;
-        int rc = load_page_cached(db,
-                                  db->raw_blob_pages,
-                                  (uint32_t)db->header.raw_blob_page_count,
-                                  db->header.raw_blob_offset,
-                                  page_id,
-                                  db->raw_blob_cache,
-                                  EZDB_RAW_BLOB_CACHE_PAGES,
-                                  &page,
-                                  &page_size);
+        int rc = ezdb_entries_load_page_cached(db->fp,
+                                               db->raw_blob_pages,
+                                               (uint32_t)db->header.raw_blob_page_count,
+                                               db->header.raw_blob_offset,
+                                               page_id,
+                                               db->raw_blob_cache,
+                                               EZDB_RAW_BLOB_CACHE_PAGES,
+                                               &db->cache_tick,
+                                               &page,
+                                               &page_size);
         if (rc != EZDB_OK) return rc;
         if (page_pos >= page_size) return EZDB_ERR_FORMAT;
         uint32_t chunk = page_size - page_pos;

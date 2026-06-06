@@ -3,6 +3,7 @@
 #include "ezdb.h"
 #include "ezdb_internal.h"
 
+#include <stdio.h>
 #include <stdint.h>
 
 #define EZDB_ENTRY_PAGE_SIZE 4096u
@@ -28,5 +29,15 @@ typedef struct EzdbEntrySource {
 } EzdbEntrySource;
 
 void ezdb_entries_page_cache_free(EzdbPageCacheEntry* cache, uint32_t count);
+int ezdb_entries_load_page_cached(FILE* fp,
+                                  EzdbDiskPage* pages,
+                                  uint32_t page_count,
+                                  uint64_t section_offset,
+                                  uint32_t page_id,
+                                  EzdbPageCacheEntry* cache,
+                                  uint32_t cache_count,
+                                  uint64_t* cache_tick,
+                                  const unsigned char** out_data,
+                                  uint32_t* out_size);
 void ezdb_entries_encode_core(const EzdbDiskEntry* entry, unsigned char out[EZDB_ENTRY_CORE_RECORD_SIZE]);
 void ezdb_entries_decode_core(const unsigned char raw[EZDB_ENTRY_CORE_RECORD_SIZE], EzdbDiskEntry* out);
