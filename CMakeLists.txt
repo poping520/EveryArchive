@@ -14,6 +14,7 @@ add_subdirectory(external/zlib)
 add_library(ezdb STATIC
         src/ezdb/ezdb.c
         src/ezdb/ezdb_build.c
+        src/ezdb/ezdb_delta.c
         src/ezdb/ezdb_entries.c
         src/ezdb/ezdb_format.c
         src/ezdb/ezdb_io.c
@@ -21,6 +22,8 @@ add_library(ezdb STATIC
         src/ezdb/ezdb_query.c
         src/ezdb/ezdb.h
         src/ezdb/ezdb_build.h
+        src/ezdb/ezdb_core_internal.h
+        src/ezdb/ezdb_delta.h
         src/ezdb/ezdb_entries.h
         src/ezdb/ezdb_format.h
         src/ezdb/ezdb_internal.h

@@ -31,12 +31,12 @@ ezdb v13 的目标是为 `build-zip-entries` 建立一个更快、更低内存�
 | query 基础模块 | 已完成 | query parser、AST、wildcard、candidate keys、text match helper 已迁入 `ezdb_query.c/.h` |
 | v13 section directory 格式 | 已完成当前计划 | build/open 已接入 v13 section table；live entry append 重新 open 已修复并验证；v13 header/section table 写出 helper 已收敛到 format 层；`EzdbHeader` 明确保留为运行期归一化结构 |
 | 多线程 postings 构建 | 已完成 | pass 1 count、reduce、slice prepare、pass 2 fill 已并行化 |
-| query 主流程拆分 | 后续 backlog | parser/helper 已迁出；`search/search-v2/query_entries` 主流程保持在 `ezdb.c`，作为下一轮模块化候选 |
-| delta 模块拆分 | 后续 backlog | insert/update/delete/compact 仍在 `ezdb.c`，当前 v13 功能与 smoke 已验证；后续可独立拆 `ezdb_delta.c/.h` |
+| query 主流程拆分 | 已完成 | `search/search-v2/query_entries` 主流程、candidate bitset、entry result emit 和分页排序已迁入 `ezdb_query.c` |
+| delta 模块拆分 | 已完成主要路径 | 新增 `ezdb_delta.c/.h`，迁出 delta hash、replay、事务、insert/update/delete、archive upsert 和 entry append/replace；compact 编排仍在后续 compact/core backlog |
 | entries 模块拆分 | 已完成当前计划 | entry source、读路径 helper、分页 writer、section build 会话、collect 主循环、collected section finalize 和 entry index build/write 编排已迁出 |
 | build 模块拆分 | 已完成当前计划 | 已新增 `ezdb_build.c/.h`，公开 build API wrapper、build options resolve、public stream adapter、archive tree/string pool/DFS remap、file-record 编码、base section 写入和 file/dir postings 编排已迁入 |
 
-当前总体进度估算：`100%`（本轮 v13 提速与模块化重构计划完成）。已完成 ZIP CD scan、spool/stream、postings、多线程 postings、测试体系、entries 写入边界、build 模块边界和 v13 section directory 写出边界收敛；`EzdbHeader` 明确保留为运行期归一化结构。query 主流程、delta 和 core 生命周期拆分不再作为本轮 v13 build 性能计划的阻塞项，转入后续模块化 backlog。
+当前总体进度估算：`100%`（本轮 v13 提速与模块化重构计划完成；后续模块化 backlog 继续收敛）。已完成 ZIP CD scan、spool/stream、postings、多线程 postings、测试体系、entries 写入边界、build 模块边界、query 主流程、delta 主要路径和 v13 section directory 写出边界收敛；`EzdbHeader` 明确保留为运行期归一化结构。core 生命周期和 compact 编排拆分仍作为后续模块化 backlog。
 
 ## 已完成工作
 
@@ -389,7 +389,7 @@ typedef struct EzdbSectionDesc {
 
 ### 4. query 模块拆分
 
-状态：后续 backlog。
+状态：已完成。
 
 目标文件：
 
@@ -403,14 +403,15 @@ typedef struct EzdbSectionDesc {
   - `EzdbQueryParser`
   - AND/OR/NOT/wildcard parse
 - 已迁入 wildcard/text/candidate key helper。
-- 后续可迁入 archive/file search：
+- 已迁入 archive/file search：
   - `ezdb_search`
   - `ezdb_search_v2`
   - result materialization
-- 后续可迁入 entry search：
+- 已迁入 entry search：
   - `query_entries`
   - entry search-v2
   - wildcard post-filter
+- 已迁入 candidate bitset、entry emit、entry sort/page 和 batch get 主流程。
 - postings intersect/load helper 已迁入 `ezdb_postings.c/.h`。
 
 拆分注意：
@@ -421,14 +422,14 @@ typedef struct EzdbSectionDesc {
 
 ### 5. delta 模块拆分
 
-状态：后续 backlog。
+状态：已完成主要路径。
 
 目标文件：
 
 - `src/ezdb/ezdb_delta.c`
 - `src/ezdb/ezdb_delta.h`
 
-计划迁入：
+已迁入：
 
 - delta disk frame encode/decode。
 - insert/update/delete。
@@ -436,7 +437,10 @@ typedef struct EzdbSectionDesc {
 - archive upsert。
 - write transaction begin/commit/rollback。
 - replay delta log。
-- compact。
+
+后续 backlog：
+
+- compact 编排仍在 `ezdb.c`，后续可独立迁入 `ezdb_compact.c/.h` 或随 core 生命周期拆分收口。
 
 v13 调整：
 
@@ -470,7 +474,7 @@ v13 调整：
 拆分后目标：
 
 - `ezdb.c` 不再包含大型 builder。（已完成当前计划）
-- `ezdb.c` 仍保留 open/query/delta/core 主流程，作为后续 backlog 继续拆分。
+- `ezdb.c` 仍保留 open/close、stats/info、archive materialization、metadata、compact 和少量 core helper；query 主流程和 delta 主要路径已迁出。
 
 ### 7. core 模块拆分
 
@@ -507,17 +511,14 @@ v13 调整：
 
 ### 阶段 B：拆 entries/query
 
-状态：已完成当前计划；query 主流程拆分转入后续 backlog。
+状态：已完成。
 
 - [x] 新建 `ezdb_entries.c/.h`。
 - [x] 迁出 entry core/detail/raw blob 读写。（已迁出 core encode/decode、detail/raw blob 读路径、分页 writer、array source、entry section writer、section build session、collect 主循环和 collected section finalize；entry postings 编排已迁入 postings）
 - [x] 新建 `ezdb_query.c/.h`。
 - [x] 迁出 query parser。
+- [x] 迁出 archive/entry search 主流程、`query_entries`、candidate bitset、entry emit 和分页排序。
 - [x] 保持 Debug 构建和 smoke test 通过。
-
-后续 backlog：
-
-- 迁出 archive/entry search 主流程。
 
 ### 阶段 C：v13 format
 
@@ -613,6 +614,7 @@ v13 调整：
 - 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 2.683s`，`entry_total_seconds 16.820s`，`zip_total_parse_to_build_seconds 19.637s`，峰值工作集 `294.40MB`，输出 `97.46MB`。
 - 2026-06-06 本机完成阶段 F/C 收口：新增 `EzdbBuildArchiveBaseStats` / `ezdb_build_write_archive_base_sections(...)`，迁出 archive records、archive meta、dir records 和 string pool 的 base section 写入；新增 `ezdb_format_build_v13_sections_from_header(...)`、`ezdb_format_write_v13_disk_header(...)`、`ezdb_format_write_v13_header_and_section_table(...)`，将 v13 section table/disk header 写出收敛到 format 层；`EzdbHeader` 明确保留为运行期归一化结构。Release `EzdbBench` 构建通过，`EzdbZipFixtureTests` 通过。
 - 2026-06-06 本机 `test_data\all_zip_files.tsv` 6 线程复测：`5559` 个 ZIP、`1171025` 个 entry；`zip_parse_seconds 1.689s`，`entry_total_seconds 21.013s`，`zip_total_parse_to_build_seconds 22.847s`，峰值工作集 `294.72MB`，输出 `97.46MB`。
+- 2026-06-07 本机继续后续模块化：新增 `src/ezdb/ezdb_core_internal.h` 暴露内部 `Ezdb` 结构和跨模块 helper；新增 `src/ezdb/ezdb_delta.c/.h`，迁出 delta hash、delta replay、写事务、archive insert/update/delete/upsert/delete-by-ref、entry append/replace/delete frame 等主要 delta API；扩展 `src/ezdb/ezdb_query.c`，迁出 `ezdb_search_path`、`ezdb_search`、`ezdb_query_entries`、candidate bitset、entry emit、entry sort/page 和 batch get 主流程。`src/ezdb/ezdb.c` 从约 `3474` 行降至 `1618` 行；`ezdb_query.c` 为 `1260` 行，`ezdb_delta.c` 为 `860` 行。Release `EzdbBench` / `TestIndexStore` 构建通过，`ctest --test-dir cmake-build-codex-release -C Release --output-on-failure` 通过。
 
 当前工作区中仍有非本计划代码提交项：
 
@@ -621,9 +623,9 @@ v13 调整：
 
 后续 backlog：
 
-- 可独立启动 query 主流程拆分：将 `search/search-v2/query_entries` 主流程从 `ezdb.c` 迁入 query/core 协作模块。
-- 可独立启动 delta 模块拆分：将 insert/update/delete/entry append/write transaction/replay/compact 迁入 `ezdb_delta.c/.h`。
+- 可独立启动 compact 模块拆分：将 `ezdb_compact` 的 active archive 收集、archive id remap、temp rebuild、reopen/replace 编排迁入 `ezdb_compact.c/.h`。
 - 可独立启动 core 模块拆分：将 `struct Ezdb` 生命周期、open/close、stats/info、active bitset 和 error bridge 迁入 `ezdb_core.c/.h`。
+- 可进一步收紧内部接口：减少 `ezdb_core_internal.h` 暴露面，让 query/delta 只通过 core/entries/archive helper API 访问数据。
 
 ## 风险与注意事项
 
