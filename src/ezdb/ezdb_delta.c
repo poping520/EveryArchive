@@ -120,6 +120,7 @@ int ezdb_append_delta_memory(Ezdb* db, uint32_t type, uint32_t id, const char* p
 int ezdb_delta_entry_index_add_path(Ezdb* db, uint32_t entry_id, const char* path)
 {
     if (!path || !*path) return EZDB_OK;
+    if (db->batch_index_deferred) { db->batch_index_dirty = 1; return EZDB_OK; }
     int rc = ezdb_delta_entry_index_ensure(db);
     if (rc != EZDB_OK) return rc;
     return ezdb_postings_add_text_grams(&db->delta_entry_index, path, entry_id, 0);
@@ -128,6 +129,7 @@ int ezdb_delta_entry_index_add_path(Ezdb* db, uint32_t entry_id, const char* pat
 int ezdb_delta_entry_index_remove_path(Ezdb* db, uint32_t entry_id, const char* path)
 {
     if (!db || !path || !*path || !db->delta_entry_index_ready) return EZDB_OK;
+    if (db->batch_index_deferred) { db->batch_index_dirty = 1; return EZDB_OK; }
     uint32_t* keys = NULL;
     uint32_t key_count = 0;
     int rc = ezdb_postings_build_query_keys(path, &keys, &key_count);
@@ -167,20 +169,54 @@ int ezdb_rebuild_delta_entry_index(Ezdb* db)
     ezdb_postings_builder_free(&db->delta_entry_index);
     memset(&db->delta_entry_index, 0, sizeof(db->delta_entry_index));
     db->delta_entry_index_ready = 0;
-    EzdbEntryPathStore path_store = ezdb_entry_path_store(db);
+
+    uint32_t active_delta_count = 0;
     for (uint32_t e = 0; e < db->header.entry_count; ++e) {
-        if (!ezdb_bitset_get(db->active_entry_bits, e) || !ezdb_bitset_get(db->delta_entry_bits, e)) continue;
-        char* entry_path = ezdb_entries_copy_path(&path_store, e);
-        if (!entry_path) continue;
-        int rc = ezdb_delta_entry_index_add_path(db, e, entry_path);
-        free(entry_path);
-        if (rc != EZDB_OK) return rc;
+        if (ezdb_bitset_get(db->active_entry_bits, e) &&
+            ezdb_bitset_get(db->delta_entry_bits, e)) {
+            ++active_delta_count;
+        }
     }
-    return EZDB_OK;
+    if (!active_delta_count) return EZDB_OK;
+
+    uint32_t estimated_keys = active_delta_count * 20u;
+    if (estimated_keys < 4096u) estimated_keys = 4096u;
+    uint32_t bucket_count = ezdb_next_pow2_u32(estimated_keys * 2u);
+    int rc = ezdb_postings_builder_init(&db->delta_entry_index, bucket_count);
+    if (rc != EZDB_OK) return rc;
+    db->delta_entry_index_ready = 1;
+
+    EzdbEntryPathStore path_store = ezdb_entry_path_store(db);
+
+    for (uint32_t e = 0; e < db->header.entry_count; ++e) {
+        if (!ezdb_bitset_get(db->active_entry_bits, e) ||
+            !ezdb_bitset_get(db->delta_entry_bits, e)) continue;
+        char* entry_path = ezdb_entries_copy_path(&path_store, e);
+        if (!entry_path) { rc = EZDB_ERR_MEMORY; break; }
+        rc = ezdb_postings_count_text_grams(&db->delta_entry_index, entry_path, e);
+        free(entry_path);
+        if (rc != EZDB_OK) break;
+    }
+    if (rc != EZDB_OK) return rc;
+
+    rc = ezdb_postings_builder_prepare_fill(&db->delta_entry_index);
+    if (rc != EZDB_OK) return rc;
+
+    for (uint32_t e = 0; e < db->header.entry_count; ++e) {
+        if (!ezdb_bitset_get(db->active_entry_bits, e) ||
+            !ezdb_bitset_get(db->delta_entry_bits, e)) continue;
+        char* entry_path = ezdb_entries_copy_path(&path_store, e);
+        if (!entry_path) { rc = EZDB_ERR_MEMORY; break; }
+        rc = ezdb_postings_fill_text_grams(&db->delta_entry_index, entry_path, e);
+        free(entry_path);
+        if (rc != EZDB_OK) break;
+    }
+    return rc;
 }
 int ezdb_replay_delta_log(Ezdb* db)
 {
     if (!db->header.delta_offset || !db->header.delta_size) return EZDB_OK;
+    db->batch_index_deferred = 1;
     if (fseek(db->fp, (long)db->header.delta_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     uint64_t remaining = db->header.delta_size;
     while (remaining) {
@@ -274,6 +310,12 @@ int ezdb_replay_delta_log(Ezdb* db)
             ezdb_bitset_set(db->active_bits, dh.id, 1);
         }
     }
+    if (db->batch_index_dirty) {
+        int rc2 = ezdb_rebuild_delta_entry_index(db);
+        if (rc2 != EZDB_OK) return rc2;
+    }
+    db->batch_index_deferred = 0;
+    db->batch_index_dirty = 0;
     return EZDB_OK;
 }
 
@@ -379,7 +421,13 @@ static int append_entry_delete_archive_frame(Ezdb* db, uint32_t archive_id, int 
     db->header.delta_size += sizeof(dh);
     db->header.reserved_offset = db->header.delta_offset + db->header.delta_size;
     db->header.reserved_size = 0;
-    int rc = ezdb_deactivate_entries_for_archive(db, archive_id);
+    int rc;
+    if (db->archive_first_entry_ids && archive_id < db->header.file_count &&
+        db->archive_first_entry_ids[archive_id] == UINT32_MAX) {
+        rc = EZDB_OK;
+    } else {
+        rc = ezdb_deactivate_entries_for_archive(db, archive_id);
+    }
     if (rc != EZDB_OK) return rc;
     if (!flush_now) return EZDB_OK;
     return ezdb_write_header(db);
@@ -504,6 +552,9 @@ int ezdb_commit_write(Ezdb* db)
     if (db->read_only) return EZDB_ERR_READ_ONLY;
     if (!db->write_txn_active) return EZDB_ERR_ARG;
     int rc = append_delta_frame(db, EZDB_DELTA_BATCH_COMMIT);
+    if (rc == EZDB_OK && db->batch_index_dirty) {
+        rc = ezdb_rebuild_delta_entry_index(db);
+    }
     if (rc == EZDB_OK) rc = ezdb_write_header(db);
     if (rc != EZDB_OK) {
         (void)restore_txn_snapshot(db);
