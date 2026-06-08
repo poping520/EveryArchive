@@ -95,6 +95,8 @@ add_executable(EveryZip WIN32
         src/parser/archive_parser_factory.cpp
         src/parser/zip_archive_parser.h
         src/parser/zip_archive_parser.cpp
+        src/parser/zip_cd_scanner.c
+        src/parser/zip_cd_scanner.h
         src/parser/sevenzip_archive_parser.h
         src/parser/sevenzip_archive_parser.cpp
         src/parser/rar_archive_parser.h

@@ -20,6 +20,9 @@ add_executable(TestZip
         ../src/parser/archive_parser.h
         ../src/parser/zip_archive_parser.h
         ../src/parser/zip_archive_parser.cpp
+        ../src/parser/zip_cd_scanner.c
+        ../src/parser/zip_cd_scanner.h
+        ../src/string_utils.cpp
 )
 
 add_executable(TestSevenZip
@@ -75,6 +78,7 @@ add_executable(QueryDB
 
 target_link_libraries(TestZip PRIVATE
         minizip
+        shlwapi
 )
 
 target_include_directories(TestZip PRIVATE

@@ -1,4 +1,5 @@
 #include "zip_archive_parser.h"
+#include "zip_cd_scanner.h"
 
 #include "../string_utils.h"
 
@@ -188,6 +189,52 @@ bool ZipArchiveParser::ForEachEntry(const std::function<bool(const ArchiveEntry_
         return false;
     }
 
+    // Fast path: try the Central Directory scanner first.
+    if (!archive_path_.empty()) {
+        struct CdScanCtx {
+            const std::function<bool(const ArchiveEntry_t&)>* visitor;
+            bool stopped;
+        };
+        CdScanCtx ctx;
+        ctx.visitor = &visitor;
+        ctx.stopped = false;
+
+        auto cd_callback = [](const ZipCdEntry* cd, void* ud) -> int {
+            auto* c = static_cast<CdScanCtx*>(ud);
+            if (c->stopped) return 0;
+
+            const std::string name(cd->raw_name, cd->raw_name_len);
+            const bool isUtf8 = (cd->flags & 0x800) != 0;
+
+            ArchiveEntry_t e;
+            e.entryPathUtf8 = DecodeZipPathBestEffort(name, isUtf8).utf8;
+            if (name != e.entryPathUtf8) {
+                e.entryRawPath = name;
+            }
+            e.isDirectory = EndsWithSlash(name);
+            e.compressedSize = cd->compressed_size;
+            e.originalSize = cd->original_size;
+            e.modifiedTime = cd->modified_time;
+
+            if (!(*c->visitor)(e)) {
+                c->stopped = true;
+                return 0;
+            }
+            return 1;
+        };
+
+        char cd_error[128] = {};
+        if (zip_cd_scan_entries(archive_path_.c_str(), cd_callback, &ctx, cd_error, sizeof(cd_error))) {
+            if (ctx.stopped) {
+                if (error) *error = "entry visitor stopped";
+                return false;
+            }
+            return true;
+        }
+        // CD scanner failed — fall through to MiniZIP.
+    }
+
+    // Fallback: MiniZIP iteration.
     int rc = unzGoToFirstFile((unzFile)handle_);
     if (rc != UNZ_OK) {
         if (rc == UNZ_END_OF_LIST_OF_FILE) return true;
