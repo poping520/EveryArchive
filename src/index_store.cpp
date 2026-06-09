@@ -406,9 +406,14 @@ public:
     bool IsOpen() const override { return db_.IsOpen(); }
     void SetBusyTimeout(int ms) override { db_.SetBusyTimeout(ms); }
     bool OpenOrCreate(const std::wstring& path, std::wstring* err) override { return Open(path, err) && EnsureSchema(err, true); }
-    bool BeginWrite(std::wstring* err, bool bulk = false) override { (void)err; (void)bulk; return db_.BeginTransaction(); }
-    bool CommitWrite(std::wstring* err) override { (void)err; return db_.CommitTransaction(); }
-    bool RollbackWrite() override { return db_.RollbackTransaction(); }
+    bool BeginWrite(std::wstring* err, bool bulk = false) override { (void)err; bulkMode_ = bulk; return db_.BeginTransaction(); }
+    bool CommitWrite(std::wstring* err) override {
+        if (!db_.CommitTransaction()) { bulkMode_ = false; return false; }
+        if (bulkMode_) { db_.RebuildFtsIndex(err); }
+        bulkMode_ = false;
+        return true;
+    }
+    bool RollbackWrite() override { bulkMode_ = false; return db_.RollbackTransaction(); }
 
     bool EnsureSchema(std::wstring* err, bool includeConfigs) override
     {
@@ -507,6 +512,7 @@ public:
 
 private:
     Database db_;
+    bool bulkMode_ = false;
 };
 
 class EzdbIndexStore final : public IndexStore {
@@ -1085,5 +1091,5 @@ std::unique_ptr<IndexStore> CreateEzdbIndexStore()
 
 std::unique_ptr<IndexStore> CreateIndexStore()
 {
-    return CreateEzdbIndexStore();
+    return CreateSQLiteIndexStore();
 }

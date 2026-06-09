@@ -42,6 +42,38 @@ static std::wstring BuildSearchLikePattern(const std::wstring& filter)
     return pattern;
 }
 
+static std::string BuildFts5Query(const std::wstring& filter)
+{
+    if (filter.empty()) return {};
+
+    std::string utf8 = WStringToUtf8(filter);
+    std::string result;
+    std::string token;
+
+    auto flushToken = [&]() {
+        if (token.empty()) return;
+        // Strip leading '*' (FTS5 token matching makes it redundant)
+        size_t start = 0;
+        while (start < token.size() && token[start] == '*') ++start;
+        if (start >= token.size()) { token.clear(); return; }
+        std::string cleaned = token.substr(start);
+        if (!result.empty()) result += " AND ";
+        // Keep trailing '*' for FTS5 prefix matching
+        result += cleaned;
+        token.clear();
+    };
+
+    for (char ch : utf8) {
+        if (ch == ' ' || ch == '\t') {
+            flushToken();
+        } else {
+            token.push_back(ch);
+        }
+    }
+    flushToken();
+    return result;
+}
+
 static bool ArchivesTableHasColumn(sqlite3* db, const char* columnName)
 {
     if (!db || !columnName) return false;
@@ -150,7 +182,20 @@ bool Database::InsertOrUpdateEntry(const ArchiveEntry_t& e)
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    if (rc != SQLITE_DONE) return false;
+
+    if (fts5Available_) {
+        sqlite3_stmt* ftsStmt = nullptr;
+        const char* ftsSql = "INSERT INTO entries_fts(rowid, entry_path) VALUES (?, ?)";
+        if (sqlite3_prepare_v2(db_, ftsSql, -1, &ftsStmt, nullptr) == SQLITE_OK && ftsStmt) {
+            sqlite3_bind_int64(ftsStmt, 1, sqlite3_last_insert_rowid(db_));
+            sqlite3_bind_text(ftsStmt, 2, pathUtf8.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(ftsStmt);
+            sqlite3_finalize(ftsStmt);
+        }
+    }
+
+    return true;
 }
 
 bool Database::InsertEntriesBatch(const std::vector<ArchiveEntry_t>& entries, std::wstring* err)
@@ -255,14 +300,23 @@ bool Database::QueryEntries(const std::wstring& filter, std::vector<ArchiveEntry
 
     sqlite3_stmt* stmt = nullptr;
     const bool hasFilter = !filter.empty();
+    const bool useFts = fts5Available_ && hasFilter;
 
-    const char* sql = hasFilter
-                          ? "SELECT a.file_path, e.entry_path, e.compressed_size, e.original_size, e.modified_time "
-                           "FROM entries e JOIN archives a ON e.archive_id = a.id "
-                           "WHERE e.entry_path LIKE ? ESCAPE '\\' "
-                           "ORDER BY e.id DESC;"
-                          : "SELECT a.file_path, e.entry_path, e.compressed_size, e.original_size, e.modified_time "
-                           "FROM entries e JOIN archives a ON e.archive_id = a.id ORDER BY e.id DESC;";
+    const char* sqlLikeFiltered =
+        "SELECT a.file_path, e.entry_path, e.compressed_size, e.original_size, e.modified_time "
+        "FROM entries e JOIN archives a ON e.archive_id = a.id "
+        "WHERE e.entry_path LIKE ? ESCAPE '\\' "
+        "ORDER BY e.id DESC;";
+    const char* sqlFtsFiltered =
+        "SELECT a.file_path, e.entry_path, e.compressed_size, e.original_size, e.modified_time "
+        "FROM entries e JOIN archives a ON e.archive_id = a.id "
+        "WHERE e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?) "
+        "ORDER BY e.id DESC;";
+    const char* sqlNoFilter =
+        "SELECT a.file_path, e.entry_path, e.compressed_size, e.original_size, e.modified_time "
+        "FROM entries e JOIN archives a ON e.archive_id = a.id ORDER BY e.id DESC;";
+
+    const char* sql = hasFilter ? (useFts ? sqlFtsFiltered : sqlLikeFiltered) : sqlNoFilter;
 
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK || !stmt)
@@ -278,7 +332,7 @@ bool Database::QueryEntries(const std::wstring& filter, std::vector<ArchiveEntry
 
     if (hasFilter)
     {
-        std::string filterUtf8 = WStringToUtf8(BuildSearchLikePattern(filter));
+        std::string filterUtf8 = useFts ? BuildFts5Query(filter) : WStringToUtf8(BuildSearchLikePattern(filter));
         sqlite3_bind_text(stmt, 1, filterUtf8.c_str(), -1, SQLITE_TRANSIENT);
     }
 
@@ -349,6 +403,17 @@ bool Database::CreateEntriesTable(std::wstring* err)
     alterErr = nullptr;
     sqlite3_exec(db_, "ALTER TABLE entries ADD COLUMN modified_time INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, &alterErr);
     if (alterErr) sqlite3_free(alterErr);
+
+    fts5Available_ = false;
+    char* ftsErr = nullptr;
+    const char* ftsSql = "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts"
+                         " USING fts5(entry_path, content='entries', content_rowid='id', tokenize='unicode61');";
+    if (sqlite3_exec(db_, ftsSql, nullptr, nullptr, &ftsErr) == SQLITE_OK) {
+        fts5Available_ = true;
+    } else {
+        if (ftsErr) sqlite3_free(ftsErr);
+    }
+
     return true;
 }
 
@@ -362,6 +427,19 @@ bool Database::DeleteEntriesByArchivePath(const std::wstring& archivePath, std::
     }
 
     const char* sql = "DELETE FROM entries WHERE archive_id IN (SELECT id FROM archives WHERE file_path = ?);";
+
+    if (fts5Available_) {
+        const char* ftsSql = "DELETE FROM entries_fts WHERE rowid IN ("
+            "SELECT e.id FROM entries e JOIN archives a ON e.archive_id = a.id WHERE a.file_path = ?)";
+        sqlite3_stmt* ftsStmt = nullptr;
+        if (sqlite3_prepare_v2(db_, ftsSql, -1, &ftsStmt, nullptr) == SQLITE_OK && ftsStmt) {
+            std::string pathUtf8Fts = WStringToUtf8(archivePath);
+            sqlite3_bind_text(ftsStmt, 1, pathUtf8Fts.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(ftsStmt);
+            sqlite3_finalize(ftsStmt);
+        }
+    }
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK || !stmt)
@@ -401,6 +479,17 @@ bool Database::DeleteEntriesByArchiveId(int64_t archiveId, std::wstring* err)
     }
 
     const char* sql = "DELETE FROM entries WHERE archive_id = ?";
+
+    if (fts5Available_) {
+        const char* ftsSql = "DELETE FROM entries_fts WHERE rowid IN (SELECT id FROM entries WHERE archive_id = ?)";
+        sqlite3_stmt* ftsStmt = nullptr;
+        if (sqlite3_prepare_v2(db_, ftsSql, -1, &ftsStmt, nullptr) == SQLITE_OK && ftsStmt) {
+            sqlite3_bind_int64(ftsStmt, 1, archiveId);
+            sqlite3_step(ftsStmt);
+            sqlite3_finalize(ftsStmt);
+        }
+    }
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK || !stmt)
@@ -993,6 +1082,21 @@ bool Database::DeleteArchiveByRefNumber(wchar_t driveLetter, uint64_t fileRefNum
             SELECT id FROM archives WHERE drive_letter = ? AND file_ref_number = ?
         );
     )";
+
+    if (fts5Available_) {
+        const char* ftsSql = "DELETE FROM entries_fts WHERE rowid IN ("
+            "SELECT e.id FROM entries e JOIN archives a ON e.archive_id = a.id "
+            "WHERE a.drive_letter = ? AND a.file_ref_number = ?)";
+        sqlite3_stmt* ftsStmt = nullptr;
+        if (sqlite3_prepare_v2(db_, ftsSql, -1, &ftsStmt, nullptr) == SQLITE_OK && ftsStmt) {
+            std::string driveStrFts(1, (char)driveLetter);
+            sqlite3_bind_text(ftsStmt, 1, driveStrFts.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ftsStmt, 2, fileRefNumber);
+            sqlite3_step(ftsStmt);
+            sqlite3_finalize(ftsStmt);
+        }
+    }
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, deleteEntriesSql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK)
@@ -1092,9 +1196,14 @@ bool Database::QueryEntryIds(const std::wstring& filter, int sortColumn, bool so
 
     std::string sql;
     const bool hasFilter = !filter.empty();
+    const bool useFts = fts5Available_ && hasFilter;
     sql = std::string("SELECT e.id FROM entries e JOIN archives a ON e.archive_id = a.id ");
     if (hasFilter) {
-        sql += "WHERE e.entry_path LIKE ?1 ESCAPE '\\' ";
+        if (useFts) {
+            sql += "WHERE e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1) ";
+        } else {
+            sql += "WHERE e.entry_path LIKE ?1 ESCAPE '\\' ";
+        }
     }
     if (compressedSizeSort) {
         sql += std::string("ORDER BY CASE WHEN e.compressed_size < 0 THEN 1 ELSE 0 END ASC, ") + orderCol + " " + orderDir;
@@ -1114,10 +1223,15 @@ bool Database::QueryEntryIds(const std::wstring& filter, int sortColumn, bool so
     }
 
     if (hasFilter) {
-        std::wstring pattern = BuildSearchLikePattern(filter);
-        int needed = WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        std::string filterUtf8(needed > 0 ? needed - 1 : 0, '\0');
-        if (needed > 0) WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, filterUtf8.data(), needed, nullptr, nullptr);
+        std::string filterUtf8;
+        if (useFts) {
+            filterUtf8 = BuildFts5Query(filter);
+        } else {
+            std::wstring pattern = BuildSearchLikePattern(filter);
+            int needed = WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            filterUtf8.resize(needed > 0 ? needed - 1 : 0, '\0');
+            if (needed > 0) WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, filterUtf8.data(), needed, nullptr, nullptr);
+        }
         sqlite3_bind_text(stmt, 1, filterUtf8.c_str(), -1, SQLITE_TRANSIENT);
     }
 
@@ -1167,8 +1281,14 @@ int64_t Database::GetEntryCount(const std::wstring& filter)
 
     std::string sql;
     const bool hasFilter = !filter.empty();
+    const bool useFts = fts5Available_ && hasFilter;
     if (hasFilter) {
-        sql = "SELECT COUNT(*) FROM entries e JOIN archives a ON e.archive_id = a.id WHERE e.entry_path LIKE ?1 ESCAPE '\\'";
+        if (useFts) {
+            sql = "SELECT COUNT(*) FROM entries e JOIN archives a ON e.archive_id = a.id "
+                  "WHERE e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1)";
+        } else {
+            sql = "SELECT COUNT(*) FROM entries e JOIN archives a ON e.archive_id = a.id WHERE e.entry_path LIKE ?1 ESCAPE '\\'";
+        }
     } else {
         sql = "SELECT COUNT(*) FROM entries e JOIN archives a ON e.archive_id = a.id";
     }
@@ -1178,10 +1298,15 @@ int64_t Database::GetEntryCount(const std::wstring& filter)
     if (rc != SQLITE_OK) return 0;
 
     if (hasFilter) {
-        std::wstring pattern = BuildSearchLikePattern(filter);
-        int needed = WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        std::string filterUtf8(needed > 0 ? needed - 1 : 0, '\0');
-        if (needed > 0) WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, filterUtf8.data(), needed, nullptr, nullptr);
+        std::string filterUtf8;
+        if (useFts) {
+            filterUtf8 = BuildFts5Query(filter);
+        } else {
+            std::wstring pattern = BuildSearchLikePattern(filter);
+            int needed = WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            filterUtf8.resize(needed > 0 ? needed - 1 : 0, '\0');
+            if (needed > 0) WideCharToMultiByte(CP_UTF8, 0, pattern.c_str(), -1, filterUtf8.data(), needed, nullptr, nullptr);
+        }
         sqlite3_bind_text(stmt, 1, filterUtf8.c_str(), -1, SQLITE_TRANSIENT);
     }
 
@@ -1234,6 +1359,24 @@ bool Database::Vacuum()
     int rc = sqlite3_exec(db_, "VACUUM", nullptr, nullptr, &errMsg);
     if (rc != SQLITE_OK)
     {
+        if (errMsg) sqlite3_free(errMsg);
+        return false;
+    }
+    return true;
+}
+
+bool Database::RebuildFtsIndex(std::wstring* err)
+{
+    if (err) err->clear();
+    if (!db_) { if (err) *err = L"db not open"; return false; }
+    if (!fts5Available_) return true;
+
+    char* errMsg = nullptr;
+    int rc = sqlite3_exec(db_, "INSERT INTO entries_fts(entries_fts) VALUES('rebuild')", nullptr, nullptr, &errMsg);
+    if (rc != SQLITE_OK) {
+        if (err) {
+            *err = errMsg ? Utf8ToWString(errMsg) : L"FTS rebuild failed";
+        }
         if (errMsg) sqlite3_free(errMsg);
         return false;
     }

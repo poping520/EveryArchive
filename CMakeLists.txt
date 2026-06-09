@@ -237,7 +237,7 @@ target_include_directories(EveryZip PRIVATE
         external/unrar
 )
 
-target_compile_definitions(EveryZip PRIVATE UNICODE _UNICODE)
+target_compile_definitions(EveryZip PRIVATE UNICODE _UNICODE SQLITE_ENABLE_FTS5)
 
 if(MSVC)
     target_compile_options(EveryZip PRIVATE /utf-8)

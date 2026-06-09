@@ -286,6 +286,8 @@ public:
      */
     int64_t GetEntryCount(const std::wstring& filter);
 
+    bool RebuildFtsIndex(std::wstring* err);
+
 private:
     /**
      * 执行一段 UTF-16 SQL 文本。
@@ -296,4 +298,5 @@ private:
     bool ExecSql16(const std::wstring& sql, std::wstring* err);
 
     sqlite3* db_ = nullptr;
+    bool fts5Available_ = false;
 };
