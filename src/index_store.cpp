@@ -195,7 +195,7 @@ bool ImportSQLiteToEzdb(const std::wstring& sqlitePath, const std::wstring& ezdb
             DeleteFileW(tmp.c_str());
             return false;
         }
-        const bool countOk = ezdb_archive_count(validate) == archives.size() &&
+        const bool countOk = ezdb_count(validate) == archives.size() &&
                              ezdb_entry_count(validate) == entryCount;
         ezdb_close(validate);
         if (!countOk) {
@@ -668,7 +668,7 @@ public:
     {
         if (!db_ || !out) { SetErr(err, L"store not open"); return false; }
         out->clear();
-        const uint32_t count = ezdb_archive_count(db_);
+        const uint32_t count = ezdb_count(db_);
         const std::wstring lowered = ToLower(filter);
         for (uint32_t i = 0; i < count; ++i) {
             EzdbArchiveResult result{};
@@ -699,12 +699,12 @@ public:
         return RebuildAndUnload(&err);
     }
 
-    int64_t GetArchiveCount() override { return db_ ? ezdb_active_archive_count(db_) : 0; }
+    int64_t GetArchiveCount() override { return db_ ? ezdb_active_count(db_) : 0; }
 
     int64_t GetArchiveIdByPath(const std::wstring& filePath) override
     {
         if (!db_) return -1;
-        const uint32_t count = ezdb_archive_count(db_);
+        const uint32_t count = ezdb_count(db_);
         for (uint32_t i = 0; i < count; ++i) {
             EzdbArchiveResult result{};
             if (ezdb_get_archive(db_, i, &result) != 0) continue;
@@ -979,8 +979,8 @@ private:
         if (!db_) { SetErr(err, L"store not open"); return false; }
         archives_.clear();
         entries_.clear();
-        std::vector<int64_t> archiveIdMap(ezdb_archive_count(db_), -1);
-        for (uint32_t i = 0; i < ezdb_archive_count(db_); ++i) {
+        std::vector<int64_t> archiveIdMap(ezdb_count(db_), -1);
+        for (uint32_t i = 0; i < ezdb_count(db_); ++i) {
             EzdbArchiveResult result{};
             if (ezdb_get_archive(db_, i, &result) != 0) continue;
             archiveIdMap[i] = static_cast<int64_t>(archives_.size());
