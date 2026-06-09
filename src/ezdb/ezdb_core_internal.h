@@ -89,6 +89,23 @@ struct Ezdb {
     uint64_t txn_start_active_entry_count;
     int batch_index_deferred;
     int batch_index_dirty;
+
+    /* Bulk write mode: buffer archives + entries in memory, build at commit */
+    int bulk_write_mode;
+    EzdbArchiveRecord* bulk_archives;
+    char** bulk_archive_paths;       /* strdup'd file_path for each archive */
+    uint32_t bulk_archive_count;
+    uint32_t bulk_archive_cap;
+    uint32_t* bulk_archive_id_map;   /* original archive_id -> bulk index */
+    EzdbEntryRecord* bulk_entries;
+    char** bulk_entry_paths;         /* strdup'd entry_path per entry */
+    void** bulk_entry_raw_paths;     /* malloc'd raw_path per entry */
+    uint32_t bulk_entry_count;
+    uint32_t bulk_entry_cap;
+
+    /* Path cache for non-bulk transactions: avoids disk reads in rebuild */
+    char** delta_entry_path_cache;   /* entry_id -> strdup'd path */
+    uint32_t delta_entry_path_cache_cap;
 };
 
 char* ezdb_strdup_range(const char* text, size_t len);
@@ -133,3 +150,4 @@ uint64_t ezdb_file_modified_time_by_id(Ezdb* db, uint32_t id);
 const char* ezdb_file_name_by_id(Ezdb* db, uint32_t id);
 int ezdb_write_header(Ezdb* db);
 uint64_t ezdb_delta_append_offset(Ezdb* db);
+void ezdb_release_members(Ezdb* db, int free_path);

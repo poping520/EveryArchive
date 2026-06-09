@@ -47,6 +47,8 @@ typedef struct EzdbEntryStream {
 #define EZDB_BUILD_POSTING_COMPRESSION 0x02u
 #define EZDB_BUILD_DEFAULT_FLAGS (EZDB_BUILD_ENTRY_INDEX | EZDB_BUILD_POSTING_COMPRESSION)
 
+#define EZDB_WRITE_BULK 1u   /* bulk mode: buffer entries, build at commit */
+
 typedef struct EzdbBuildOptions {
     const char* temp_dir;
     uint32_t memory_limit_mb;

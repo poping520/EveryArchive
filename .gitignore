@@ -1,7 +1,8 @@
 .idea
 .vscode
 build
+cmake-build-*
 external/7z
 external/zlib
-cmake-build-*
+logs
 test_data/*

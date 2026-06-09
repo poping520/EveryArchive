@@ -596,7 +596,7 @@ void Indexer::Start(HWND hWnd) {
                         bool parseWriteTxnActive = false;
                         {
                             std::wstring txnErr;
-                            if (store->BeginWrite(&txnErr)) {
+                            if (store->BeginWrite(&txnErr, true)) {
                                 parseWriteTxnActive = true;
                             } else {
                                 LOG_WARN(L"Initial archive parsing write transaction disabled: %s", txnErr.c_str());

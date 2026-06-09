@@ -1240,7 +1240,7 @@ int ezdb_open(const char* path, Ezdb** out_db)
     return EZDB_OK;
 }
 
-static void ezdb_release_members(Ezdb* db, int free_path)
+void ezdb_release_members(Ezdb* db, int free_path)
 {
     if (!db) return;
     if (db->fp) fclose(db->fp);
@@ -1282,6 +1282,27 @@ static void ezdb_release_members(Ezdb* db, int free_path)
     }
     free(db->deltas);
     free(db->delta_buckets);
+    /* Bulk mode buffers */
+    if (db->bulk_archive_paths) {
+        for (uint32_t i = 0; i < db->bulk_archive_count; ++i) free(db->bulk_archive_paths[i]);
+    }
+    free(db->bulk_archives);
+    free(db->bulk_archive_paths);
+    free(db->bulk_archive_id_map);
+    if (db->bulk_entry_paths) {
+        for (uint32_t i = 0; i < db->bulk_entry_count; ++i) free(db->bulk_entry_paths[i]);
+    }
+    if (db->bulk_entry_raw_paths) {
+        for (uint32_t i = 0; i < db->bulk_entry_count; ++i) free(db->bulk_entry_raw_paths[i]);
+    }
+    free(db->bulk_entries);
+    free(db->bulk_entry_paths);
+    free(db->bulk_entry_raw_paths);
+    /* Path cache */
+    if (db->delta_entry_path_cache) {
+        for (uint32_t i = 0; i < db->delta_entry_path_cache_cap; ++i) free(db->delta_entry_path_cache[i]);
+    }
+    free(db->delta_entry_path_cache);
 }
 
 void ezdb_close(Ezdb* db)
@@ -1573,6 +1594,16 @@ int ezdb_compact(Ezdb* db)
     if (!db) return EZDB_ERR_ARG;
     if (db->read_only) return EZDB_ERR_READ_ONLY;
     if (!db->path) return EZDB_ERR_ARG;
+
+    /* If no delta entries exist, database is already compact */
+    {
+        int has_delta = 0;
+        for (uint32_t e = 0; e < db->header.entry_count && !has_delta; ++e) {
+            if (ezdb_bitset_get(db->delta_entry_bits, e)) has_delta = 1;
+        }
+        if (!has_delta && db->header.delta_size == 0) return EZDB_OK;
+    }
+
     uint32_t active_archives = ezdb_active_count(db);
     uint32_t active_entries = ezdb_compute_active_entry_count(db);
     EzdbArchiveRecord* archives = (EzdbArchiveRecord*)calloc(active_archives ? active_archives : 1u, sizeof(EzdbArchiveRecord));

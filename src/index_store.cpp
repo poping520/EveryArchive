@@ -406,7 +406,7 @@ public:
     bool IsOpen() const override { return db_.IsOpen(); }
     void SetBusyTimeout(int ms) override { db_.SetBusyTimeout(ms); }
     bool OpenOrCreate(const std::wstring& path, std::wstring* err) override { return Open(path, err) && EnsureSchema(err, true); }
-    bool BeginWrite(std::wstring* err) override { (void)err; return db_.BeginTransaction(); }
+    bool BeginWrite(std::wstring* err, bool bulk = false) override { (void)err; (void)bulk; return db_.BeginTransaction(); }
     bool CommitWrite(std::wstring* err) override { (void)err; return db_.CommitTransaction(); }
     bool RollbackWrite() override { return db_.RollbackTransaction(); }
 
@@ -562,11 +562,11 @@ public:
     void SetBusyTimeout(int ms) override { (void)ms; }
     bool EnsureSchema(std::wstring* err, bool includeConfigs) override { (void)err; (void)includeConfigs; return true; }
 
-    bool BeginWrite(std::wstring* err) override
+    bool BeginWrite(std::wstring* err, bool bulk = false) override
     {
         if (txnActive_) { SetErr(err, L"write transaction already active"); return false; }
         if (!db_) { SetErr(err, L"store not open"); return false; }
-        int rc = ezdb_begin_write(db_, 0);
+        int rc = ezdb_begin_write(db_, bulk ? EZDB_WRITE_BULK : 0u);
         if (rc != 0) { SetErr(err, Utf8ToWString(ezdb_error_message(rc))); return false; }
         txnActive_ = true;
         dirty_ = false;

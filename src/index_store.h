@@ -47,7 +47,7 @@ public:
     virtual bool OpenOrCreate(const std::wstring& path, std::wstring* err) = 0;
     virtual bool EnsureSchema(std::wstring* err, bool includeConfigs) = 0;
 
-    virtual bool BeginWrite(std::wstring* err) = 0;
+    virtual bool BeginWrite(std::wstring* err, bool bulk = false) = 0;
     virtual bool CommitWrite(std::wstring* err) = 0;
     virtual bool RollbackWrite() = 0;
 
