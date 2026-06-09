@@ -583,6 +583,25 @@ static int append_entry_delta_disk(Ezdb* db, uint32_t archive_id, const EzdbEntr
     db->header.reserved_offset = old_reserved_offset;
     return rc;
 }
+
+static void cleanup_txn_state(Ezdb* db)
+{
+    free(db->txn_start_active_bits);
+    db->txn_start_active_bits = NULL;
+    free(db->txn_start_active_entry_bits);
+    db->txn_start_active_entry_bits = NULL;
+    db->txn_start_active_bit_bytes = 0;
+    db->txn_start_active_entry_bit_bytes = 0;
+    db->txn_start_delta_count = 0;
+    db->txn_start_delta_cap = 0;
+    db->txn_start_entry_count = 0;
+    db->txn_start_active_entry_count = 0;
+    db->write_txn_active = 0;
+    db->batch_index_deferred = 0;
+    db->batch_index_dirty = 0;
+    ezdb_path_cache_free(db);
+}
+
 int ezdb_begin_write(Ezdb* db, uint32_t flags)
 {
     if (!db) return EZDB_ERR_ARG;
@@ -770,15 +789,8 @@ int ezdb_commit_write(Ezdb* db)
         free(tmp_path);
 
     bulk_cleanup:
-        if (own_archives) {
-            /* Original bulk buffer archives: free strdup'd paths */
-            for (uint32_t i = 0; i < bc; ++i) { if (bap && bap[i]) free(bap[i]); }
-            free(ba); free(bap); free(baim);
-        } else {
-            /* Extracted from db: bap has result.path ownership */
-            for (uint32_t i = 0; i < bc; ++i) { if (bap && bap[i]) free(bap[i]); }
-            free(ba); free(bap); free(baim);
-        }
+        for (uint32_t i = 0; i < bc; ++i) { if (bap && bap[i]) free(bap[i]); }
+        free(ba); free(bap); free(baim);
         for (uint32_t i = 0; i < ec; ++i) {
             if (bep && bep[i]) free(bep[i]);
             if (berp && berp[i]) free(berp[i]);
@@ -795,31 +807,10 @@ int ezdb_commit_write(Ezdb* db)
     if (rc == EZDB_OK) rc = ezdb_write_header(db);
     if (rc != EZDB_OK) {
         (void)restore_txn_snapshot(db);
-        db->write_txn_active = 0;
-        free(db->txn_start_active_bits);
-        db->txn_start_active_bits = NULL;
-        free(db->txn_start_active_entry_bits);
-        db->txn_start_active_entry_bits = NULL;
-        db->txn_start_active_bit_bytes = 0;
-        db->txn_start_active_entry_bit_bytes = 0;
-        db->txn_start_entry_count = 0;
-        db->txn_start_active_entry_count = 0;
+        cleanup_txn_state(db);
         return rc;
     }
-    db->write_txn_active = 0;
-    db->batch_index_deferred = 0;
-    db->batch_index_dirty = 0;
-    ezdb_path_cache_free(db);
-    free(db->txn_start_active_bits);
-    db->txn_start_active_bits = NULL;
-    free(db->txn_start_active_entry_bits);
-    db->txn_start_active_entry_bits = NULL;
-    db->txn_start_active_bit_bytes = 0;
-    db->txn_start_active_entry_bit_bytes = 0;
-    db->txn_start_delta_count = 0;
-    db->txn_start_delta_cap = 0;
-    db->txn_start_entry_count = 0;
-    db->txn_start_active_entry_count = 0;
+    cleanup_txn_state(db);
     return EZDB_OK;
 }
 
@@ -839,20 +830,7 @@ int ezdb_rollback_write(Ezdb* db)
     }
 
     int rc = restore_txn_snapshot(db);
-    db->write_txn_active = 0;
-    db->batch_index_deferred = 0;
-    db->batch_index_dirty = 0;
-    ezdb_path_cache_free(db);
-    free(db->txn_start_active_bits);
-    db->txn_start_active_bits = NULL;
-    free(db->txn_start_active_entry_bits);
-    db->txn_start_active_entry_bits = NULL;
-    db->txn_start_active_bit_bytes = 0;
-    db->txn_start_active_entry_bit_bytes = 0;
-    db->txn_start_delta_count = 0;
-    db->txn_start_delta_cap = 0;
-    db->txn_start_entry_count = 0;
-    db->txn_start_active_entry_count = 0;
+    cleanup_txn_state(db);
     if (db->fp) {
         if (db->format_v13) {
             int wrc = ezdb_write_header(db);

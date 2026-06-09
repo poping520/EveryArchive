@@ -14,11 +14,6 @@ typedef struct EzdbQueryParser {
     int error;
 } EzdbQueryParser;
 
-static unsigned char ezdb_query_fold_ascii_byte(unsigned char ch)
-{
-    return (ch >= 'A' && ch <= 'Z') ? (unsigned char)(ch + ('a' - 'A')) : ch;
-}
-
 int ezdb_query_contains_ascii_casefold(const char* text, size_t text_len, const char* needle, size_t needle_len)
 {
     if (!needle_len) return 1;
@@ -26,7 +21,7 @@ int ezdb_query_contains_ascii_casefold(const char* text, size_t text_len, const 
     for (size_t i = 0; i + needle_len <= text_len; ++i) {
         size_t j = 0;
         while (j < needle_len &&
-               ezdb_query_fold_ascii_byte((unsigned char)text[i + j]) == ezdb_query_fold_ascii_byte((unsigned char)needle[j])) ++j;
+               ezdb_fold_ascii_byte((unsigned char)text[i + j]) == ezdb_fold_ascii_byte((unsigned char)needle[j])) ++j;
         if (j == needle_len) return 1;
     }
     return 0;
@@ -257,7 +252,7 @@ static int ezdb_query_wildcard_match_here(const char* text, size_t text_len, con
             continue;
         }
         if (pi < pattern_len &&
-            ezdb_query_fold_ascii_byte((unsigned char)text[ti]) == ezdb_query_fold_ascii_byte((unsigned char)pattern[pi])) {
+            ezdb_fold_ascii_byte((unsigned char)text[ti]) == ezdb_fold_ascii_byte((unsigned char)pattern[pi])) {
             ++ti;
             ++pi;
             continue;
@@ -468,6 +463,46 @@ int ezdb_bitset_any(const unsigned char* data, size_t size)
     return 0;
 }
 
+static int merge_candidate_bitsets(EzdbQueryNode* node,
+                                   unsigned char* left, int left_positive,
+                                   unsigned char* right, int right_positive,
+                                   size_t bit_bytes,
+                                   unsigned char** out_bits, int* out_has_positive)
+{
+    *out_bits = NULL;
+    *out_has_positive = 0;
+    if (node->type == EZDB_QUERY_AND) {
+        if (left_positive && right_positive) {
+            ezdb_bitset_and_into(left, right, bit_bytes);
+            free(right);
+            *out_bits = left;
+            *out_has_positive = 1;
+        } else if (left_positive) {
+            *out_bits = left;
+            *out_has_positive = 1;
+            free(right);
+        } else if (right_positive) {
+            *out_bits = right;
+            *out_has_positive = 1;
+            free(left);
+        } else {
+            free(left);
+            free(right);
+        }
+    } else {
+        if (left_positive && right_positive) {
+            ezdb_bitset_or_into(left, right, bit_bytes);
+            free(right);
+            *out_bits = left;
+            *out_has_positive = 1;
+        } else {
+            free(left);
+            free(right);
+        }
+    }
+    return EZDB_OK;
+}
+
 static int query_build_candidate_bitset(Ezdb* db, EzdbQueryNode* node, unsigned char** out_bits, int* out_has_positive)
 {
     *out_bits = NULL;
@@ -508,37 +543,7 @@ static int query_build_candidate_bitset(Ezdb* db, EzdbQueryNode* node, unsigned 
             free(right);
             return rc;
         }
-        if (node->type == EZDB_QUERY_AND) {
-            if (left_positive && right_positive) {
-                ezdb_bitset_and_into(left, right, bit_bytes);
-                free(right);
-                *out_bits = left;
-                *out_has_positive = 1;
-            } else if (left_positive) {
-                *out_bits = left;
-                *out_has_positive = 1;
-                free(right);
-            } else if (right_positive) {
-                *out_bits = right;
-                *out_has_positive = 1;
-                free(left);
-            } else {
-                free(left);
-                free(right);
-            }
-        } else {
-            if (left_positive && right_positive) {
-                ezdb_bitset_or_into(left, right, bit_bytes);
-                free(right);
-                *out_bits = left;
-                *out_has_positive = 1;
-            } else {
-                free(left);
-                free(right);
-                *out_bits = NULL;
-                *out_has_positive = 0;
-            }
-        }
+        return merge_candidate_bitsets(node, left, left_positive, right, right_positive, bit_bytes, out_bits, out_has_positive);
     }
     return EZDB_OK;
 }
@@ -649,7 +654,9 @@ static int mark_entry_scope_literal_candidates(Ezdb* db, const char* literal, si
         rc = mark_entry_literal_candidates(db, literal, literal_len, seen, any_marked);
     }
     if (rc == EZDB_OK && (scope & EZDB_SEARCH_COMBINED_PATH)) {
-        rc = mark_entry_literal_candidates(db, literal, literal_len, seen, any_marked);
+        if (!(scope & EZDB_SEARCH_ENTRY_PATH)) {
+            rc = mark_entry_literal_candidates(db, literal, literal_len, seen, any_marked);
+        }
         if (rc == EZDB_OK) rc = mark_archive_literal_entry_candidates(db, literal, literal_len, seen, any_marked);
     }
     return rc;
@@ -707,37 +714,7 @@ static int query_build_entry_candidate_bitset(Ezdb* db, EzdbQueryNode* node, con
             free(right);
             return rc;
         }
-        if (node->type == EZDB_QUERY_AND) {
-            if (left_positive && right_positive) {
-                ezdb_bitset_and_into(left, right, bit_bytes);
-                free(right);
-                *out_bits = left;
-                *out_has_positive = 1;
-            } else if (left_positive) {
-                *out_bits = left;
-                *out_has_positive = 1;
-                free(right);
-            } else if (right_positive) {
-                *out_bits = right;
-                *out_has_positive = 1;
-                free(left);
-            } else {
-                free(left);
-                free(right);
-            }
-        } else {
-            if (left_positive && right_positive) {
-                ezdb_bitset_or_into(left, right, bit_bytes);
-                free(right);
-                *out_bits = left;
-                *out_has_positive = 1;
-            } else {
-                free(left);
-                free(right);
-                *out_bits = NULL;
-                *out_has_positive = 0;
-            }
-        }
+        return merge_candidate_bitsets(node, left, left_positive, right, right_positive, bit_bytes, out_bits, out_has_positive);
     }
     return EZDB_OK;
 }

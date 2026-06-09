@@ -1308,16 +1308,6 @@ uint32_t ezdb_active_count(Ezdb* db)
     return db ? (uint32_t)db->header.active_count : 0;
 }
 
-uint32_t ezdb_archive_count(Ezdb* db)
-{
-    return ezdb_count(db);
-}
-
-uint32_t ezdb_active_archive_count(Ezdb* db)
-{
-    return ezdb_active_count(db);
-}
-
 uint32_t ezdb_entry_count(Ezdb* db)
 {
     return db ? (uint32_t)db->header.entry_count : 0;

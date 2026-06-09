@@ -177,16 +177,8 @@ static int build_append_file(EzdbArchiveBuildTree* tree,
     return EZDB_OK;
 }
 
-static int build_append_varuint(unsigned char** data, uint32_t* size, uint32_t* cap, uint32_t value)
+static int build_append_varuint_raw(unsigned char** data, uint32_t* size, uint32_t* cap, const unsigned char* bytes, uint32_t count)
 {
-    unsigned char bytes[5];
-    uint32_t count = 0;
-    do {
-        bytes[count] = (unsigned char)(value & 0x7fu);
-        value >>= 7u;
-        if (value) bytes[count] |= 0x80u;
-        ++count;
-    } while (value);
     if (*size + count > *cap) {
         uint32_t next = *cap ? *cap : 256u;
         while (next < *size + count) {
@@ -203,6 +195,19 @@ static int build_append_varuint(unsigned char** data, uint32_t* size, uint32_t* 
     return EZDB_OK;
 }
 
+static int build_append_varuint(unsigned char** data, uint32_t* size, uint32_t* cap, uint32_t value)
+{
+    unsigned char bytes[5];
+    uint32_t count = 0;
+    do {
+        bytes[count] = (unsigned char)(value & 0x7fu);
+        value >>= 7u;
+        if (value) bytes[count] |= 0x80u;
+        ++count;
+    } while (value);
+    return build_append_varuint_raw(data, size, cap, bytes, count);
+}
+
 static int build_append_varuint64(unsigned char** data, uint32_t* size, uint32_t* cap, uint64_t value)
 {
     unsigned char bytes[10];
@@ -213,20 +218,7 @@ static int build_append_varuint64(unsigned char** data, uint32_t* size, uint32_t
         if (value) bytes[count] |= 0x80u;
         ++count;
     } while (value);
-    if (*size + count > *cap) {
-        uint32_t next = *cap ? *cap : 256u;
-        while (next < *size + count) {
-            if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
-            next *= 2u;
-        }
-        unsigned char* new_data = (unsigned char*)realloc(*data, next);
-        if (!new_data) return EZDB_ERR_MEMORY;
-        *data = new_data;
-        *cap = next;
-    }
-    memcpy(*data + *size, bytes, count);
-    *size += count;
-    return EZDB_OK;
+    return build_append_varuint_raw(data, size, cap, bytes, count);
 }
 
 static uint32_t build_dfs_assign(EzdbBuildDir* dirs,

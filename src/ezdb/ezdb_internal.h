@@ -4,13 +4,15 @@
 
 #include <stdint.h>
 
-#define EZDB_POSTING_COMPRESS_MIN_SIZE 256u
-#define EZDB_POSTING_COMPRESS_MIN_SAVING 16u
-#define EZDB_POSTING_COMPRESSION_LEVEL 1
 #define EZDB_SECTION_COMPRESSED 1u
 #define EZDB_SECTION_COMPRESS_MIN_SIZE 4096u
 #define EZDB_SECTION_COMPRESS_MIN_SAVING 256u
 #define EZDB_SECTION_COMPRESSION_LEVEL 3
+
+static inline unsigned char ezdb_fold_ascii_byte(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ? (unsigned char)(ch + ('a' - 'A')) : ch;
+}
 
 enum {
     EZDB_OK = 0,

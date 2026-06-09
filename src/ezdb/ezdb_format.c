@@ -43,15 +43,15 @@ static int ezdb_format_section_range_compare(const void* a, const void* b)
 
 int ezdb_format_validate_section_table(const EzdbSectionDesc* sections, uint32_t section_count, uint64_t file_size)
 {
-    if (!sections && section_count) return EZDB_FORMAT_ERR_ARG;
-    if (!section_count) return EZDB_FORMAT_ERR_FORMAT;
+    if (!sections && section_count) return EZDB_ERR_ARG;
+    if (!section_count) return EZDB_ERR_FORMAT;
 
     EzdbSectionDesc* by_id = (EzdbSectionDesc*)malloc(sizeof(EzdbSectionDesc) * (size_t)section_count);
     EzdbSectionRange* ranges = (EzdbSectionRange*)malloc(sizeof(EzdbSectionRange) * (size_t)section_count * 2u);
     if (!by_id || !ranges) {
         free(by_id);
         free(ranges);
-        return EZDB_FORMAT_ERR_MEMORY;
+        return EZDB_ERR_MEMORY;
     }
     memcpy(by_id, sections, sizeof(EzdbSectionDesc) * (size_t)section_count);
     qsort(by_id, section_count, sizeof(EzdbSectionDesc), ezdb_format_section_compare);
@@ -62,32 +62,32 @@ int ezdb_format_validate_section_table(const EzdbSectionDesc* sections, uint32_t
         if (!ezdb_format_section_id_is_known(section->section_id)) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (i && by_id[i - 1u].section_id == section->section_id) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (section->encoded_size > file_size || section->offset > file_size - section->encoded_size) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (!section->encoded_size && section->raw_size) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (section->aux_size > file_size || section->aux_offset > file_size - section->aux_size) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (!section->aux_size && section->aux_count) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
         if (section->encoded_size) {
             ranges[range_count].offset = section->offset;
@@ -108,13 +108,13 @@ int ezdb_format_validate_section_table(const EzdbSectionDesc* sections, uint32_t
         if (cur->offset < prev->offset + prev->size) {
             free(by_id);
             free(ranges);
-            return EZDB_FORMAT_ERR_FORMAT;
+            return EZDB_ERR_FORMAT;
         }
     }
 
     free(by_id);
     free(ranges);
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }
 
 const EzdbSectionDesc* ezdb_format_find_section(const EzdbSectionDesc* sections, uint32_t section_count, uint32_t section_id)
@@ -132,16 +132,16 @@ int ezdb_format_write_section_table(FILE* fp,
                                     uint64_t* out_offset,
                                     uint64_t* out_size)
 {
-    if (!fp || (!sections && section_count)) return EZDB_FORMAT_ERR_ARG;
+    if (!fp || (!sections && section_count)) return EZDB_ERR_ARG;
     __int64 pos = _ftelli64(fp);
-    if (pos < 0) return EZDB_FORMAT_ERR_IO;
+    if (pos < 0) return EZDB_ERR_IO;
     uint64_t offset = (uint64_t)pos;
     if (section_count && fwrite(sections, sizeof(EzdbSectionDesc), (size_t)section_count, fp) != (size_t)section_count) {
-        return EZDB_FORMAT_ERR_IO;
+        return EZDB_ERR_IO;
     }
     if (out_offset) *out_offset = offset;
     if (out_size) *out_size = sizeof(EzdbSectionDesc) * (uint64_t)section_count;
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }
 
 static void ezdb_format_add_v13_section(EzdbSectionDesc* sections,
@@ -176,7 +176,7 @@ int ezdb_format_build_v13_sections_from_header(const EzdbHeader* header,
                                                uint32_t section_cap,
                                                uint32_t* out_section_count)
 {
-    if (!header || !sections || !out_section_count || section_cap < EZDB_SECTION_METADATA) return EZDB_FORMAT_ERR_ARG;
+    if (!header || !sections || !out_section_count || section_cap < EZDB_SECTION_METADATA) return EZDB_ERR_ARG;
     uint32_t count = 0;
     ezdb_format_add_v13_section(sections, &count, EZDB_SECTION_ARCHIVE_RECORDS,
                                 header->file_records_flags,
@@ -257,7 +257,7 @@ int ezdb_format_build_v13_sections_from_header(const EzdbHeader* header,
                                 header->delta_size,
                                 0, 0, 0, 0);
     *out_section_count = count;
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }
 
 int ezdb_format_write_v13_disk_header(FILE* fp,
@@ -265,7 +265,7 @@ int ezdb_format_write_v13_disk_header(FILE* fp,
                                       uint32_t section_count,
                                       uint64_t section_table_offset)
 {
-    if (!fp || !header) return EZDB_FORMAT_ERR_ARG;
+    if (!fp || !header) return EZDB_ERR_ARG;
     EzdbV13Header disk_header;
     memset(&disk_header, 0, sizeof(disk_header));
     memcpy(disk_header.magic, EZDB_V13_MAGIC, sizeof(disk_header.magic));
@@ -281,9 +281,9 @@ int ezdb_format_write_v13_disk_header(FILE* fp,
     disk_header.base_archive_count = header->base_file_count;
     disk_header.base_entry_count = header->base_entry_count;
     if (fseek(fp, 0, SEEK_SET) != 0 || fwrite(&disk_header, sizeof(disk_header), 1, fp) != 1) {
-        return EZDB_FORMAT_ERR_IO;
+        return EZDB_ERR_IO;
     }
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }
 
 int ezdb_format_write_v13_header_and_section_table(FILE* fp,
@@ -291,23 +291,23 @@ int ezdb_format_write_v13_header_and_section_table(FILE* fp,
                                                    uint64_t* out_table_offset,
                                                    uint64_t* out_table_size)
 {
-    if (!fp || !header) return EZDB_FORMAT_ERR_ARG;
+    if (!fp || !header) return EZDB_ERR_ARG;
     EzdbSectionDesc sections[EZDB_SECTION_METADATA];
     uint32_t section_count = 0;
     int rc = ezdb_format_build_v13_sections_from_header(header, sections, EZDB_SECTION_METADATA, &section_count);
-    if (rc != EZDB_FORMAT_OK) return rc;
+    if (rc != EZDB_OK) return rc;
     uint64_t table_offset = 0;
     uint64_t table_size = 0;
     rc = ezdb_format_write_section_table(fp, sections, section_count, &table_offset, &table_size);
-    if (rc != EZDB_FORMAT_OK) return rc;
+    if (rc != EZDB_OK) return rc;
     uint64_t file_size = table_offset + table_size;
     rc = ezdb_format_validate_section_table(sections, section_count, file_size);
-    if (rc != EZDB_FORMAT_OK) return rc;
+    if (rc != EZDB_OK) return rc;
     rc = ezdb_format_write_v13_disk_header(fp, header, section_count, table_offset);
-    if (rc != EZDB_FORMAT_OK) return rc;
+    if (rc != EZDB_OK) return rc;
     if (out_table_offset) *out_table_offset = table_offset;
     if (out_table_size) *out_table_size = table_size;
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }
 
 int ezdb_format_read_section_table(FILE* fp,
@@ -315,26 +315,26 @@ int ezdb_format_read_section_table(FILE* fp,
                                    uint64_t file_size,
                                    EzdbSectionDesc** out_sections)
 {
-    if (!fp || !header || !out_sections) return EZDB_FORMAT_ERR_ARG;
+    if (!fp || !header || !out_sections) return EZDB_ERR_ARG;
     *out_sections = NULL;
-    if (!ezdb_format_v13_header_is_current(header)) return EZDB_FORMAT_ERR_FORMAT;
-    if (!header->section_count) return EZDB_FORMAT_ERR_FORMAT;
+    if (!ezdb_format_v13_header_is_current(header)) return EZDB_ERR_FORMAT;
+    if (!header->section_count) return EZDB_ERR_FORMAT;
     uint64_t table_size = sizeof(EzdbSectionDesc) * (uint64_t)header->section_count;
     if (table_size > file_size || header->section_table_offset > file_size - table_size) {
-        return EZDB_FORMAT_ERR_FORMAT;
+        return EZDB_ERR_FORMAT;
     }
     EzdbSectionDesc* sections = (EzdbSectionDesc*)malloc(sizeof(EzdbSectionDesc) * (size_t)header->section_count);
-    if (!sections) return EZDB_FORMAT_ERR_MEMORY;
+    if (!sections) return EZDB_ERR_MEMORY;
     if (_fseeki64(fp, (__int64)header->section_table_offset, SEEK_SET) != 0 ||
         fread(sections, sizeof(EzdbSectionDesc), (size_t)header->section_count, fp) != (size_t)header->section_count) {
         free(sections);
-        return EZDB_FORMAT_ERR_IO;
+        return EZDB_ERR_IO;
     }
     int rc = ezdb_format_validate_section_table(sections, header->section_count, file_size);
-    if (rc != EZDB_FORMAT_OK) {
+    if (rc != EZDB_OK) {
         free(sections);
         return rc;
     }
     *out_sections = sections;
-    return EZDB_FORMAT_OK;
+    return EZDB_OK;
 }

@@ -205,8 +205,6 @@ void ezdb_close(Ezdb* db);
 
 uint32_t ezdb_count(Ezdb* db);              /* 压缩包总记录数（含已删除） */
 uint32_t ezdb_active_count(Ezdb* db);       /* 活跃压缩包记录数 */
-uint32_t ezdb_archive_count(Ezdb* db);      /* 同 ezdb_count（语义别名） */
-uint32_t ezdb_active_archive_count(Ezdb* db);/* 同 ezdb_active_count（语义别名） */
 uint32_t ezdb_entry_count(Ezdb* db);        /* 条目总记录数（含已删除） */
 uint32_t ezdb_active_entry_count(Ezdb* db); /* 活跃条目记录数 */
 uint64_t ezdb_file_size(Ezdb* db);          /* 数据库文件当前大小 */

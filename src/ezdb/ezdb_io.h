@@ -7,7 +7,6 @@
 #include <stdio.h>
 
 int ezdb_io_write_bytes(FILE* fp, const void* data, uint32_t size, uint64_t* written);
-int ezdb_io_maybe_compress_payload(const unsigned char* raw, uint32_t raw_size, unsigned char** out_data, uint32_t* out_size, int* out_compressed);
 int ezdb_io_maybe_compress_section(const unsigned char* raw, uint64_t raw_size, unsigned char** out_data, uint64_t* out_size, uint32_t* out_flags);
 int ezdb_io_write_compressed_section(FILE* out, const unsigned char* raw, uint64_t raw_size, uint64_t* out_written, uint32_t* out_flags);
 int ezdb_io_read_section_payload(FILE* fp, uint64_t offset, uint64_t encoded_size, uint64_t raw_size, uint32_t flags, unsigned char** out_data);
@@ -38,7 +37,6 @@ int ezdb_io_section_var_reader_varuint(EzdbSectionVarReader* reader, uint32_t* o
 int ezdb_io_section_var_reader_varuint64(EzdbSectionVarReader* reader, uint64_t* out);
 
 #define write_bytes ezdb_io_write_bytes
-#define maybe_compress_payload ezdb_io_maybe_compress_payload
 #define maybe_compress_section ezdb_io_maybe_compress_section
 #define write_compressed_section ezdb_io_write_compressed_section
 #define read_section_payload ezdb_io_read_section_payload

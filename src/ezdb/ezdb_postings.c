@@ -10,11 +10,6 @@
 #endif
 #include <windows.h>
 
-static unsigned char ezdb_postings_fold_ascii_byte(unsigned char ch)
-{
-    return (ch >= 'A' && ch <= 'Z') ? (unsigned char)(ch + ('a' - 'A')) : ch;
-}
-
 static int ezdb_postings_u32_compare(const void* a, const void* b)
 {
     uint32_t av = *(const uint32_t*)a;
@@ -154,7 +149,7 @@ uint32_t ezdb_postings_make_gram_key_from_span(const char* text, uint32_t offset
     const unsigned char* s = (const unsigned char*)text + offset;
     if (len <= 3u) {
         uint32_t value = 0;
-        for (uint32_t i = 0; i < len; ++i) value = (value << 8) | (uint32_t)ezdb_postings_fold_ascii_byte(s[i]);
+        for (uint32_t i = 0; i < len; ++i) value = (value << 8) | (uint32_t)ezdb_fold_ascii_byte(s[i]);
         return (EZDB_TOKEN_INLINE << 31) | (token_count << 24) | value;
     }
     uint32_t hash = ezdb_fnv1a_bytes(text + offset, len) & 0x00ffffffu;
@@ -1368,15 +1363,15 @@ int ezdb_postings_write(FILE* out,
         }
 
         unsigned char* payload = NULL;
-        uint32_t payload_size = 0;
-        int compressed = 0;
+        uint64_t payload_size = 0;
+        uint32_t payload_flags = 0;
         stage_start_ms = ezdb_now_ms();
-        rc = maybe_compress_payload(raw_payload, raw_size, &payload, &payload_size, &compressed);
+        rc = ezdb_io_maybe_compress_section(raw_payload, raw_size, &payload, &payload_size, &payload_flags);
         if (stats) {
             stats->compress_ms += ezdb_now_ms() - stage_start_ms;
             stats->raw_bytes += raw_size;
             stats->encoded_bytes += payload_size;
-            if (compressed) stats->compressed_count += 1u;
+            if (payload_flags & EZDB_SECTION_COMPRESSED) stats->compressed_count += 1u;
         }
         free(raw_payload);
         if (rc != EZDB_OK) {
@@ -1387,7 +1382,7 @@ int ezdb_postings_write(FILE* out,
 
         uint64_t local_offset = written;
         stage_start_ms = ezdb_now_ms();
-        rc = write_bytes(out, payload, payload_size, &written);
+        rc = write_bytes(out, payload, (uint32_t)payload_size, &written);
         if (stats) stats->fwrite_ms += ezdb_now_ms() - stage_start_ms;
         free(payload);
         if (rc != EZDB_OK) {
@@ -1404,7 +1399,7 @@ int ezdb_postings_write(FILE* out,
         stage_start_ms = ezdb_now_ms();
         indexes[index_count].key = entry->key;
         indexes[index_count].count = entry->count;
-        indexes[index_count].container_type = type | (compressed ? EZDB_POSTING_COMPRESSED : 0u);
+        indexes[index_count].container_type = type | ((payload_flags & EZDB_SECTION_COMPRESSED) ? EZDB_POSTING_COMPRESSED : 0u);
         indexes[index_count].encoded_size = (uint32_t)(written - local_offset);
         indexes[index_count].raw_size = raw_size;
         indexes[index_count].offset = local_offset;

@@ -14,36 +14,6 @@ int ezdb_io_write_bytes(FILE* fp, const void* data, uint32_t size, uint64_t* wri
     return EZDB_OK;
 }
 
-int ezdb_io_maybe_compress_payload(const unsigned char* raw, uint32_t raw_size, unsigned char** out_data, uint32_t* out_size, int* out_compressed)
-{
-    if (!out_data || !out_size || !out_compressed || (!raw && raw_size)) return EZDB_ERR_ARG;
-    *out_data = NULL;
-    *out_size = 0;
-    *out_compressed = 0;
-    if (raw_size >= EZDB_POSTING_COMPRESS_MIN_SIZE) {
-        uLongf bound = compressBound((uLong)raw_size);
-        if (bound <= UINT32_MAX) {
-            unsigned char* compressed = (unsigned char*)malloc((size_t)bound);
-            if (!compressed) return EZDB_ERR_MEMORY;
-            uLongf compressed_size = bound;
-            int zrc = compress2(compressed, &compressed_size, raw, (uLong)raw_size, EZDB_POSTING_COMPRESSION_LEVEL);
-            if (zrc == Z_OK && compressed_size + EZDB_POSTING_COMPRESS_MIN_SAVING < raw_size && compressed_size <= UINT32_MAX) {
-                *out_data = compressed;
-                *out_size = (uint32_t)compressed_size;
-                *out_compressed = 1;
-                return EZDB_OK;
-            }
-            free(compressed);
-        }
-    }
-    unsigned char* copy = (unsigned char*)malloc(raw_size ? raw_size : 1u);
-    if (!copy) return EZDB_ERR_MEMORY;
-    if (raw_size) memcpy(copy, raw, raw_size);
-    *out_data = copy;
-    *out_size = raw_size;
-    return EZDB_OK;
-}
-
 int ezdb_io_maybe_compress_section(const unsigned char* raw, uint64_t raw_size, unsigned char** out_data, uint64_t* out_size, uint32_t* out_flags)
 {
     if (!out_data || !out_size || !out_flags || (!raw && raw_size)) return EZDB_ERR_ARG;
@@ -58,7 +28,7 @@ int ezdb_io_maybe_compress_section(const unsigned char* raw, uint64_t raw_size, 
             if (!compressed) return EZDB_ERR_MEMORY;
             uLongf compressed_size = bound;
             int zrc = compress2(compressed, &compressed_size, raw, (uLong)raw_size, EZDB_SECTION_COMPRESSION_LEVEL);
-            if (zrc == Z_OK && compressed_size + EZDB_SECTION_COMPRESS_MIN_SAVING < raw_size) {
+            if (zrc == Z_OK && (uint64_t)compressed_size + EZDB_SECTION_COMPRESS_MIN_SAVING < raw_size) {
                 *out_data = compressed;
                 *out_size = (uint64_t)compressed_size;
                 *out_flags = EZDB_SECTION_COMPRESSED;
