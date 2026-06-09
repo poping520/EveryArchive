@@ -696,14 +696,14 @@ int ezdb_commit_write(Ezdb* db)
                 uint32_t out_idx = 0;
                 for (uint32_t i = 0; i < db->header.file_count; ++i) {
                     if (!ezdb_bitset_get(db->active_bits, i)) continue;
-                    EzdbSearchResult result;
-                    rc = ezdb_build_result_path(db, i, &result);
+                    char* path = NULL;
+                    rc = ezdb_build_result_path(db, i, &path);
                     if (rc == EZDB_ERR_NOT_FOUND) { rc = EZDB_OK; continue; }
                     if (rc != EZDB_OK) break;
-                    bap[out_idx] = result.path; /* takes ownership */
-                    ba[out_idx].file_path = result.path;
-                    ba[out_idx].file_size = result.size;
-                    ba[out_idx].modified_time = result.modified_time;
+                    bap[out_idx] = path; /* takes ownership */
+                    ba[out_idx].file_path = path;
+                    ba[out_idx].file_size = ezdb_file_size_by_id(db, i);
+                    ba[out_idx].modified_time = ezdb_file_modified_time_by_id(db, i);
                     if (i < db->header.base_file_count && db->archive_meta) {
                         ba[out_idx].drive_letter = (char)db->archive_meta[i].drive_letter;
                         ba[out_idx].file_ref_number = db->archive_meta[i].file_ref_number;

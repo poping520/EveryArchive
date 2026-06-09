@@ -509,24 +509,19 @@ static int build_dir_path(Ezdb* db, uint32_t dir_id, char** out, uint32_t* out_l
     return EZDB_OK;
 }
 
-int ezdb_build_result_path(Ezdb* db, uint32_t id, EzdbSearchResult* out_result)
+int ezdb_build_result_path(Ezdb* db, uint32_t id, char** out_path)
 {
-    if (!db || !out_result) return EZDB_ERR_ARG;
+    if (!db || !out_path) return EZDB_ERR_ARG;
     if (id >= db->header.file_count) return EZDB_ERR_NOT_FOUND;
     if (!ezdb_bitset_get(db->active_bits, id)) return EZDB_ERR_NOT_FOUND;
+    *out_path = NULL;
     EzdbDeltaRecord* delta = ezdb_find_delta_record(db, id);
     if (delta) {
         if (delta->type == EZDB_DELTA_DELETE) return EZDB_ERR_NOT_FOUND;
-        memset(out_result, 0, sizeof(*out_result));
-        out_result->path = ezdb_strdup_range(delta->path, delta->path_len);
-        if (!out_result->path) return EZDB_ERR_MEMORY;
-        out_result->id = id;
-        out_result->size = delta->size;
-        out_result->modified_time = delta->modified_time;
-        return EZDB_OK;
+        *out_path = ezdb_strdup_range(delta->path, delta->path_len);
+        return *out_path ? EZDB_OK : EZDB_ERR_MEMORY;
     }
     if (id >= db->header.base_file_count) return EZDB_ERR_NOT_FOUND;
-    memset(out_result, 0, sizeof(*out_result));
     char* dir_path = NULL;
     uint32_t dir_len = 0;
     uint32_t name_len = db->file_name_lens[id];
@@ -548,10 +543,7 @@ int ezdb_build_result_path(Ezdb* db, uint32_t id, EzdbSearchResult* out_result)
     }
     path[path_len] = '\0';
     free(dir_path);
-    out_result->id = id;
-    out_result->path = path;
-    out_result->size = ezdb_file_size_by_id(db, id);
-    out_result->modified_time = ezdb_file_modified_time_by_id(db, id);
+    *out_path = path;
     return EZDB_OK;
 }
 
@@ -1380,24 +1372,17 @@ int ezdb_stats(Ezdb* db, EzdbStats* out_stats)
     return EZDB_OK;
 }
 
-void ezdb_free_result(EzdbSearchResult* result)
-{
-    if (!result) return;
-    free(result->path);
-    memset(result, 0, sizeof(*result));
-}
-
 int ezdb_get_archive(Ezdb* db, uint32_t id, EzdbArchiveResult* out_result)
 {
     if (!db || !out_result) return EZDB_ERR_ARG;
-    EzdbSearchResult path_result;
-    int rc = ezdb_build_result_path(db, id, &path_result);
+    char* path = NULL;
+    int rc = ezdb_build_result_path(db, id, &path);
     if (rc != EZDB_OK) return rc;
     memset(out_result, 0, sizeof(*out_result));
     out_result->id = id;
-    out_result->file_path = path_result.path;
-    out_result->file_size = path_result.size;
-    out_result->modified_time = path_result.modified_time;
+    out_result->file_path = path;
+    out_result->file_size = ezdb_file_size_by_id(db, id);
+    out_result->modified_time = ezdb_file_modified_time_by_id(db, id);
     if (id < db->header.base_file_count && db->archive_meta) {
         out_result->drive_letter = (char)db->archive_meta[id].drive_letter;
         out_result->file_ref_number = db->archive_meta[id].file_ref_number;
@@ -1425,13 +1410,13 @@ int ezdb_get_entry(Ezdb* db, uint32_t id, EzdbEntryResult* out_result)
     out_result->id = id;
     out_result->archive_id = detail.archive_id;
     out_result->entry_path = entry_path;
-    EzdbSearchResult archive;
-    rc = ezdb_build_result_path(db, detail.archive_id, &archive);
+    char* archive_path = NULL;
+    rc = ezdb_build_result_path(db, detail.archive_id, &archive_path);
     if (rc != EZDB_OK) {
         ezdb_free_entry_result(out_result);
         return rc;
     }
-    out_result->archive_path = archive.path;
+    out_result->archive_path = archive_path;
     out_result->compressed_size = detail.compressed_size;
     out_result->original_size = detail.original_size;
     out_result->modified_time = detail.modified_time;
@@ -1609,18 +1594,18 @@ int ezdb_compact(Ezdb* db)
     uint32_t out_archive_count = 0;
     int rc = EZDB_OK;
     for (uint32_t i = 0; rc == EZDB_OK && i < db->header.file_count; ++i) {
-        EzdbSearchResult result;
-        rc = ezdb_build_result_path(db, i, &result);
+        char* path = NULL;
+        rc = ezdb_build_result_path(db, i, &path);
         if (rc == EZDB_ERR_NOT_FOUND) {
             rc = EZDB_OK;
             continue;
         }
         if (rc != EZDB_OK) break;
         archive_id_map[i] = out_archive_count;
-        archive_paths[out_archive_count] = result.path;
+        archive_paths[out_archive_count] = path;
         archives[out_archive_count].file_path = archive_paths[out_archive_count];
-        archives[out_archive_count].file_size = result.size;
-        archives[out_archive_count].modified_time = result.modified_time;
+        archives[out_archive_count].file_size = ezdb_file_size_by_id(db, i);
+        archives[out_archive_count].modified_time = ezdb_file_modified_time_by_id(db, i);
         if (i < db->header.base_file_count && db->archive_meta) {
             archives[out_archive_count].drive_letter = (char)db->archive_meta[i].drive_letter;
             archives[out_archive_count].file_ref_number = db->archive_meta[i].file_ref_number;

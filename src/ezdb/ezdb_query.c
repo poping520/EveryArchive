@@ -351,6 +351,8 @@ int ezdb_query_build_candidate_keys(const char* text, size_t len, uint32_t** out
 
 /* Query execution */
 
+typedef void (*EzdbPathCallback)(uint32_t id, const char* path, uint64_t size, uint64_t modified_time, void* user_data);
+
 typedef struct EzdbArchiveSearchAdapter {
     Ezdb* db;
     EzdbSearchV2Callback callback;
@@ -372,11 +374,9 @@ static int record_contains_keyword(Ezdb* db, uint32_t id, const char* keyword, s
     if (id >= db->header.base_file_count) return 0;
     if (ezdb_query_contains_ascii_casefold(ezdb_file_name_by_id(db, id), db->file_name_lens[id], keyword, key_len)) return 1;
     char* path = NULL;
-    EzdbSearchResult result;
-    if (ezdb_build_result_path(db, id, &result) != EZDB_OK) return 0;
-    path = result.path;
+    if (ezdb_build_result_path(db, id, &path) != EZDB_OK) return 0;
     int matched = ezdb_query_contains_ascii_casefold(path, strlen(path), keyword, key_len);
-    ezdb_free_result(&result);
+    free(path);
     return matched;
 }
 
@@ -741,7 +741,7 @@ static int query_build_entry_candidate_bitset(Ezdb* db, EzdbQueryNode* node, con
     }
     return EZDB_OK;
 }
-static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, void (*callback)(const EzdbSearchResult*, void*), void* user_data)
+static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, EzdbPathCallback callback, void* user_data)
 {
     size_t key_len = strlen(keyword);
     if (!key_len) return EZDB_OK;
@@ -803,16 +803,16 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, void
         if (limit && emitted >= limit) break;
         if (!(seen[id >> 3u] & (unsigned char)(1u << (id & 7u)))) continue;
         if (key_len > EZDB_GRAM3 && !record_contains_keyword(db, id, keyword, key_len)) continue;
-        EzdbSearchResult result;
-        rc = ezdb_build_result_path(db, id, &result);
+        char* path = NULL;
+        rc = ezdb_build_result_path(db, id, &path);
         if (rc == EZDB_ERR_NOT_FOUND) {
             rc = EZDB_OK;
             continue;
         }
         if (rc != EZDB_OK) break;
-        callback(&result, user_data);
+        callback(id, path, ezdb_file_size_by_id(db, id), ezdb_file_modified_time_by_id(db, id), user_data);
         ++emitted;
-        ezdb_free_result(&result);
+        free(path);
     }
     free(seen);
     free(file_ids);
@@ -820,7 +820,7 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, void
     return rc;
 }
 
-static int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, void (*callback)(const EzdbSearchResult*, void*), void* user_data)
+static int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbPathCallback callback, void* user_data)
 {
     if (!db || !keyword || !callback) return EZDB_ERR_ARG;
     while (ezdb_query_is_space((unsigned char)*keyword)) ++keyword;
@@ -852,18 +852,18 @@ static int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, void 
         } else if (!(seen[id >> 3u] & (unsigned char)(1u << (id & 7u)))) {
             continue;
         }
-        EzdbSearchResult result;
-        rc = ezdb_build_result_path(db, id, &result);
+        char* path = NULL;
+        rc = ezdb_build_result_path(db, id, &path);
         if (rc == EZDB_ERR_NOT_FOUND) {
             rc = EZDB_OK;
             continue;
         }
         if (rc != EZDB_OK) break;
-        if (ezdb_query_match_path(root, result.path, strlen(result.path))) {
-            callback(&result, user_data);
+        if (ezdb_query_match_path(root, path, strlen(path))) {
+            callback(id, path, ezdb_file_size_by_id(db, id), ezdb_file_modified_time_by_id(db, id), user_data);
             ++emitted;
         }
-        ezdb_free_result(&result);
+        free(path);
     }
 
     free(seen);
@@ -871,19 +871,19 @@ static int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, void 
     return rc;
 }
 
-static void ezdb_archive_search_adapter_cb(const EzdbSearchResult* result, void* user_data)
+static void ezdb_archive_search_adapter_cb(uint32_t id, const char* path, uint64_t size, uint64_t modified_time, void* user_data)
 {
     EzdbArchiveSearchAdapter* adapter = (EzdbArchiveSearchAdapter*)user_data;
     EzdbSearchV2Result out;
     memset(&out, 0, sizeof(out));
     out.kind = EZDB_RESULT_ARCHIVE;
-    out.id = result->id;
-    out.archive_id = result->id;
-    out.archive_path = ezdb_strdup_range(result->path, strlen(result->path));
-    out.file_size = result->size;
-    out.modified_time = result->modified_time;
-    if (adapter->db && result->id < adapter->db->header.base_file_count && adapter->db->archive_meta) {
-        EzdbDiskArchiveMeta* meta = &adapter->db->archive_meta[result->id];
+    out.id = id;
+    out.archive_id = id;
+    out.archive_path = ezdb_strdup_range(path, strlen(path));
+    out.file_size = size;
+    out.modified_time = modified_time;
+    if (adapter->db && id < adapter->db->header.base_file_count && adapter->db->archive_meta) {
+        EzdbDiskArchiveMeta* meta = &adapter->db->archive_meta[id];
         out.drive_letter = (char)meta->drive_letter;
         out.file_ref_number = meta->file_ref_number;
         out.usn = meta->usn;
@@ -926,15 +926,15 @@ static int ezdb_emit_entry_result_with_path(Ezdb* db, uint32_t id, char* entry_p
     EzdbEntryDetailStore store = ezdb_entry_detail_store(db);
     int rc = ezdb_entries_load_detail(&store, id, &detail);
     if (rc != EZDB_OK) return rc;
-    EzdbSearchResult archive;
-    rc = ezdb_build_result_path(db, detail.archive_id, &archive);
+    char* archive_path = NULL;
+    rc = ezdb_build_result_path(db, detail.archive_id, &archive_path);
     if (rc != EZDB_OK) return rc;
     EzdbSearchV2Result out;
     memset(&out, 0, sizeof(out));
     out.kind = EZDB_RESULT_ENTRY;
     out.id = id;
     out.archive_id = detail.archive_id;
-    out.archive_path = archive.path;
+    out.archive_path = archive_path;
     out.entry_path = entry_path;
     out.compressed_size = detail.compressed_size;
     out.original_size = detail.original_size;
@@ -943,13 +943,15 @@ static int ezdb_emit_entry_result_with_path(Ezdb* db, uint32_t id, char* entry_p
         EzdbEntryPathStore path_store = ezdb_entry_path_store(db);
         out.entry_raw_path = ezdb_entries_copy_raw_path(&path_store, id, &detail);
         if (!out.entry_raw_path) {
-            archive.path = NULL;
+            out.archive_path = NULL;
+            free(archive_path);
             ezdb_free_search_v2_result(&out);
             return EZDB_ERR_MEMORY;
         }
         out.entry_raw_path_len = detail.raw_len;
     }
-    archive.path = NULL;
+    out.archive_path = NULL;
+    free(archive_path);
     callback(&out, user_data);
     ezdb_free_search_v2_result(&out);
     return EZDB_OK;
@@ -1013,8 +1015,8 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
             matched = ezdb_query_matches_text(root, keyword, entry_path, entry_path_len);
         }
         if (!matched && (scope & EZDB_SEARCH_COMBINED_PATH)) {
-            EzdbSearchResult archive;
-            rc = ezdb_build_result_path(db, archive_id, &archive);
+            char* archive_path = NULL;
+            rc = ezdb_build_result_path(db, archive_id, &archive_path);
             if (rc == EZDB_ERR_NOT_FOUND) {
                 rc = EZDB_OK;
                 free(entry_path);
@@ -1024,22 +1026,22 @@ int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, E
                 free(entry_path);
                 break;
             }
-            size_t archive_len = strlen(archive.path);
+            size_t archive_len = strlen(archive_path);
             size_t combo_len = archive_len + 1u + entry_path_len;
             char* combo = (char*)malloc(combo_len + 1u);
             if (!combo) {
-                ezdb_free_result(&archive);
+                free(archive_path);
                 free(entry_path);
                 rc = EZDB_ERR_MEMORY;
                 break;
             }
-            memcpy(combo, archive.path, archive_len);
+            memcpy(combo, archive_path, archive_len);
             combo[archive_len] = '\n';
             memcpy(combo + archive_len + 1u, entry_path, entry_path_len);
             combo[combo_len] = '\0';
             matched = ezdb_query_matches_text(root, keyword, combo, combo_len);
             free(combo);
-            ezdb_free_result(&archive);
+            free(archive_path);
         }
         if (matched) {
             rc = ezdb_emit_entry_result_with_path(db, id, entry_path, callback, user_data);
@@ -1085,30 +1087,30 @@ static int ezdb_entry_matches_query_scope(Ezdb* db,
     }
     if (!(scope & (EZDB_SEARCH_ARCHIVE_PATH | EZDB_SEARCH_COMBINED_PATH))) return EZDB_OK;
 
-    EzdbSearchResult archive;
-    int rc = ezdb_build_result_path(db, archive_id, &archive);
+    char* archive_path = NULL;
+    int rc = ezdb_build_result_path(db, archive_id, &archive_path);
     if (rc == EZDB_ERR_NOT_FOUND) return EZDB_OK;
     if (rc != EZDB_OK) return rc;
 
     if (scope & EZDB_SEARCH_ARCHIVE_PATH) {
-        *out_matched = ezdb_query_matches_text(root, keyword, archive.path, strlen(archive.path));
+        *out_matched = ezdb_query_matches_text(root, keyword, archive_path, strlen(archive_path));
     }
     if (!*out_matched && (scope & EZDB_SEARCH_COMBINED_PATH)) {
-        size_t archive_len = strlen(archive.path);
+        size_t archive_len = strlen(archive_path);
         size_t combo_len = archive_len + 1u + entry_path_len;
         char* combo = (char*)malloc(combo_len + 1u);
         if (!combo) {
-            ezdb_free_result(&archive);
+            free(archive_path);
             return EZDB_ERR_MEMORY;
         }
-        memcpy(combo, archive.path, archive_len);
+        memcpy(combo, archive_path, archive_len);
         combo[archive_len] = '\n';
         memcpy(combo + archive_len + 1u, entry_path, entry_path_len);
         combo[combo_len] = '\0';
         *out_matched = ezdb_query_matches_text(root, keyword, combo, combo_len);
         free(combo);
     }
-    ezdb_free_result(&archive);
+    free(archive_path);
     return EZDB_OK;
 }
 

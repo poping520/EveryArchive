@@ -10,14 +10,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* Internal helper: lightweight {id, path, size, modified_time} tuple */
-typedef struct EzdbSearchResult {
-    uint32_t id;
-    char* path;
-    uint64_t size;
-    uint64_t modified_time;
-} EzdbSearchResult;
-
 typedef struct EzdbDeltaRecord {
     uint32_t id;
     uint32_t type;
@@ -152,8 +144,7 @@ int ezdb_deactivate_entries_for_archive(Ezdb* db, uint32_t archive_id);
 EzdbEntryDetailStore ezdb_entry_detail_store(Ezdb* db);
 EzdbEntryPathStore ezdb_entry_path_store(Ezdb* db);
 int ezdb_entry_is_searchable(Ezdb* db, uint32_t entry_id);
-int ezdb_build_result_path(Ezdb* db, uint32_t id, EzdbSearchResult* out_result);
-void ezdb_free_result(EzdbSearchResult* result);
+int ezdb_build_result_path(Ezdb* db, uint32_t id, char** out_path);
 uint64_t ezdb_file_size_by_id(Ezdb* db, uint32_t id);
 uint64_t ezdb_file_modified_time_by_id(Ezdb* db, uint32_t id);
 const char* ezdb_file_name_by_id(Ezdb* db, uint32_t id);
