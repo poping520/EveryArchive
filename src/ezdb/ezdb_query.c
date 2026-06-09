@@ -741,7 +741,7 @@ static int query_build_entry_candidate_bitset(Ezdb* db, EzdbQueryNode* node, con
     }
     return EZDB_OK;
 }
-static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCallback callback, void* user_data)
+static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, void (*callback)(const EzdbSearchResult*, void*), void* user_data)
 {
     size_t key_len = strlen(keyword);
     if (!key_len) return EZDB_OK;
@@ -820,7 +820,7 @@ static int ezdb_search_plain(Ezdb* db, const char* keyword, uint32_t limit, Ezdb
     return rc;
 }
 
-int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCallback callback, void* user_data)
+static int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, void (*callback)(const EzdbSearchResult*, void*), void* user_data)
 {
     if (!db || !keyword || !callback) return EZDB_ERR_ARG;
     while (ezdb_query_is_space((unsigned char)*keyword)) ++keyword;

@@ -69,14 +69,6 @@ typedef struct EzdbBuildOptions {
 
 /* ===== 查询结果结构体 ===== */
 
-/* 旧版文件搜索结果（仅包含文件/压缩包级别信息） */
-typedef struct EzdbSearchResult {
-    uint32_t id;                /* 记录 ID */
-    char* path;                 /* 文件完整路径（调用方需 free） */
-    uint64_t size;              /* 文件大小 */
-    uint64_t modified_time;     /* 修改时间 */
-} EzdbSearchResult;
-
 /* 压缩包查询结果，包含 NTFS 标识信息 */
 typedef struct EzdbArchiveResult {
     uint32_t id;                /* 压缩包 ID */
@@ -174,8 +166,6 @@ typedef struct EzdbEntryQueryPage {
 
 /* ===== 回调函数类型 ===== */
 
-/* 旧版搜索结果回调 */
-typedef void (*EzdbSearchCallback)(const EzdbSearchResult* result, void* user_data);
 /* V2 统一搜索结果回调 */
 typedef void (*EzdbSearchV2Callback)(const EzdbSearchV2Result* result, void* user_data);
 
@@ -226,10 +216,6 @@ int ezdb_stats(Ezdb* db, EzdbStats* out_stats);
 
 /* ===== 单条记录查询 ===== */
 
-/* 按 ID 获取文件记录（旧版，仅路径/大小/时间） */
-int ezdb_get_by_id(Ezdb* db, uint32_t id, EzdbSearchResult* out_result);
-void ezdb_free_result(EzdbSearchResult* result);  /* 释放 EzdbSearchResult */
-
 /* 按 ID 获取压缩包完整信息（含 NTFS 标识） */
 int ezdb_get_archive(Ezdb* db, uint32_t id, EzdbArchiveResult* out_result);
 
@@ -246,9 +232,6 @@ void ezdb_free_search_v2_result(EzdbSearchV2Result* result);
 void ezdb_free_entry_query_page(EzdbEntryQueryPage* page);
 
 /* ===== 搜索 API ===== */
-
-/* 旧版路径搜索：按关键词搜索文件路径，通过回调返回结果 */
-int ezdb_search_path(Ezdb* db, const char* keyword, uint32_t limit, EzdbSearchCallback callback, void* user_data);
 
 /* V2 统一搜索：支持压缩包/条目路径搜索，通过 scope 控制搜索范围 */
 int ezdb_search(Ezdb* db, const char* keyword, uint32_t scope, uint32_t limit, EzdbSearchV2Callback callback, void* user_data);

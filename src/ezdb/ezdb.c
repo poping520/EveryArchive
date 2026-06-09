@@ -1380,11 +1380,6 @@ int ezdb_stats(Ezdb* db, EzdbStats* out_stats)
     return EZDB_OK;
 }
 
-int ezdb_get_by_id(Ezdb* db, uint32_t id, EzdbSearchResult* out_result)
-{
-    return ezdb_build_result_path(db, id, out_result);
-}
-
 void ezdb_free_result(EzdbSearchResult* result)
 {
     if (!result) return;

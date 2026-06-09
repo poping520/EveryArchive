@@ -96,20 +96,6 @@ static uint64_t file_size_of_path(const char* path)
     return ((uint64_t)data.nFileSizeHigh << 32u) | data.nFileSizeLow;
 }
 
-static void on_result(const EzdbSearchResult* result, void* user_data)
-{
-    SearchStats* stats = (SearchStats*)user_data;
-    ++stats->total;
-    if (stats->printed < 20) {
-        printf("[%u] %s, %llu, %llu\n",
-               result->id,
-               result->path,
-               (unsigned long long)result->size,
-               (unsigned long long)result->modified_time);
-        ++stats->printed;
-    }
-}
-
 static void on_v2_result(const EzdbSearchV2Result* result, void* user_data)
 {
     SearchStats* stats = (SearchStats*)user_data;
@@ -153,7 +139,7 @@ static int run_search_once(Ezdb* db, const char* keyword, uint32_t limit, const 
     SearchStats stats;
     memset(&stats, 0, sizeof(stats));
     double search_start = now_ms();
-    int rc = ezdb_search_path(db, keyword, limit, on_result, &stats);
+    int rc = ezdb_search(db, keyword, EZDB_SEARCH_ARCHIVE_PATH, limit, on_v2_result, &stats);
     double search_elapsed = now_ms() - search_start;
     if (rc != 0) {
         fprintf(stderr, "search failed: %s (%d)\n", ezdb_error_message(rc), rc);
@@ -431,9 +417,9 @@ static int print_db_info(Ezdb* db, const char* memory_prefix)
 
 static int run_get_once(Ezdb* db, uint32_t id, const char* memory_prefix)
 {
-    EzdbSearchResult result;
+    EzdbArchiveResult result;
     double start = now_ms();
-    int rc = ezdb_get_by_id(db, id, &result);
+    int rc = ezdb_get_archive(db, id, &result);
     double elapsed = now_ms() - start;
     if (rc != 0) {
         fprintf(stderr, "get failed: %s (%d)\n", ezdb_error_message(rc), rc);
@@ -441,12 +427,12 @@ static int run_get_once(Ezdb* db, uint32_t id, const char* memory_prefix)
     }
     printf("[%u] %s, %llu, %llu\n",
            result.id,
-           result.path,
-           (unsigned long long)result.size,
+           result.file_path,
+           (unsigned long long)result.file_size,
            (unsigned long long)result.modified_time);
     printf("get_ms: %.2f\n", elapsed);
     print_memory_usage(memory_prefix);
-    ezdb_free_result(&result);
+    ezdb_free_archive_result(&result);
     return 0;
 }
 
@@ -1799,8 +1785,8 @@ static int run_main(int argc, char** argv)
             fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
             return 2;
         }
-        EzdbSearchResult result;
-        rc = ezdb_get_by_id(db, (uint32_t)strtoul(argv[3], NULL, 10), &result);
+        EzdbArchiveResult result;
+        rc = ezdb_get_archive(db, (uint32_t)strtoul(argv[3], NULL, 10), &result);
         if (rc != 0) {
             fprintf(stderr, "get failed: %s (%d)\n", ezdb_error_message(rc), rc);
             ezdb_close(db);
@@ -1808,11 +1794,11 @@ static int run_main(int argc, char** argv)
         }
         printf("[%u] %s, %llu, %llu\n",
                result.id,
-               result.path,
-               (unsigned long long)result.size,
+               result.file_path,
+               (unsigned long long)result.file_size,
                (unsigned long long)result.modified_time);
         print_memory_usage("get");
-        ezdb_free_result(&result);
+        ezdb_free_archive_result(&result);
         ezdb_close(db);
         return 0;
     }
