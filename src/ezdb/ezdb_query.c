@@ -19,15 +19,6 @@ static unsigned char ezdb_query_fold_ascii_byte(unsigned char ch)
     return (ch >= 'A' && ch <= 'Z') ? (unsigned char)(ch + ('a' - 'A')) : ch;
 }
 
-static char* ezdb_query_strdup_range(const char* text, size_t len)
-{
-    char* out = (char*)malloc(len + 1u);
-    if (!out) return NULL;
-    if (len) memcpy(out, text, len);
-    out[len] = '\0';
-    return out;
-}
-
 int ezdb_query_contains_ascii_casefold(const char* text, size_t text_len, const char* needle, size_t needle_len)
 {
     if (!needle_len) return 1;
@@ -123,7 +114,7 @@ static EzdbQueryNode* ezdb_query_parse_primary(EzdbQueryParser* p)
             return NULL;
         }
         size_t len = p->pos - start;
-        char* text = ezdb_query_strdup_range(p->text + start, len);
+        char* text = ezdb_strdup_range(p->text + start, len);
         ++p->pos;
         if (!text) {
             p->error = 1;
@@ -149,7 +140,7 @@ static EzdbQueryNode* ezdb_query_parse_primary(EzdbQueryParser* p)
         return NULL;
     }
     size_t len = p->pos - start;
-    char* text = ezdb_query_strdup_range(p->text + start, len);
+    char* text = ezdb_strdup_range(p->text + start, len);
     if (!text) {
         p->error = 1;
         return NULL;

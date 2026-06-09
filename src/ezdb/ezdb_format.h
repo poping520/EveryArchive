@@ -131,7 +131,6 @@ typedef struct EzdbSectionDesc {
     uint32_t aux_count;
 } EzdbSectionDesc;
 
-int ezdb_format_header_is_current(const EzdbHeader* header);
 int ezdb_format_v13_header_is_current(const EzdbV13Header* header);
 int ezdb_format_section_id_is_known(uint32_t section_id);
 int ezdb_format_validate_section_table(const EzdbSectionDesc* sections, uint32_t section_count, uint64_t file_size);

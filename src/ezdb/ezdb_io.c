@@ -94,7 +94,7 @@ int ezdb_io_read_section_payload(FILE* fp, uint64_t offset, uint64_t encoded_siz
     if (encoded_size > UINT32_MAX || raw_size > UINT32_MAX) return EZDB_ERR_MEMORY;
     unsigned char* encoded = (unsigned char*)malloc(encoded_size ? (size_t)encoded_size : 1u);
     if (!encoded) return EZDB_ERR_MEMORY;
-    if (fseek(fp, (long)offset, SEEK_SET) != 0 ||
+    if (_fseeki64(fp, (__int64)offset, SEEK_SET) != 0 ||
         (encoded_size && fread(encoded, 1, (size_t)encoded_size, fp) != (size_t)encoded_size)) {
         free(encoded);
         return EZDB_ERR_IO;
@@ -124,7 +124,7 @@ int ezdb_io_read_section_into(FILE* fp, uint64_t offset, uint64_t encoded_size, 
     if (!fp || (!out && raw_size)) return EZDB_ERR_ARG;
     if (encoded_size > UINT32_MAX || raw_size > UINT32_MAX) return EZDB_ERR_MEMORY;
     if (!(flags & EZDB_SECTION_COMPRESSED)) {
-        if (fseek(fp, (long)offset, SEEK_SET) != 0 ||
+        if (_fseeki64(fp, (__int64)offset, SEEK_SET) != 0 ||
             (raw_size && fread(out, 1, (size_t)raw_size, fp) != (size_t)raw_size)) {
             return EZDB_ERR_IO;
         }
@@ -132,7 +132,7 @@ int ezdb_io_read_section_into(FILE* fp, uint64_t offset, uint64_t encoded_size, 
     }
     unsigned char* encoded = (unsigned char*)malloc(encoded_size ? (size_t)encoded_size : 1u);
     if (!encoded) return EZDB_ERR_MEMORY;
-    if (fseek(fp, (long)offset, SEEK_SET) != 0 ||
+    if (_fseeki64(fp, (__int64)offset, SEEK_SET) != 0 ||
         (encoded_size && fread(encoded, 1, (size_t)encoded_size, fp) != (size_t)encoded_size)) {
         free(encoded);
         return EZDB_ERR_IO;
@@ -201,7 +201,7 @@ int ezdb_io_section_var_reader_init(EzdbSectionVarReader* reader, FILE* fp, uint
 {
     if (!reader || !fp) return EZDB_ERR_ARG;
     memset(reader, 0, sizeof(*reader));
-    if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+    if (_fseeki64(fp, (__int64)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     reader->fp = fp;
     reader->remaining = encoded_size;
     reader->compressed = (flags & EZDB_SECTION_COMPRESSED) != 0;

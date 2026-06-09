@@ -1,5 +1,6 @@
 #include "ezdb_build.h"
 
+#include "ezdb_core_internal.h"
 #include "ezdb_internal.h"
 #include "ezdb_io.h"
 #include "ezdb_postings.h"
@@ -13,39 +14,9 @@ typedef struct EzdbPublicEntryStreamRange {
     EzdbEntryStream stream;
 } EzdbPublicEntryStreamRange;
 
-static double build_now_ms(void)
-{
-    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
-}
-
-static int build_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed)
-{
-    if (*capacity >= needed) return EZDB_OK;
-    uint32_t next = *capacity ? *capacity : 1024;
-    while (next < needed) {
-        if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
-        next *= 2u;
-    }
-    void* new_data = realloc(*data, elem_size * (size_t)next);
-    if (!new_data) return EZDB_ERR_MEMORY;
-    *data = new_data;
-    *capacity = next;
-    return EZDB_OK;
-}
-
-static uint32_t build_fnv1a_bytes(const char* text, size_t len)
-{
-    uint32_t hash = 2166136261u;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= (unsigned char)text[i];
-        hash *= 16777619u;
-    }
-    return hash;
-}
-
 static int build_append_string(char** data, uint32_t* size, uint32_t* cap, const char* text, uint32_t len, uint32_t* out_offset)
 {
-    if (build_ensure_capacity((void**)data, 1, cap, *size + len + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
+    if (ezdb_ensure_capacity((void**)data, 1, cap, *size + len + 1u) != EZDB_OK) return EZDB_ERR_MEMORY;
     *out_offset = *size;
     memcpy(*data + *size, text, len);
     *size += len;
@@ -67,7 +38,7 @@ static int build_find_or_add_string(EzdbArchiveBuildTree* tree, const char* text
         tree->string_bucket_count = 65536u;
         if (build_init_u32_buckets(&tree->string_buckets, tree->string_bucket_count) != EZDB_OK) return EZDB_ERR_MEMORY;
     }
-    uint32_t hash = build_fnv1a_bytes(text, len);
+    uint32_t hash = ezdb_fnv1a_bytes(text, len);
     uint32_t bucket = hash & (tree->string_bucket_count - 1u);
     for (uint32_t i = tree->string_buckets[bucket]; i != UINT32_MAX; i = tree->string_entries[i].next) {
         if (tree->string_entries[i].len == len &&
@@ -81,7 +52,7 @@ static int build_find_or_add_string(EzdbArchiveBuildTree* tree, const char* text
     if (build_append_string(&tree->string_pool, &tree->string_size, &tree->string_cap, text, len, &offset) != EZDB_OK) {
         return EZDB_ERR_MEMORY;
     }
-    if (build_ensure_capacity((void**)&tree->string_entries,
+    if (ezdb_ensure_capacity((void**)&tree->string_entries,
                               sizeof(EzdbBuildStringHashEntry),
                               &tree->string_entry_cap,
                               tree->string_entry_count + 1) != EZDB_OK) {
@@ -106,7 +77,7 @@ static uint32_t build_find_or_add_dir(EzdbArchiveBuildTree* tree,
         tree->dir_bucket_count = 262144u;
         if (build_init_u32_buckets(&tree->dir_buckets, tree->dir_bucket_count) != EZDB_OK) return UINT32_MAX;
     }
-    uint32_t hash = build_fnv1a_bytes(name, name_len) ^ (parent * 16777619u);
+    uint32_t hash = ezdb_fnv1a_bytes(name, name_len) ^ (parent * 16777619u);
     uint32_t bucket = hash & (tree->dir_bucket_count - 1u);
     for (uint32_t i = tree->dir_buckets[bucket]; i != UINT32_MAX; i = tree->dir_hash_entries[i].next) {
         EzdbBuildDirHashEntry* he = &tree->dir_hash_entries[i];
@@ -116,7 +87,7 @@ static uint32_t build_find_or_add_dir(EzdbArchiveBuildTree* tree,
         }
     }
 
-    if (build_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, tree->dir_count + 1) != EZDB_OK) {
+    if (ezdb_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, tree->dir_count + 1) != EZDB_OK) {
         return UINT32_MAX;
     }
     uint32_t name_offset = 0;
@@ -138,7 +109,7 @@ static uint32_t build_find_or_add_dir(EzdbArchiveBuildTree* tree,
     }
     tree->dir_count += 1;
 
-    if (build_ensure_capacity((void**)&tree->dir_hash_entries,
+    if (ezdb_ensure_capacity((void**)&tree->dir_hash_entries,
                               sizeof(EzdbBuildDirHashEntry),
                               &tree->dir_hash_cap,
                               tree->dir_hash_count + 1) != EZDB_OK) {
@@ -182,7 +153,7 @@ static int build_append_file(EzdbArchiveBuildTree* tree,
                              uint64_t file_ref_number,
                              int64_t usn)
 {
-    if (build_ensure_capacity((void**)&tree->old_files, sizeof(EzdbBuildFile), &tree->file_cap, tree->file_count + 1) != EZDB_OK) {
+    if (ezdb_ensure_capacity((void**)&tree->old_files, sizeof(EzdbBuildFile), &tree->file_cap, tree->file_count + 1) != EZDB_OK) {
         return EZDB_ERR_MEMORY;
     }
     uint32_t name_offset = 0;
@@ -284,7 +255,7 @@ int ezdb_build_archive_tree_init(EzdbArchiveBuildTree* tree)
 {
     if (!tree) return EZDB_ERR_ARG;
     memset(tree, 0, sizeof(*tree));
-    if (build_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, 1) != EZDB_OK) {
+    if (ezdb_ensure_capacity((void**)&tree->dirs, sizeof(EzdbBuildDir), &tree->dir_cap, 1) != EZDB_OK) {
         return EZDB_ERR_MEMORY;
     }
     memset(&tree->dirs[0], 0, sizeof(EzdbBuildDir));
@@ -388,9 +359,9 @@ int ezdb_build_write_archive_base_sections(FILE* out,
 {
     if (!out || !tree || !header) return EZDB_ERR_ARG;
     if (stats) memset(stats, 0, sizeof(*stats));
-    double stage_start_ms = build_now_ms();
+    double stage_start_ms = ezdb_now_ms();
 
-    header->file_records_offset = (uint64_t)ftell(out);
+    header->file_records_offset = (uint64_t)_ftelli64(out);
     unsigned char* file_records_raw = NULL;
     uint64_t file_records_raw_size = 0;
     uint64_t file_records_written = 0;
@@ -410,7 +381,7 @@ int ezdb_build_write_archive_base_sections(FILE* out,
     header->file_records_size = file_records_written;
 
     if (rc == EZDB_OK) {
-        header->archive_meta_offset = (uint64_t)ftell(out);
+        header->archive_meta_offset = (uint64_t)_ftelli64(out);
         uint64_t archive_meta_raw_size = sizeof(EzdbDiskArchiveMeta) * (uint64_t)tree->file_count;
         EzdbDiskArchiveMeta* archive_meta_raw =
             (EzdbDiskArchiveMeta*)calloc((size_t)(tree->file_count ? tree->file_count : 1u),
@@ -435,7 +406,7 @@ int ezdb_build_write_archive_base_sections(FILE* out,
         }
     }
 
-    header->dir_records_offset = (uint64_t)ftell(out);
+    header->dir_records_offset = (uint64_t)_ftelli64(out);
     uint64_t dir_records_raw_size = sizeof(EzdbDiskDir) * (uint64_t)tree->dir_count;
     EzdbDiskDir* dir_records_raw = (EzdbDiskDir*)malloc(dir_records_raw_size ? (size_t)dir_records_raw_size : 1u);
     if (!dir_records_raw && rc == EZDB_OK) rc = EZDB_ERR_MEMORY;
@@ -458,7 +429,7 @@ int ezdb_build_write_archive_base_sections(FILE* out,
     header->dir_records_raw_size = dir_records_raw_size;
     header->dir_records_size = dir_records_written;
 
-    header->strings_offset = (uint64_t)ftell(out);
+    header->strings_offset = (uint64_t)_ftelli64(out);
     header->strings_raw_size = tree->string_size;
     uint64_t strings_written = 0;
     if (rc == EZDB_OK) {
@@ -470,7 +441,7 @@ int ezdb_build_write_archive_base_sections(FILE* out,
     }
     header->strings_size = strings_written;
 
-    if (stats) stats->write_ms = build_now_ms() - stage_start_ms;
+    if (stats) stats->write_ms = ezdb_now_ms() - stage_start_ms;
     return rc;
 }
 
@@ -487,7 +458,7 @@ int ezdb_build_write_archive_postings(FILE* out,
     memset(&file_builder, 0, sizeof(file_builder));
     memset(&dir_builder, 0, sizeof(dir_builder));
 
-    double stage_start_ms = build_now_ms();
+    double stage_start_ms = ezdb_now_ms();
     int rc = ezdb_postings_builder_init(&file_builder, 262144u);
     if (rc == EZDB_OK) file_builder_ready = 1;
     if (rc == EZDB_OK) {
@@ -512,14 +483,14 @@ int ezdb_build_write_archive_postings(FILE* out,
                                  &result->file_postings_size,
                                  NULL);
     }
-    if (rc == EZDB_OK) result->file_index_ms = build_now_ms() - stage_start_ms;
+    if (rc == EZDB_OK) result->file_index_ms = ezdb_now_ms() - stage_start_ms;
     if (file_builder_ready) {
         ezdb_postings_builder_free(&file_builder);
         file_builder_ready = 0;
     }
 
     if (rc == EZDB_OK) {
-        stage_start_ms = build_now_ms();
+        stage_start_ms = ezdb_now_ms();
         rc = ezdb_postings_builder_init(&dir_builder, 131072u);
         if (rc == EZDB_OK) dir_builder_ready = 1;
     }
@@ -545,7 +516,7 @@ int ezdb_build_write_archive_postings(FILE* out,
                                  &result->dir_postings_size,
                                  NULL);
     }
-    if (rc == EZDB_OK) result->dir_index_ms = build_now_ms() - stage_start_ms;
+    if (rc == EZDB_OK) result->dir_index_ms = ezdb_now_ms() - stage_start_ms;
     if (dir_builder_ready) {
         ezdb_postings_builder_free(&dir_builder);
         dir_builder_ready = 0;

@@ -51,15 +51,6 @@ typedef struct EzdbEntryDeltaDiskHeader {
     uint64_t modified_time;
 } EzdbEntryDeltaDiskHeader;
 
-typedef struct EzdbDiskFile {
-    uint32_t parent_dir_id;
-    uint32_t name_offset;
-    uint32_t name_len;
-    uint32_t flags;
-    uint64_t size;
-    uint64_t modified_time;
-} EzdbDiskFile;
-
 typedef struct EzdbDiskArchiveMeta {
     uint64_t file_ref_number;
     int64_t usn;

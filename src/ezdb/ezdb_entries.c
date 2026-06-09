@@ -1,4 +1,5 @@
 #include "ezdb_entries.h"
+#include "ezdb_core_internal.h"
 #include "ezdb_io.h"
 
 #include <direct.h>
@@ -6,35 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-static double entries_now_ms(void)
-{
-    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
-}
-
-static int entry_bitset_get(const unsigned char* bits, uint32_t id)
-{
-    return bits && (bits[id >> 3u] & (unsigned char)(1u << (id & 7u)));
-}
-
-static int entries_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed)
-{
-    if (!data || !capacity || !elem_size) return EZDB_ERR_ARG;
-    if (needed <= *capacity) return EZDB_OK;
-    uint32_t cap = *capacity ? *capacity : 16u;
-    while (cap < needed) {
-        if (cap > UINT32_MAX / 2u) {
-            cap = needed;
-            break;
-        }
-        cap *= 2u;
-    }
-    void* p = realloc(*data, elem_size * (size_t)cap);
-    if (!p) return EZDB_ERR_MEMORY;
-    *data = p;
-    *capacity = cap;
-    return EZDB_OK;
-}
 
 static int entries_ensure_directory_exists(const char* path)
 {
@@ -134,7 +106,7 @@ static int entries_paged_writer_flush_page(EzdbEntryPagedWriter* writer)
 {
     if (!writer || !writer->out) return EZDB_ERR_ARG;
     if (!writer->page_len) return EZDB_OK;
-    if (entries_ensure_capacity((void**)&writer->pages,
+    if (ezdb_ensure_capacity((void**)&writer->pages,
                                 sizeof(EzdbDiskPage),
                                 &writer->page_cap,
                                 writer->page_count + 1u) != EZDB_OK) {
@@ -294,7 +266,7 @@ int ezdb_entries_section_build_write_core(EzdbEntrySectionBuild* build,
 {
     if (!build || !out || !header) return EZDB_ERR_ARG;
     uint64_t written = 0;
-    header->entry_records_offset = (uint64_t)ftell(out);
+    header->entry_records_offset = (uint64_t)_ftelli64(out);
     header->entry_records_raw_size = EZDB_ENTRY_CORE_RECORD_SIZE * (uint64_t)entry_count;
     header->entry_records_flags = 0;
     int rc = entries_copy_file_payload(out, build->core_path, &written);
@@ -306,10 +278,10 @@ int ezdb_entries_section_build_write_detail(EzdbEntrySectionBuild* build, FILE* 
 {
     if (!build || !out || !header) return EZDB_ERR_ARG;
     uint64_t detail_written = 0;
-    header->entry_detail_offset = (uint64_t)ftell(out);
+    header->entry_detail_offset = (uint64_t)_ftelli64(out);
     int rc = entries_copy_file_payload(out, build->detail_path, &detail_written);
     header->entry_detail_size = detail_written;
-    header->entry_detail_index_offset = (uint64_t)ftell(out);
+    header->entry_detail_index_offset = (uint64_t)_ftelli64(out);
     header->entry_detail_page_count = build->writer.detail_writer.page_count;
     header->entry_page_size = EZDB_ENTRY_PAGE_SIZE;
     if (rc == EZDB_OK && build->writer.detail_writer.page_count &&
@@ -326,11 +298,11 @@ int ezdb_entries_section_build_write_raw(EzdbEntrySectionBuild* build, FILE* out
 {
     if (!build || !out || !header) return EZDB_ERR_ARG;
     uint64_t raw_written = 0;
-    header->raw_blob_offset = (uint64_t)ftell(out);
+    header->raw_blob_offset = (uint64_t)_ftelli64(out);
     header->raw_blob_raw_size = build->writer.raw_writer.raw_size;
     int rc = entries_copy_file_payload(out, build->raw_path, &raw_written);
     header->raw_blob_size = raw_written;
-    header->raw_blob_index_offset = (uint64_t)ftell(out);
+    header->raw_blob_index_offset = (uint64_t)_ftelli64(out);
     header->raw_blob_page_count = build->writer.raw_writer.page_count;
     header->raw_blob_page_size = EZDB_RAW_BLOB_PAGE_SIZE;
     if (rc == EZDB_OK && build->writer.raw_writer.page_count &&
@@ -443,30 +415,30 @@ int ezdb_entries_write_collected_sections(EzdbEntryCollectResult* result,
     if (!result || !out || !header) return EZDB_ERR_ARG;
     if (stats) memset(stats, 0, sizeof(*stats));
 
-    double stage_start_ms = entries_now_ms();
+    double stage_start_ms = ezdb_now_ms();
     int rc = ezdb_entries_section_build_write_core(&result->sections, out, header, entry_count);
-    if (stats) stats->write_core_ms = entries_now_ms() - stage_start_ms;
+    if (stats) stats->write_core_ms = ezdb_now_ms() - stage_start_ms;
 
     if (rc == EZDB_OK) {
-        stage_start_ms = entries_now_ms();
+        stage_start_ms = ezdb_now_ms();
         rc = ezdb_entries_section_build_write_detail(&result->sections, out, header);
-        if (stats) stats->write_detail_ms = entries_now_ms() - stage_start_ms;
+        if (stats) stats->write_detail_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
-        stage_start_ms = entries_now_ms();
+        stage_start_ms = ezdb_now_ms();
         rc = ezdb_entries_section_build_write_raw(&result->sections, out, header);
-        if (stats) stats->write_raw_ms = entries_now_ms() - stage_start_ms;
+        if (stats) stats->write_raw_ms = ezdb_now_ms() - stage_start_ms;
     }
     if (rc == EZDB_OK) {
-        stage_start_ms = entries_now_ms();
+        stage_start_ms = ezdb_now_ms();
         header->entry_count = entry_count;
         header->active_entry_count = entry_count;
         header->base_entry_count = entry_count;
-        header->reserved_offset = (uint64_t)ftell(out);
+        header->reserved_offset = (uint64_t)_ftelli64(out);
         header->reserved_size = 0;
         header->delta_offset = header->reserved_offset;
         header->delta_size = 0;
-        if (stats) stats->finalize_ms = entries_now_ms() - stage_start_ms;
+        if (stats) stats->finalize_ms = ezdb_now_ms() - stage_start_ms;
     }
     return rc;
 }
@@ -578,7 +550,7 @@ int ezdb_entries_copy_raw_blob_range(FILE* fp,
 int ezdb_entries_copy_delta_blob_range(FILE* fp, uint64_t offset, uint32_t len, unsigned char* out)
 {
     if (!fp || (!out && len)) return EZDB_ERR_ARG;
-    if (fseek(fp, (long)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+    if (_fseeki64(fp, (__int64)offset, SEEK_SET) != 0) return EZDB_ERR_IO;
     if (len && fread(out, 1, len, fp) != len) return EZDB_ERR_IO;
     return EZDB_OK;
 }
@@ -589,7 +561,7 @@ int ezdb_entries_load_detail(const EzdbEntryDetailStore* store, uint32_t id, Ezd
         !store->path_offsets || !store->path_lens) {
         return EZDB_ERR_ARG;
     }
-    if (entry_bitset_get(store->delta_bits, id)) {
+    if (ezdb_bitset_get(store->delta_bits, id)) {
         if (!store->delta_refs) return EZDB_ERR_ARG;
         const EzdbDeltaEntryRef* ref = &store->delta_refs[id];
         memset(out, 0, sizeof(*out));
@@ -637,8 +609,8 @@ char* ezdb_entries_copy_path(const EzdbEntryPathStore* store, uint32_t id)
     uint32_t len = store->path_lens[id];
     char* out = (char*)malloc((size_t)len + 1u);
     if (!out) return NULL;
-    long saved_pos = ftell(store->fp);
-    int rc = entry_bitset_get(store->delta_bits, id)
+    __int64 saved_pos = _ftelli64(store->fp);
+    int rc = ezdb_bitset_get(store->delta_bits, id)
         ? (store->delta_refs
                ? ezdb_entries_copy_delta_blob_range(store->fp,
                                                     store->delta_refs[id].path_offset,
@@ -656,7 +628,7 @@ char* ezdb_entries_copy_path(const EzdbEntryPathStore* store, uint32_t id)
                                            store->path_offsets[id],
                                            len,
                                            (unsigned char*)out);
-    if (saved_pos >= 0 && fseek(store->fp, saved_pos, SEEK_SET) != 0) rc = EZDB_ERR_IO;
+    if (saved_pos >= 0 && _fseeki64(store->fp, saved_pos, SEEK_SET) != 0) rc = EZDB_ERR_IO;
     if (rc != EZDB_OK) {
         free(out);
         return NULL;
@@ -671,7 +643,7 @@ void* ezdb_entries_copy_raw_path(const EzdbEntryPathStore* store, uint32_t id, c
     if (!detail->raw_len) return NULL;
     void* out = malloc(detail->raw_len);
     if (!out) return NULL;
-    int rc = entry_bitset_get(store->delta_bits, id)
+    int rc = ezdb_bitset_get(store->delta_bits, id)
         ? (store->delta_refs
                ? ezdb_entries_copy_delta_blob_range(store->fp,
                                                     store->delta_refs[id].raw_offset,
@@ -793,12 +765,12 @@ void ezdb_entries_array_source_init(EzdbEntrySource* source,
 static int compact_entry_is_searchable(const EzdbCompactEntrySource* source, uint32_t entry_id)
 {
     if (!source || entry_id >= source->detail_store.entry_count ||
-        !entry_bitset_get(source->active_entry_bits, entry_id)) {
+        !ezdb_bitset_get(source->active_entry_bits, entry_id)) {
         return 0;
     }
     if (!source->detail_store.archive_ids) return 0;
     uint32_t archive_id = source->detail_store.archive_ids[entry_id];
-    return archive_id < source->file_count && entry_bitset_get(source->active_archive_bits, archive_id);
+    return archive_id < source->file_count && ezdb_bitset_get(source->active_archive_bits, archive_id);
 }
 
 void ezdb_entries_compact_source_clear_current(EzdbCompactEntrySource* source)

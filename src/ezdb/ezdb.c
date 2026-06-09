@@ -39,16 +39,26 @@ static int append_blob(unsigned char** data, uint32_t* size, uint32_t* cap, cons
 
 static uint64_t file_size_of(FILE* fp)
 {
-    long old_pos = ftell(fp);
-    if (fseek(fp, 0, SEEK_END) != 0) return 0;
-    long size = ftell(fp);
-    fseek(fp, old_pos, SEEK_SET);
+    __int64 old_pos = _ftelli64(fp);
+    if (_fseeki64(fp, 0, SEEK_END) != 0) return 0;
+    __int64 size = _ftelli64(fp);
+    _fseeki64(fp, old_pos, SEEK_SET);
     return size < 0 ? 0 : (uint64_t)size;
 }
 
-static double ezdb_now_ms(void)
+double ezdb_now_ms(void)
 {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+uint32_t ezdb_fnv1a_bytes(const char* text, size_t len)
+{
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= (unsigned char)text[i];
+        hash *= 16777619u;
+    }
+    return hash;
 }
 
 static double ezdb_peak_working_set_mb(void)
@@ -74,7 +84,7 @@ int ezdb_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint
     if (*capacity >= needed) return EZDB_OK;
     uint32_t next = *capacity ? *capacity : 1024;
     while (next < needed) {
-        if (next > UINT32_MAX / 2u) return EZDB_ERR_MEMORY;
+        if (next > UINT32_MAX / 2u) { next = needed; break; }
         next *= 2u;
     }
     void* new_data = realloc(*data, elem_size * (size_t)next);
@@ -82,22 +92,6 @@ int ezdb_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint
     *data = new_data;
     *capacity = next;
     return EZDB_OK;
-}
-
-static int u32_compare(const void* a, const void* b)
-{
-    uint32_t av = *(const uint32_t*)a;
-    uint32_t bv = *(const uint32_t*)b;
-    if (av == bv) return 0;
-    return av < bv ? -1 : 1;
-}
-
-static int index_compare(const void* a, const void* b)
-{
-    const EzdbDiskIndex* ia = (const EzdbDiskIndex*)a;
-    const EzdbDiskIndex* ib = (const EzdbDiskIndex*)b;
-    if (ia->key == ib->key) return 0;
-    return ia->key < ib->key ? -1 : 1;
 }
 
 uint32_t ezdb_next_pow2_u32(uint32_t value)
@@ -717,7 +711,7 @@ static int ezdb_write_v13_db_header(Ezdb* db)
         ? db->header.delta_offset + db->header.delta_size
         : db->v13_section_table_offset;
     if (!table_offset) table_offset = db->header.reserved_offset;
-    if (fseek(db->fp, (long)table_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
+    if (_fseeki64(db->fp, (__int64)table_offset, SEEK_SET) != 0) return EZDB_ERR_IO;
 
     EzdbSectionDesc sections[EZDB_SECTION_METADATA];
     uint32_t section_count = 0;
@@ -755,12 +749,12 @@ uint64_t ezdb_delta_append_offset(Ezdb* db)
 static int ezdb_get_file_size(FILE* fp, uint64_t* out_size)
 {
     if (!fp || !out_size) return EZDB_ERR_ARG;
-    long current = ftell(fp);
+    __int64 current = _ftelli64(fp);
     if (current < 0) return EZDB_ERR_IO;
-    if (fseek(fp, 0, SEEK_END) != 0) return EZDB_ERR_IO;
-    long end = ftell(fp);
+    if (_fseeki64(fp, 0, SEEK_END) != 0) return EZDB_ERR_IO;
+    __int64 end = _ftelli64(fp);
     if (end < 0) return EZDB_ERR_IO;
-    if (fseek(fp, current, SEEK_SET) != 0) return EZDB_ERR_IO;
+    if (_fseeki64(fp, current, SEEK_SET) != 0) return EZDB_ERR_IO;
     *out_size = (uint64_t)end;
     return EZDB_OK;
 }
@@ -951,8 +945,8 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
                 write_base_ms = archive_base_stats.write_ms;
             }
 
-            header.postings_offset = (uint64_t)ftell(out);
-            rc = ezdb_build_write_archive_postings(out, &tree, &archive_postings);
+            header.postings_offset = (uint64_t)_ftelli64(out);
+            if (rc == EZDB_OK) rc = ezdb_build_write_archive_postings(out, &tree, &archive_postings);
             if (rc == EZDB_OK) {
                 file_index_ms = archive_postings.file_index_ms;
                 dir_index_ms = archive_postings.dir_index_ms;
@@ -967,7 +961,7 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
                 }
             }
 
-            header.file_index_offset = (uint64_t)ftell(out);
+            header.file_index_offset = (uint64_t)_ftelli64(out);
             header.file_index_count = archive_postings.file_index_count;
             if (rc == EZDB_OK && archive_postings.file_index_count &&
                 fwrite(archive_postings.file_index,
@@ -980,7 +974,7 @@ int ezdb_build_write_archive_base_core(const EzdbArchiveRecord* archives,
             for (uint32_t i = 0; i < archive_postings.dir_index_count; ++i) {
                 archive_postings.dir_index[i].offset += archive_postings.file_postings_size;
             }
-            header.dir_index_offset = (uint64_t)ftell(out);
+            header.dir_index_offset = (uint64_t)_ftelli64(out);
             header.dir_index_count = archive_postings.dir_index_count;
             if (rc == EZDB_OK && archive_postings.dir_index_count &&
                 fwrite(archive_postings.dir_index,
@@ -1180,13 +1174,13 @@ int ezdb_open(const char* path, Ezdb** out_db)
         free(entry_core);
     }
     if (rc == EZDB_OK && db->header.entry_detail_index_offset && db->header.entry_detail_page_count) {
-        if (fseek(fp, (long)db->header.entry_detail_index_offset, SEEK_SET) != 0 ||
+        if (_fseeki64(fp, (__int64)db->header.entry_detail_index_offset, SEEK_SET) != 0 ||
             fread(db->entry_detail_pages, sizeof(EzdbDiskPage), (size_t)db->header.entry_detail_page_count, fp) != (size_t)db->header.entry_detail_page_count) {
             rc = EZDB_ERR_IO;
         }
     }
     if (rc == EZDB_OK && db->header.raw_blob_index_offset && db->header.raw_blob_page_count) {
-        if (fseek(fp, (long)db->header.raw_blob_index_offset, SEEK_SET) != 0 ||
+        if (_fseeki64(fp, (__int64)db->header.raw_blob_index_offset, SEEK_SET) != 0 ||
             fread(db->raw_blob_pages, sizeof(EzdbDiskPage), (size_t)db->header.raw_blob_page_count, fp) != (size_t)db->header.raw_blob_page_count) {
             rc = EZDB_ERR_IO;
         }
@@ -1195,15 +1189,15 @@ int ezdb_open(const char* path, Ezdb** out_db)
         ezdb_close(db);
         return rc;
     }
-    if (fseek(fp, (long)db->header.file_index_offset, SEEK_SET) != 0 ||
+    if (_fseeki64(fp, (__int64)db->header.file_index_offset, SEEK_SET) != 0 ||
         fread(db->file_index, sizeof(EzdbDiskIndex), (size_t)db->header.file_index_count, fp) != (size_t)db->header.file_index_count ||
-        fseek(fp, (long)db->header.dir_index_offset, SEEK_SET) != 0 ||
+        _fseeki64(fp, (__int64)db->header.dir_index_offset, SEEK_SET) != 0 ||
         fread(db->dir_index, sizeof(EzdbDiskIndex), (size_t)db->header.dir_index_count, fp) != (size_t)db->header.dir_index_count) {
         ezdb_close(db);
         return EZDB_ERR_IO;
     }
     if (db->header.entry_index_count) {
-        if (fseek(fp, (long)db->header.entry_index_offset, SEEK_SET) != 0 ||
+        if (_fseeki64(fp, (__int64)db->header.entry_index_offset, SEEK_SET) != 0 ||
             fread(db->entry_index, sizeof(EzdbDiskIndex), (size_t)db->header.entry_index_count, fp) != (size_t)db->header.entry_index_count) {
             ezdb_close(db);
             return EZDB_ERR_IO;
@@ -1353,7 +1347,7 @@ static uint32_t ezdb_compute_active_entry_count(Ezdb* db)
 
 uint32_t ezdb_active_entry_count(Ezdb* db)
 {
-    return ezdb_compute_active_entry_count(db);
+    return db ? (uint32_t)db->header.active_entry_count : 0;
 }
 
 uint64_t ezdb_file_size(Ezdb* db)

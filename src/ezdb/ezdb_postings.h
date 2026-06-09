@@ -31,6 +31,7 @@ typedef struct PostingBuildEntry {
     uint32_t next;
     uint32_t fill_mode;
     uint32_t fill_bytes;
+    uint32_t last_id;  /* 去重用：count 阶段记录上一次看到的 ID */
 } PostingBuildEntry;
 
 typedef struct PostingBuilder {

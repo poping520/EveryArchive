@@ -10,8 +10,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define EZDB_WRITE_TXN_ACTIVE 1u
-
 typedef struct EzdbDeltaRecord {
     uint32_t id;
     uint32_t type;
@@ -108,7 +106,9 @@ struct Ezdb {
     uint32_t delta_entry_path_cache_cap;
 };
 
+double ezdb_now_ms(void);
 char* ezdb_strdup_range(const char* text, size_t len);
+uint32_t ezdb_fnv1a_bytes(const char* text, size_t len);
 int ezdb_ensure_capacity(void** data, size_t elem_size, uint32_t* capacity, uint32_t needed);
 void ezdb_bitset_set(unsigned char* bits, uint32_t id, int value);
 int ezdb_bitset_get(const unsigned char* bits, uint32_t id);

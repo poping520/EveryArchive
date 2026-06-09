@@ -4,14 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-int ezdb_format_header_is_current(const EzdbHeader* header)
-{
-    if (!header) return 0;
-    return memcmp(header->magic, EZDB_MAGIC, sizeof(header->magic)) == 0 &&
-           header->version == EZDB_VERSION &&
-           header->header_size == sizeof(EzdbHeader);
-}
-
 int ezdb_format_v13_header_is_current(const EzdbV13Header* header)
 {
     if (!header) return 0;
@@ -141,7 +133,7 @@ int ezdb_format_write_section_table(FILE* fp,
                                     uint64_t* out_size)
 {
     if (!fp || (!sections && section_count)) return EZDB_FORMAT_ERR_ARG;
-    long pos = ftell(fp);
+    __int64 pos = _ftelli64(fp);
     if (pos < 0) return EZDB_FORMAT_ERR_IO;
     uint64_t offset = (uint64_t)pos;
     if (section_count && fwrite(sections, sizeof(EzdbSectionDesc), (size_t)section_count, fp) != (size_t)section_count) {
@@ -333,7 +325,7 @@ int ezdb_format_read_section_table(FILE* fp,
     }
     EzdbSectionDesc* sections = (EzdbSectionDesc*)malloc(sizeof(EzdbSectionDesc) * (size_t)header->section_count);
     if (!sections) return EZDB_FORMAT_ERR_MEMORY;
-    if (fseek(fp, (long)header->section_table_offset, SEEK_SET) != 0 ||
+    if (_fseeki64(fp, (__int64)header->section_table_offset, SEEK_SET) != 0 ||
         fread(sections, sizeof(EzdbSectionDesc), (size_t)header->section_count, fp) != (size_t)header->section_count) {
         free(sections);
         return EZDB_FORMAT_ERR_IO;
