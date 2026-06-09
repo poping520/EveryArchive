@@ -425,16 +425,16 @@ static int restore_txn_snapshot(Ezdb* db)
     ezdb_rebuild_archive_entry_links(db);
     return ezdb_rebuild_delta_entry_index(db);
 }
-static int append_delta_disk(Ezdb* db, uint32_t type, uint32_t id, const EzdbFileRecord* record, int flush_now)
+static int append_delta_disk(Ezdb* db, uint32_t type, uint32_t id, const char* path, uint64_t size, uint64_t modified_time, int flush_now)
 {
     if (!db || db->read_only || !db->fp) return EZDB_ERR_READ_ONLY;
     uint32_t path_len = 0;
-    if (record && record->path) {
-        size_t len = strlen(record->path);
+    if (path) {
+        size_t len = strlen(path);
         if (len > UINT32_MAX) return EZDB_ERR_ARG;
         path_len = (uint32_t)len;
     }
-    if ((type == EZDB_DELTA_INSERT || type == EZDB_DELTA_UPDATE) && (!record || !record->path || !path_len)) {
+    if ((type == EZDB_DELTA_INSERT || type == EZDB_DELTA_UPDATE) && (!path || !path_len)) {
         return EZDB_ERR_ARG;
     }
 
@@ -446,10 +446,10 @@ static int append_delta_disk(Ezdb* db, uint32_t type, uint32_t id, const EzdbFil
     dh.type = type;
     dh.id = id;
     dh.path_len = path_len;
-    dh.size = record ? record->size : 0;
-    dh.modified_time = record ? record->modified_time : 0;
+    dh.size = size;
+    dh.modified_time = modified_time;
     if (fwrite(&dh, sizeof(dh), 1, db->fp) != 1) return EZDB_ERR_IO;
-    if (path_len && fwrite(record->path, 1, path_len, db->fp) != path_len) return EZDB_ERR_IO;
+    if (path_len && fwrite(path, 1, path_len, db->fp) != path_len) return EZDB_ERR_IO;
 
     if (!db->header.delta_offset) db->header.delta_offset = append_offset;
     db->header.delta_size += sizeof(dh) + path_len;
@@ -855,45 +855,9 @@ int ezdb_rollback_write(Ezdb* db)
     return rc;
 }
 
-int ezdb_insert_many(Ezdb* db, const EzdbFileRecord* records, uint32_t count, uint32_t* first_id)
+static int archive_insert(Ezdb* db, const char* path, uint64_t size, uint64_t modified_time, uint32_t* out_id)
 {
-    if (!db || (!records && count)) return EZDB_ERR_ARG;
-    if (db->read_only) return EZDB_ERR_READ_ONLY;
-    if ((uint64_t)count > UINT32_MAX - db->header.file_count) return EZDB_ERR_MEMORY;
-    int own_txn = db->write_txn_active ? 0 : 1;
-    int rc = EZDB_OK;
-    if (own_txn) {
-        rc = ezdb_begin_write(db, 0);
-        if (rc != EZDB_OK) return rc;
-    }
-    rc = ezdb_resize_active_bits(db, db->header.file_count + count);
-    if (rc == EZDB_OK) rc = ezdb_ensure_capacity((void**)&db->deltas, sizeof(EzdbDeltaRecord), &db->delta_cap, db->delta_count + count);
-    if (rc == EZDB_OK) rc = ezdb_delta_hash_ensure(db, db->delta_count + count);
-    if (rc != EZDB_OK) {
-        if (own_txn) (void)ezdb_rollback_write(db);
-        return rc;
-    }
-    uint32_t first = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t id = 0;
-        rc = ezdb_insert(db, &records[i], &id);
-        if (rc != EZDB_OK) break;
-        if (i == 0) first = id;
-    }
-    if (rc == EZDB_OK && first_id && count) *first_id = first;
-    if (own_txn) {
-        if (rc == EZDB_OK) {
-            rc = ezdb_commit_write(db);
-        } else {
-            (void)ezdb_rollback_write(db);
-        }
-    }
-    return rc;
-}
-
-int ezdb_insert(Ezdb* db, const EzdbFileRecord* record, uint32_t* out_id)
-{
-    if (!db || !record || !record->path || !out_id) return EZDB_ERR_ARG;
+    if (!db || !path || !out_id) return EZDB_ERR_ARG;
     if (db->read_only) return EZDB_ERR_READ_ONLY;
     if (db->header.file_count >= UINT32_MAX) return EZDB_ERR_MEMORY;
     uint32_t id = (uint32_t)db->header.file_count;
@@ -913,8 +877,9 @@ int ezdb_insert(Ezdb* db, const EzdbFileRecord* record, uint32_t* out_id)
     ezdb_bitset_set(db->active_bits, id, 0);
     if (db->archive_first_entry_ids) db->archive_first_entry_ids[id] = UINT32_MAX;
 
-    int rc = append_delta_disk(db, EZDB_DELTA_INSERT, id, record, !db->write_txn_active);
-    if (rc == EZDB_OK) rc = ezdb_append_delta_memory(db, EZDB_DELTA_INSERT, id, record->path, (uint32_t)strlen(record->path), record->size, record->modified_time);
+    uint32_t path_len = (uint32_t)strlen(path);
+    int rc = append_delta_disk(db, EZDB_DELTA_INSERT, id, path, size, modified_time, !db->write_txn_active);
+    if (rc == EZDB_OK) rc = ezdb_append_delta_memory(db, EZDB_DELTA_INSERT, id, path, path_len, size, modified_time);
     if (rc == EZDB_OK) {
         ezdb_bitset_set(db->active_bits, id, 1);
         *out_id = id;
@@ -929,16 +894,17 @@ int ezdb_insert(Ezdb* db, const EzdbFileRecord* record, uint32_t* out_id)
     return rc;
 }
 
-int ezdb_update(Ezdb* db, uint32_t id, const EzdbFileRecord* record)
+static int archive_update(Ezdb* db, uint32_t id, const char* path, uint64_t size, uint64_t modified_time)
 {
-    if (!db || !record || !record->path) return EZDB_ERR_ARG;
+    if (!db || !path) return EZDB_ERR_ARG;
     if (db->read_only) return EZDB_ERR_READ_ONLY;
     if (id >= db->header.file_count || !ezdb_bitset_get(db->active_bits, id)) return EZDB_ERR_NOT_FOUND;
     uint64_t old_delta_offset = db->header.delta_offset;
     uint64_t old_delta_size = db->header.delta_size;
     uint64_t old_reserved_offset = db->header.reserved_offset;
-    int rc = append_delta_disk(db, EZDB_DELTA_UPDATE, id, record, !db->write_txn_active);
-    if (rc == EZDB_OK) rc = ezdb_append_delta_memory(db, EZDB_DELTA_UPDATE, id, record->path, (uint32_t)strlen(record->path), record->size, record->modified_time);
+    uint32_t path_len = (uint32_t)strlen(path);
+    int rc = append_delta_disk(db, EZDB_DELTA_UPDATE, id, path, size, modified_time, !db->write_txn_active);
+    if (rc == EZDB_OK) rc = ezdb_append_delta_memory(db, EZDB_DELTA_UPDATE, id, path, path_len, size, modified_time);
     if (rc == EZDB_OK) {
         if (id < db->header.base_file_count) ezdb_bitset_set(db->covered_base_bits, id, 1);
         ezdb_bitset_set(db->active_bits, id, 1);
@@ -950,7 +916,7 @@ int ezdb_update(Ezdb* db, uint32_t id, const EzdbFileRecord* record)
     return rc;
 }
 
-int ezdb_delete(Ezdb* db, uint32_t id)
+static int archive_delete(Ezdb* db, uint32_t id)
 {
     if (!db) return EZDB_ERR_ARG;
     if (db->read_only) return EZDB_ERR_READ_ONLY;
@@ -960,7 +926,7 @@ int ezdb_delete(Ezdb* db, uint32_t id)
     uint64_t old_delta_size = db->header.delta_size;
     uint64_t old_reserved_offset = db->header.reserved_offset;
     db->header.active_count -= 1u;
-    int rc = append_delta_disk(db, EZDB_DELTA_DELETE, id, NULL, !db->write_txn_active);
+    int rc = append_delta_disk(db, EZDB_DELTA_DELETE, id, NULL, 0, 0, !db->write_txn_active);
     if (rc == EZDB_OK) rc = ezdb_append_delta_memory(db, EZDB_DELTA_DELETE, id, NULL, 0, 0, 0);
     if (rc == EZDB_OK) {
         ezdb_bitset_set(db->active_bits, id, 0);
@@ -1002,11 +968,7 @@ int ezdb_upsert_archive(Ezdb* db, const EzdbArchiveRecord* record, uint32_t* out
         if (ezdb_bitset_get(db->active_bits, i) &&
             db->archive_meta[i].drive_letter == (unsigned char)record->drive_letter &&
             db->archive_meta[i].file_ref_number == record->file_ref_number) {
-            EzdbFileRecord file_record;
-            file_record.path = record->file_path;
-            file_record.size = record->file_size;
-            file_record.modified_time = record->modified_time;
-            int rc = ezdb_update(db, i, &file_record);
+            int rc = archive_update(db, i, record->file_path, record->file_size, record->modified_time);
             if (rc == EZDB_OK) {
                 db->archive_meta[i].usn = record->usn;
                 *out_id = i;
@@ -1014,11 +976,7 @@ int ezdb_upsert_archive(Ezdb* db, const EzdbArchiveRecord* record, uint32_t* out
             return rc;
         }
     }
-    EzdbFileRecord file_record;
-    file_record.path = record->file_path;
-    file_record.size = record->file_size;
-    file_record.modified_time = record->modified_time;
-    return ezdb_insert(db, &file_record, out_id);
+    return archive_insert(db, record->file_path, record->file_size, record->modified_time, out_id);
 }
 
 int ezdb_upsert_archives(Ezdb* db, const EzdbArchiveRecord* records, uint32_t count, uint32_t* out_ids)
@@ -1087,7 +1045,7 @@ int ezdb_delete_archive_by_ref(Ezdb* db, char drive_letter, uint64_t file_ref_nu
                 if (rc != EZDB_OK) return rc;
             }
             rc = append_entry_delete_archive_frame(db, i, 0);
-            if (rc == EZDB_OK) rc = ezdb_delete(db, i);
+            if (rc == EZDB_OK) rc = archive_delete(db, i);
             if (own_txn) {
                 if (rc == EZDB_OK) rc = ezdb_commit_write(db);
                 else (void)ezdb_rollback_write(db);

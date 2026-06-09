@@ -68,9 +68,6 @@ static void print_usage(void)
     printf("  EzdbBench search <db.ezdb> <keyword> [limit]\n");
     printf("  EzdbBench search-v2 <db.ezdb> <scope> <keyword> [limit]\n");
     printf("  EzdbBench query-entries <db.ezdb> <scope> <keyword> [offset] [limit]\n");
-    printf("  EzdbBench insert <db.ezdb> <path> [size] [mtime]\n");
-    printf("  EzdbBench update <db.ezdb> <id> <path> [size] [mtime]\n");
-    printf("  EzdbBench delete <db.ezdb> <id>\n");
     printf("  EzdbBench delete-archive-ref <db.ezdb> <drive> <file_ref_number>\n");
     printf("  EzdbBench compact <db.ezdb>\n");
 
@@ -358,9 +355,6 @@ static void print_interactive_help(uint32_t default_limit)
     printf("  get <id>\n");
     printf("  search <keyword> [limit]\n");
     printf("  <keyword> [limit]\n");
-    printf("  insert <path> [size] [mtime]\n");
-    printf("  update <id> <path> [size] [mtime]\n");
-    printf("  delete <id>\n");
     printf("  exit | quit\n");
     printf("Default search limit: %u\n", default_limit);
 }
@@ -453,58 +447,6 @@ static int run_get_once(Ezdb* db, uint32_t id, const char* memory_prefix)
     printf("get_ms: %.2f\n", elapsed);
     print_memory_usage(memory_prefix);
     ezdb_free_result(&result);
-    return 0;
-}
-
-static int run_insert_once(Ezdb* db, const char* path, uint64_t size, uint64_t mtime, const char* memory_prefix)
-{
-    EzdbFileRecord record;
-    record.path = path;
-    record.size = size;
-    record.modified_time = mtime;
-    uint32_t id = 0;
-    double start = now_ms();
-    int rc = ezdb_insert(db, &record, &id);
-    double elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "insert failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return rc;
-    }
-    printf("insert_id: %u\n", id);
-    printf("insert_ms: %.2f\n", elapsed);
-    print_memory_usage(memory_prefix);
-    return 0;
-}
-
-static int run_update_once(Ezdb* db, uint32_t id, const char* path, uint64_t size, uint64_t mtime, const char* memory_prefix)
-{
-    EzdbFileRecord record;
-    record.path = path;
-    record.size = size;
-    record.modified_time = mtime;
-    double start = now_ms();
-    int rc = ezdb_update(db, id, &record);
-    double elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "update failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return rc;
-    }
-    printf("update_ms: %.2f\n", elapsed);
-    print_memory_usage(memory_prefix);
-    return 0;
-}
-
-static int run_delete_once(Ezdb* db, uint32_t id, const char* memory_prefix)
-{
-    double start = now_ms();
-    int rc = ezdb_delete(db, id);
-    double elapsed = now_ms() - start;
-    if (rc != 0) {
-        fprintf(stderr, "delete failed: %s (%d)\n", ezdb_error_message(rc), rc);
-        return rc;
-    }
-    printf("delete_ms: %.2f\n", elapsed);
-    print_memory_usage(memory_prefix);
     return 0;
 }
 
@@ -2109,41 +2051,6 @@ static int run_main(int argc, char** argv)
                     continue;
                 }
                 rc = run_search_once(db, keyword, limit, "open_search");
-            } else if (strcmp(command, "insert") == 0) {
-                char* path = next_token(&cursor);
-                char* size_text = next_token(&cursor);
-                char* mtime_text = next_token(&cursor);
-                if (!path) {
-                    printf("usage: insert <path> [size] [mtime]\n");
-                    continue;
-                }
-                rc = run_insert_once(db,
-                                     path,
-                                     parse_u64_arg(size_text, 0),
-                                     parse_u64_arg(mtime_text, 0),
-                                     "open_insert");
-            } else if (strcmp(command, "update") == 0) {
-                char* id_text = next_token(&cursor);
-                char* path = next_token(&cursor);
-                char* size_text = next_token(&cursor);
-                char* mtime_text = next_token(&cursor);
-                if (!id_text || !path) {
-                    printf("usage: update <id> <path> [size] [mtime]\n");
-                    continue;
-                }
-                rc = run_update_once(db,
-                                     (uint32_t)strtoul(id_text, NULL, 10),
-                                     path,
-                                     parse_u64_arg(size_text, 0),
-                                     parse_u64_arg(mtime_text, 0),
-                                     "open_update");
-            } else if (strcmp(command, "delete") == 0) {
-                char* id_text = next_token(&cursor);
-                if (!id_text) {
-                    printf("usage: delete <id>\n");
-                    continue;
-                }
-                rc = run_delete_once(db, (uint32_t)strtoul(id_text, NULL, 10), "open_delete");
             } else {
                 char* keyword = NULL;
                 uint32_t limit = default_limit;
@@ -2157,91 +2064,6 @@ static int run_main(int argc, char** argv)
             }
             if (rc != 0) printf("command failed, type help for usage.\n");
         }
-        ezdb_close(db);
-        return 0;
-    }
-
-    if (strcmp(argv[1], "insert") == 0) {
-        if (argc < 4 || argc > 6) {
-            print_usage();
-            return 1;
-        }
-        Ezdb* db = NULL;
-        int rc = ezdb_open(argv[2], &db);
-        if (rc != 0) {
-            fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            return 2;
-        }
-        EzdbFileRecord record;
-        record.path = argv[3];
-        record.size = argc >= 5 ? parse_u64_arg(argv[4], 0) : 0;
-        record.modified_time = argc >= 6 ? parse_u64_arg(argv[5], 0) : 0;
-        uint32_t id = 0;
-        double start = now_ms();
-        rc = ezdb_insert(db, &record, &id);
-        double elapsed = now_ms() - start;
-        if (rc != 0) {
-            fprintf(stderr, "insert failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            ezdb_close(db);
-            return 2;
-        }
-        printf("insert_id: %u\n", id);
-        printf("insert_ms: %.2f\n", elapsed);
-        print_memory_usage("insert");
-        ezdb_close(db);
-        return 0;
-    }
-
-    if (strcmp(argv[1], "update") == 0) {
-        if (argc < 5 || argc > 7) {
-            print_usage();
-            return 1;
-        }
-        Ezdb* db = NULL;
-        int rc = ezdb_open(argv[2], &db);
-        if (rc != 0) {
-            fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            return 2;
-        }
-        EzdbFileRecord record;
-        record.path = argv[4];
-        record.size = argc >= 6 ? parse_u64_arg(argv[5], 0) : 0;
-        record.modified_time = argc >= 7 ? parse_u64_arg(argv[6], 0) : 0;
-        double start = now_ms();
-        rc = ezdb_update(db, (uint32_t)strtoul(argv[3], NULL, 10), &record);
-        double elapsed = now_ms() - start;
-        if (rc != 0) {
-            fprintf(stderr, "update failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            ezdb_close(db);
-            return 2;
-        }
-        printf("update_ms: %.2f\n", elapsed);
-        print_memory_usage("update");
-        ezdb_close(db);
-        return 0;
-    }
-
-    if (strcmp(argv[1], "delete") == 0) {
-        if (argc != 4) {
-            print_usage();
-            return 1;
-        }
-        Ezdb* db = NULL;
-        int rc = ezdb_open(argv[2], &db);
-        if (rc != 0) {
-            fprintf(stderr, "open failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            return 2;
-        }
-        double start = now_ms();
-        rc = ezdb_delete(db, (uint32_t)strtoul(argv[3], NULL, 10));
-        double elapsed = now_ms() - start;
-        if (rc != 0) {
-            fprintf(stderr, "delete failed: %s (%d)\n", ezdb_error_message(rc), rc);
-            ezdb_close(db);
-            return 2;
-        }
-        printf("delete_ms: %.2f\n", elapsed);
-        print_memory_usage("delete");
         ezdb_close(db);
         return 0;
     }
