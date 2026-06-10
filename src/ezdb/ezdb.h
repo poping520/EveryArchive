@@ -178,15 +178,8 @@ int ezdb_build_snapshot(const EzdbArchiveRecord* archives,
                         uint32_t entry_count,
                         const char* output_ezdb);
 
-/* 从条目流构建完整的 ezdb 快照文件（旧版，无构建选项） */
-int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
-                                       uint32_t archive_count,
-                                       EzdbEntryStream* entry_stream,
-                                       uint32_t entry_count,
-                                       const char* output_ezdb);
-
 /* 从条目流构建完整的 ezdb 快照文件（扩展版，支持构建选项） */
-int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
+int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
                                           uint32_t archive_count,
                                           EzdbEntryStream* entry_stream,
                                           uint32_t entry_count,

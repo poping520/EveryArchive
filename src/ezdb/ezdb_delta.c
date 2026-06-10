@@ -919,7 +919,7 @@ int ezdb_commit_write(Ezdb* db)
             memset(&opts, 0, sizeof(opts));
             opts.flags = EZDB_BUILD_DEFAULT_FLAGS;
             opts.index_threads = (bc > 1 && ec > 100000) ? 6u : 1u;
-            rc = ezdb_build_snapshot_stream_entries_ex(ba, bc, &ez_stream, ec, tmp_path, &opts);
+            rc = ezdb_build_snapshot_stream_entries(ba, bc, &ez_stream, ec, tmp_path, &opts);
         } else {
             rc = ezdb_build_snapshot(ba, bc, NULL, 0, tmp_path);
         }

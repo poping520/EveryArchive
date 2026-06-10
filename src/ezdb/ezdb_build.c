@@ -616,15 +616,6 @@ int ezdb_build_snapshot(const EzdbArchiveRecord* archives,
 }
 
 int ezdb_build_snapshot_stream_entries(const EzdbArchiveRecord* archives,
-                                       uint32_t archive_count,
-                                       EzdbEntryStream* entry_stream,
-                                       uint32_t entry_count,
-                                       const char* output_ezdb)
-{
-    return ezdb_build_snapshot_stream_entries_ex(archives, archive_count, entry_stream, entry_count, output_ezdb, NULL);
-}
-
-int ezdb_build_snapshot_stream_entries_ex(const EzdbArchiveRecord* archives,
                                           uint32_t archive_count,
                                           EzdbEntryStream* entry_stream,
                                           uint32_t entry_count,

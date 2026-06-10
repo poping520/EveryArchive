@@ -1378,7 +1378,7 @@ static int run_build_zip_entries(const char* zip_tsv, const char* output_ezdb, u
         build_options.flags = EZDB_BUILD_DEFAULT_FLAGS;
         build_options.zip_threads = thread_count;
         build_options.index_threads = thread_count;
-        int rc = ezdb_build_snapshot_stream_entries_ex(archives.records,
+        int rc = ezdb_build_snapshot_stream_entries(archives.records,
                                                        archives.count,
                                                        entry_count ? &ez_stream : NULL,
                                                        entry_count,
@@ -1433,7 +1433,7 @@ static int run_build_entries(const char* combined_tsv, const char* output_ezdb)
     ez_stream.next = combined_entry_next;
 
     double start = now_ms();
-    int rc = ezdb_build_snapshot_stream_entries(combined.archives.records, combined.archives.count, &ez_stream, combined.entries.count, output_ezdb);
+    int rc = ezdb_build_snapshot_stream_entries(combined.archives.records, combined.archives.count, &ez_stream, combined.entries.count, output_ezdb, NULL);
     double elapsed = now_ms() - start;
     if (rc != 0) {
         fprintf(stderr, "build-entries: ezdb_build_snapshot_stream_entries failed: %s (%d)\n", ezdb_error_message(rc), rc);
