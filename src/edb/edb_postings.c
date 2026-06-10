@@ -13,6 +13,13 @@ static int edb_is_separator(uint32_t cp) {
     return cp == '/' || cp == '\\' || cp == '.';
 }
 
+static int edb_is_cjk_codepoint(uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FFF) ||   /* CJK Unified Ideographs */
+           (cp >= 0x3400 && cp <= 0x4DBF) ||   /* CJK Extension A */
+           (cp >= 0xF900 && cp <= 0xFAFF) ||   /* CJK Compatibility */
+           (cp >= 0x20000 && cp <= 0x2A6DF);   /* CJK Extension B */
+}
+
 /* 将 UTF-8 文本分词为 token 序列（跳过分隔符，ASCII 折叠） */
 /* 返回 token 数量，tokens 写入 caller 提供的数组 */
 /* 每个 token: (offset, byte_len) */
@@ -90,16 +97,27 @@ int edb_postings_enumerate_gram_keys(const char* text, const EdbGramKeyCallback*
     uint32_t ntokens = edb_tokenize(text, tokens, 256);
     if (ntokens == 0) return 0;
 
+    /* 检查每个 token 是否包含 CJK 字符 */
+    uint32_t cjk_char_counts[256];
+    memset(cjk_char_counts, 0, ntokens * sizeof(uint32_t));
+    for (uint32_t t = 0; t < ntokens; t++) {
+        uint32_t coffsets[256], clens[256];
+        cjk_char_counts[t] = edb_extract_cjk_chars(text, tokens[t].offset, tokens[t].len,
+                                                     coffsets, clens, 256);
+    }
+
     int total = 0;
     for (uint32_t t = 0; t < ntokens; t++) {
-        /* 1-gram */
+        /* 跳过包含 CJK 字符的 token 的常规 1-gram */
+        if (cjk_char_counts[t] >= 2) continue;
         uint32_t key = edb_postings_make_gram_key(text, tokens[t].offset, tokens[t].len, 1);
         int rc = cb->emit(key, cb->user_data);
         if (rc < 0) return rc;
         total++;
     }
     for (uint32_t t = 0; t + 1 < ntokens; t++) {
-        /* 2-gram: 连接 token[t] 和 token[t+1] */
+        /* 跳过包含 CJK 的 token 的常规 2-gram */
+        if (cjk_char_counts[t] >= 2 || cjk_char_counts[t + 1] >= 2) continue;
         uint32_t off = tokens[t].offset;
         uint32_t len = tokens[t].len + tokens[t + 1].len;
         uint32_t key = edb_postings_make_gram_key(text, off, len, 2);
@@ -108,7 +126,8 @@ int edb_postings_enumerate_gram_keys(const char* text, const EdbGramKeyCallback*
         total++;
     }
     for (uint32_t t = 0; t + 2 < ntokens; t++) {
-        /* 3-gram */
+        /* 跳过包含 CJK 的 token 的常规 3-gram */
+        if (cjk_char_counts[t] >= 2 || cjk_char_counts[t + 1] >= 2 || cjk_char_counts[t + 2] >= 2) continue;
         uint32_t off = tokens[t].offset;
         uint32_t len = tokens[t].len + tokens[t + 1].len + tokens[t + 2].len;
         uint32_t key = edb_postings_make_gram_key(text, off, len, 3);
@@ -116,7 +135,66 @@ int edb_postings_enumerate_gram_keys(const char* text, const EdbGramKeyCallback*
         if (rc < 0) return rc;
         total++;
     }
+
+    /* CJK 字符级 N-gram：对包含 CJK 的 token，提取字符级 grams */
+    for (uint32_t t = 0; t < ntokens; t++) {
+        if (cjk_char_counts[t] < 2) continue;
+        uint32_t coffsets[256], clens[256];
+        uint32_t ncchars = edb_extract_cjk_chars(text, tokens[t].offset, tokens[t].len,
+                                                   coffsets, clens, 256);
+
+        /* CJK 字符 1-gram */
+        for (uint32_t c = 0; c < ncchars; c++) {
+            uint32_t key = edb_postings_make_gram_key(text, coffsets[c], clens[c], 1);
+            int rc = cb->emit(key, cb->user_data);
+            if (rc < 0) return rc;
+            total++;
+        }
+        /* CJK 字符 2-gram */
+        for (uint32_t c = 0; c + 1 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 1] + clens[c + 1]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 2);
+            int rc = cb->emit(key, cb->user_data);
+            if (rc < 0) return rc;
+            total++;
+        }
+        /* CJK 字符 3-gram */
+        for (uint32_t c = 0; c + 2 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 2] + clens[c + 2]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 3);
+            int rc = cb->emit(key, cb->user_data);
+            if (rc < 0) return rc;
+            total++;
+        }
+    }
     return total;
+}
+
+/* 从文本范围中提取 CJK 字符的偏移和长度，返回 CJK 字符数 */
+static uint32_t edb_extract_cjk_chars(const char* text, uint32_t offset, uint32_t len,
+                                        uint32_t* char_offsets, uint32_t* char_lens,
+                                        uint32_t max_chars) {
+    uint32_t count = 0;
+    uint32_t i = 0;
+    while (i < len && count < max_chars) {
+        uint32_t clen = edb_utf8_char_len((const uint8_t*)text + offset + i, len - i);
+        if (clen == 0) break;
+        uint32_t cp = 0;
+        const uint8_t* p = (const uint8_t*)text + offset + i;
+        if (clen == 1) cp = p[0];
+        else if (clen == 2) cp = ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+        else if (clen == 3) cp = ((uint32_t)(p[0] & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+        else if (clen == 4) cp = ((uint32_t)(p[0] & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12) | ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+        if (edb_is_cjk_codepoint(cp)) {
+            char_offsets[count] = offset + i;
+            char_lens[count] = clen;
+            count++;
+        }
+        i += clen;
+    }
+    return count;
 }
 
 /* ===== Query Keys ===== */
@@ -283,6 +361,32 @@ int edb_postings_count_text_grams(EdbPostingBuilder* builder, const char* text, 
         int rc = edb_postings_builder_add(builder, key, id);
         if (rc != 0) return rc;
     }
+    /* CJK 字符级 N-gram */
+    for (uint32_t t = 0; t < ntokens; t++) {
+        uint32_t coffsets[256], clens[256];
+        uint32_t ncchars = edb_extract_cjk_chars(text, tokens[t].offset, tokens[t].len,
+                                                   coffsets, clens, 256);
+        if (ncchars < 2) continue;
+        for (uint32_t c = 0; c < ncchars; c++) {
+            uint32_t key = edb_postings_make_gram_key(text, coffsets[c], clens[c], 1);
+            int rc = edb_postings_builder_add(builder, key, id);
+            if (rc != 0) return rc;
+        }
+        for (uint32_t c = 0; c + 1 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 1] + clens[c + 1]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 2);
+            int rc = edb_postings_builder_add(builder, key, id);
+            if (rc != 0) return rc;
+        }
+        for (uint32_t c = 0; c + 2 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 2] + clens[c + 2]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 3);
+            int rc = edb_postings_builder_add(builder, key, id);
+            if (rc != 0) return rc;
+        }
+    }
     return 0;
 }
 
@@ -324,6 +428,41 @@ int edb_postings_fill_text_grams(EdbPostingBuilder* builder, const char* text, u
                 edb_bit_set((unsigned char*)e->ids, id);
             } else {
                 e->ids[e->count++] = id;
+            }
+        }
+    }
+    /* CJK 字符级 N-gram */
+    for (uint32_t t = 0; t < ntokens; t++) {
+        uint32_t coffsets[256], clens[256];
+        uint32_t ncchars = edb_extract_cjk_chars(text, tokens[t].offset, tokens[t].len,
+                                                   coffsets, clens, 256);
+        if (ncchars < 2) continue;
+        for (uint32_t c = 0; c < ncchars; c++) {
+            uint32_t key = edb_postings_make_gram_key(text, coffsets[c], clens[c], 1);
+            EdbPostingEntry* e = edb_postings_builder_find(builder, key);
+            if (e) {
+                if (e->fill_mode == 1) edb_bit_set((unsigned char*)e->ids, id);
+                else e->ids[e->count++] = id;
+            }
+        }
+        for (uint32_t c = 0; c + 1 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 1] + clens[c + 1]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 2);
+            EdbPostingEntry* e = edb_postings_builder_find(builder, key);
+            if (e) {
+                if (e->fill_mode == 1) edb_bit_set((unsigned char*)e->ids, id);
+                else e->ids[e->count++] = id;
+            }
+        }
+        for (uint32_t c = 0; c + 2 < ncchars; c++) {
+            uint32_t off = coffsets[c];
+            uint32_t len = (coffsets[c + 2] + clens[c + 2]) - coffsets[c];
+            uint32_t key = edb_postings_make_gram_key(text, off, len, 3);
+            EdbPostingEntry* e = edb_postings_builder_find(builder, key);
+            if (e) {
+                if (e->fill_mode == 1) edb_bit_set((unsigned char*)e->ids, id);
+                else e->ids[e->count++] = id;
             }
         }
     }

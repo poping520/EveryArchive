@@ -67,6 +67,7 @@ static int edb_is_special(char c) {
 }
 
 /* 解析原子：关键词、带引号短语、通配符 */
+static EdbQueryNode* edb_parse_or(EdbParser* p);
 static EdbQueryNode* edb_parse_atom(EdbParser* p) {
     /* 跳过空白 */
     while (p->pos < p->len && p->src[p->pos] == ' ') p->pos++;
@@ -77,10 +78,11 @@ static EdbQueryNode* edb_parse_atom(EdbParser* p) {
     /* 括号 */
     if (c == '(') {
         edb_parser_next(p);
-        EdbQueryNode* inner = edb_query_parse(p->src + p->pos);
-        /* 在实际中我们需要递归解析，这里简化：找到匹配 ) */
-        /* 重新设计：返回到调用者，由 parse_or 处理 */
-        return NULL; /* TODO: 括号支持在完整实现中 */
+        EdbQueryNode* inner = edb_parse_or(p);
+        /* 消费匹配的 ) */
+        while (p->pos < p->len && p->src[p->pos] == ' ') p->pos++;
+        if (p->pos < p->len && p->src[p->pos] == ')') p->pos++;
+        return inner;
     }
 
     /* 引号短语 */
