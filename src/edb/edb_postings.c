@@ -156,8 +156,11 @@ int edb_postings_builder_init(EdbPostingBuilder* builder, uint32_t bucket_count)
 
 void edb_postings_builder_free(EdbPostingBuilder* builder) {
     if (builder->entries) {
-        for (uint32_t i = 0; i < builder->entry_count; i++) {
-            if (builder->entries[i].ids) free(builder->entries[i].ids);
+        /* 如果 id_block 存在，ids 指向 id_block 内部，不需要单独释放 */
+        if (!builder->id_block) {
+            for (uint32_t i = 0; i < builder->entry_count; i++) {
+                if (builder->entries[i].ids) free(builder->entries[i].ids);
+            }
         }
         free(builder->entries);
     }
@@ -235,10 +238,11 @@ int edb_postings_builder_prepare(EdbPostingBuilder* builder, uint32_t universe_c
         if (!builder->id_block) return EDB_ERR_MEMORY;
     }
 
-    /* 分配每个 entry 的 id_block 切片 */
+    /* 分配每个 entry 的 id_block 切片，释放旧的独立 ids */
     uint32_t* ptr = builder->id_block;
     for (uint32_t i = 0; i < builder->entry_count; i++) {
         EdbPostingEntry* e = &builder->entries[i];
+        free(e->ids); /* 释放 count 阶段分配的独立数组 */
         if (e->fill_mode == 1) {
             e->ids = ptr;
             ptr = (uint32_t*)((uint8_t*)ptr + e->fill_bytes);
@@ -385,6 +389,14 @@ int edb_postings_write(FILE* out, EdbPostingBuilder* builder, uint32_t universe_
     EdbDiskIndex* index = (EdbDiskIndex*)calloc(n, sizeof(EdbDiskIndex));
     if (!index) return EDB_ERR_MEMORY;
 
+    size_t buf_cap = 256 * 1024;
+    uint8_t* enc_buf = (uint8_t*)malloc(buf_cap);
+    uint8_t* range_buf = (uint8_t*)malloc(buf_cap);
+    if (!enc_buf || !range_buf) {
+        free(enc_buf); free(range_buf); free(index);
+        return EDB_ERR_MEMORY;
+    }
+
     uint64_t postings_start = (uint64_t)ftell(out);
     uint64_t offset = 0;
 
@@ -399,41 +411,50 @@ int edb_postings_write(FILE* out, EdbPostingBuilder* builder, uint32_t universe_
         }
 
         /* 选择编码 */
-        uint8_t enc_buf[256 * 1024];
         uint32_t enc_size = 0;
         uint32_t container_type = EDB_POSTING_ARRAY;
+        uint32_t raw_size = 0;
+        uint8_t* final_buf = NULL;
+        int compressed = 0;
 
         /* 尝试 array 编码 */
         if (e->fill_mode == 1) {
-            /* bitset */
+            /* bitset: 直接使用 id_block 中的 bitset 数据 */
             container_type = EDB_POSTING_BITSET;
             enc_size = e->fill_bytes;
-            if (enc_size <= sizeof(enc_buf)) {
-                memcpy(enc_buf, e->ids, enc_size);
-            }
+            final_buf = (uint8_t*)e->ids;
+            raw_size = enc_size;
         } else {
+            /* 确保缓冲区足够大：array 最多 count*5 字节，range 最多 count*8 字节 */
+            size_t needed = (size_t)count * 8 + 64;
+            if (needed > buf_cap) {
+                uint8_t* tmp = (uint8_t*)realloc(enc_buf, needed);
+                if (!tmp) { free(index); free(enc_buf); free(range_buf); return EDB_ERR_MEMORY; }
+                enc_buf = tmp;
+                tmp = (uint8_t*)realloc(range_buf, needed);
+                if (!tmp) { free(index); free(enc_buf); free(range_buf); return EDB_ERR_MEMORY; }
+                range_buf = tmp;
+                buf_cap = needed;
+            }
             enc_size = edb_encode_array(e->ids, count, enc_buf);
             container_type = EDB_POSTING_ARRAY;
 
             /* 尝试 range 编码 */
-            uint8_t range_buf[256 * 1024];
             uint32_t range_size = edb_encode_range(e->ids, count, range_buf);
             if (range_size < enc_size && range_size <= count * 4u / 2u) {
                 memcpy(enc_buf, range_buf, range_size);
                 enc_size = range_size;
                 container_type = EDB_POSTING_RANGE;
             }
+            final_buf = enc_buf;
+            raw_size = enc_size;
         }
 
         /* 尝试 zlib 压缩 */
-        uint32_t raw_size = enc_size;
-        uint8_t* final_buf = enc_buf;
-        int compressed = 0;
-
         if (raw_size >= EDB_COMPRESS_MIN_SIZE) {
             uint8_t* comp_buf = NULL;
             uint32_t comp_size = 0;
-            int rc = edb_format_compress(enc_buf, raw_size, &comp_buf, &comp_size);
+            int rc = edb_format_compress(final_buf, raw_size, &comp_buf, &comp_size);
             if (rc == 0 && comp_buf) {
                 final_buf = comp_buf;
                 enc_size = comp_size;
@@ -444,7 +465,7 @@ int edb_postings_write(FILE* out, EdbPostingBuilder* builder, uint32_t universe_
         /* 写入 */
         if (fwrite(final_buf, 1, enc_size, out) != enc_size) {
             if (compressed) free(final_buf);
-            free(index);
+            free(index); free(enc_buf); free(range_buf);
             return EDB_ERR_IO;
         }
 
@@ -459,6 +480,8 @@ int edb_postings_write(FILE* out, EdbPostingBuilder* builder, uint32_t universe_
         if (compressed) free(final_buf);
     }
 
+    free(enc_buf);
+    free(range_buf);
     *out_index = index;
     *out_index_count = n;
     *out_written = offset;

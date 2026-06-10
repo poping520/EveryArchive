@@ -187,15 +187,29 @@ static int edb_write_section_data(FILE* fp, const uint8_t* data, uint32_t len,
 int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_count,
                              EdbEntryStream* entry_stream, uint32_t entry_count,
                              const char* output_path, const EdbBuildOptions* options) {
-    (void)options;
     int rc;
 
     /* 创建临时文件 */
-    size_t pathlen = strlen(output_path);
-    char* tmp_path = (char*)malloc(pathlen + 8);
-    if (!tmp_path) return EDB_ERR_MEMORY;
-    memcpy(tmp_path, output_path, pathlen);
-    memcpy(tmp_path + pathlen, ".tmp", 5);
+    char* tmp_path = NULL;
+    if (options && options->temp_dir && options->temp_dir[0]) {
+        const char* sep = strrchr(output_path, '/');
+        if (!sep) sep = strrchr(output_path, '\\');
+        const char* base = sep ? sep + 1 : output_path;
+        size_t dlen = strlen(options->temp_dir);
+        size_t blen = strlen(base);
+        tmp_path = (char*)malloc(dlen + 1 + blen + 8);
+        if (!tmp_path) return EDB_ERR_MEMORY;
+        memcpy(tmp_path, options->temp_dir, dlen);
+        tmp_path[dlen] = '/';
+        memcpy(tmp_path + dlen + 1, base, blen);
+        memcpy(tmp_path + dlen + 1 + blen, ".tmp", 5);
+    } else {
+        size_t pathlen = strlen(output_path);
+        tmp_path = (char*)malloc(pathlen + 8);
+        if (!tmp_path) return EDB_ERR_MEMORY;
+        memcpy(tmp_path, output_path, pathlen);
+        memcpy(tmp_path + pathlen, ".tmp", 5);
+    }
 
     FILE* fp = fopen(tmp_path, "wb");
     if (!fp) { free(tmp_path); return EDB_ERR_IO; }
@@ -246,6 +260,7 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
     if (rc != EDB_OK) goto fail;
     rc = edb_paged_writer_init(&path_w, fp, EDB_PATH_PAGE_SIZE);
     if (rc != EDB_OK) { edb_paged_writer_free(&detail_w); goto fail; }
+    rc = edb_paged_writer_init(&raw_w, fp, EDB_RAW_PAGE_SIZE);
     if (rc != EDB_OK) { edb_paged_writer_free(&detail_w); edb_paged_writer_free(&path_w); goto fail; }
 
     /* 记录每个 entry 的 core 和位置信息 */
@@ -293,7 +308,7 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
             if (rec.entry_raw_path && rec.entry_raw_path_len > 0) {
                 det.raw_offset = raw_offset;
                 det.raw_len = rec.entry_raw_path_len;
-                edb_paged_writer_append(&path_w, rec.entry_raw_path, rec.entry_raw_path_len);
+                edb_paged_writer_append(&raw_w, rec.entry_raw_path, rec.entry_raw_path_len);
                 raw_offset += rec.entry_raw_path_len;
             } else {
                 det.raw_offset = UINT32_MAX;
@@ -308,6 +323,7 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
     /* flush 所有分页写入器 */
     edb_paged_writer_flush(&detail_w);
     edb_paged_writer_flush(&path_w);
+    edb_paged_writer_flush(&raw_w);
 
     /* 回写 entry cores */
     uint64_t detail_start = (uint64_t)ftell(fp);
@@ -357,6 +373,7 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
     free(cores);
     edb_paged_writer_free(&detail_w);
     edb_paged_writer_free(&path_w);
+    edb_paged_writer_free(&raw_w);
 
     /* RAW_BLOBS section (暂时为空) */
     secs[5].offset = (uint64_t)ftell(fp);
@@ -417,6 +434,8 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
             if (rec.entry_path)
                 edb_postings_count_text_grams(&builder, rec.entry_path, eid + 1);
             eid++;
+            if (eid % 500000 == 0) {
+            }
         }
 
         rc = edb_postings_builder_prepare(&builder, entry_count);
@@ -429,6 +448,8 @@ int edb_build_snapshot_impl(const EdbArchiveRecord* archives, uint32_t archive_c
             if (rec.entry_path)
                 edb_postings_fill_text_grams(&builder, rec.entry_path, eid + 1);
             eid++;
+            if (eid % 500000 == 0) {
+            }
         }
 
         secs[8].offset = (uint64_t)ftell(fp);
