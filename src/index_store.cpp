@@ -8,10 +8,7 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
-#include <sqlite3.h>
-
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include <utility>
 #include <unordered_map>
@@ -32,16 +29,6 @@ bool FileExistsW(const std::wstring& path)
 {
     DWORD attr = GetFileAttributesW(path.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-std::wstring ReplaceExtension(const std::wstring& path, const wchar_t* ext)
-{
-    size_t slash = path.find_last_of(L"\\/");
-    size_t dot = path.find_last_of(L'.');
-    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) {
-        return path + ext;
-    }
-    return path.substr(0, dot) + ext;
 }
 
 bool MoveReplace(const std::wstring& from, const std::wstring& to, std::wstring* err)
@@ -65,218 +52,6 @@ bool BuildEmptyEzdb(const std::wstring& path, std::wstring* err)
         return false;
     }
     return MoveReplace(tmp, path, err);
-}
-
-std::string SqliteText(sqlite3_stmt* stmt, int col)
-{
-    const unsigned char* text = sqlite3_column_text(stmt, col);
-    return text ? reinterpret_cast<const char*>(text) : "";
-}
-
-struct SqliteEntryStreamContext {
-    sqlite3* db = nullptr;
-    sqlite3_stmt* stmt = nullptr;
-    const std::vector<uint32_t>* idMap = nullptr;
-    int maxArchiveId = 0;
-};
-
-int SqliteEntryStreamReset(void* userData);
-int SqliteEntryStreamNext(void* userData, EzdbEntryRecord* outRecord);
-
-bool ImportSQLiteToEzdb(const std::wstring& sqlitePath, const std::wstring& ezdbPath, std::wstring* err)
-{
-    sqlite3* sdb = nullptr;
-    int rc = sqlite3_open_v2(WideToUtf8(sqlitePath).c_str(), &sdb, SQLITE_OPEN_READONLY, nullptr);
-    if (rc != SQLITE_OK) {
-        SetErr(err, sdb ? Utf8ToWString(sqlite3_errmsg(sdb)) : L"sqlite open failed");
-        if (sdb) sqlite3_close(sdb);
-        return false;
-    }
-
-    sqlite3_stmt* stmt = nullptr;
-    uint32_t archiveCount = 0;
-    uint32_t entryCount = 0;
-    int maxArchiveId = 0;
-
-    rc = sqlite3_prepare_v2(sdb, "SELECT COUNT(*), COALESCE(MAX(id),0) FROM archives", -1, &stmt, nullptr);
-    if (rc != SQLITE_OK || sqlite3_step(stmt) != SQLITE_ROW) goto sqlite_fail;
-    archiveCount = static_cast<uint32_t>(sqlite3_column_int64(stmt, 0));
-    maxArchiveId = sqlite3_column_int(stmt, 1);
-    sqlite3_finalize(stmt);
-    stmt = nullptr;
-
-    rc = sqlite3_prepare_v2(sdb, "SELECT COUNT(*) FROM entries", -1, &stmt, nullptr);
-    if (rc != SQLITE_OK || sqlite3_step(stmt) != SQLITE_ROW) goto sqlite_fail;
-    entryCount = static_cast<uint32_t>(sqlite3_column_int64(stmt, 0));
-    sqlite3_finalize(stmt);
-    stmt = nullptr;
-
-    {
-        std::vector<std::string> archivePaths;
-        std::vector<EzdbArchiveRecord> archives;
-        std::vector<uint32_t> idMap(static_cast<size_t>(maxArchiveId > 0 ? maxArchiveId : 0) + 1u, UINT32_MAX);
-        archivePaths.reserve(archiveCount);
-        archives.reserve(archiveCount);
-
-        rc = sqlite3_prepare_v2(sdb,
-                                "SELECT id, drive_letter, file_ref_number, usn, file_path, file_size, modified_time "
-                                "FROM archives ORDER BY id",
-                                -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) goto sqlite_fail;
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            int sqliteId = sqlite3_column_int(stmt, 0);
-            if (sqliteId < 0 || sqliteId > maxArchiveId) goto sqlite_fail;
-            idMap[sqliteId] = static_cast<uint32_t>(archives.size());
-            archivePaths.push_back(SqliteText(stmt, 4));
-            const std::string drive = SqliteText(stmt, 1);
-            EzdbArchiveRecord record{};
-            record.drive_letter = drive.empty() ? 0 : drive[0];
-            record.file_ref_number = static_cast<uint64_t>(sqlite3_column_int64(stmt, 2));
-            record.usn = static_cast<int64_t>(sqlite3_column_int64(stmt, 3));
-            record.file_path = archivePaths.back().c_str();
-            record.file_size = static_cast<uint64_t>(sqlite3_column_int64(stmt, 5));
-            record.modified_time = static_cast<uint64_t>(sqlite3_column_int64(stmt, 6));
-            archives.push_back(record);
-        }
-        if (rc != SQLITE_DONE) goto sqlite_fail;
-        sqlite3_finalize(stmt);
-        stmt = nullptr;
-
-        std::vector<std::pair<std::string, std::string>> meta;
-
-        rc = sqlite3_prepare_v2(sdb, "SELECT key, value FROM configs ORDER BY key", -1, &stmt, nullptr);
-        if (rc == SQLITE_OK) {
-            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-                std::string key = SqliteText(stmt, 0);
-                if (key.rfind("journal_id_", 0) != 0 && key.rfind("next_usn_", 0) != 0) {
-                    key = "config_" + key;
-                }
-                meta.emplace_back(std::move(key), SqliteText(stmt, 1));
-            }
-            if (rc != SQLITE_DONE) goto sqlite_fail;
-            sqlite3_finalize(stmt);
-            stmt = nullptr;
-        } else {
-            sqlite3_finalize(stmt);
-            stmt = nullptr;
-        }
-
-        const std::wstring tmp = ezdbPath + L".tmp";
-        const std::wstring metaTmp = ezdbPath + L".tmp.meta";
-        DeleteFileW(tmp.c_str());
-        DeleteFileW(metaTmp.c_str());
-        SqliteEntryStreamContext streamCtx;
-        streamCtx.db = sdb;
-        streamCtx.idMap = &idMap;
-        streamCtx.maxArchiveId = maxArchiveId;
-        EzdbEntryStream stream{};
-        stream.user_data = &streamCtx;
-        stream.reset = SqliteEntryStreamReset;
-        stream.next = SqliteEntryStreamNext;
-        int ezrc = ezdb_build_snapshot_stream_entries(archives.data(), static_cast<uint32_t>(archives.size()),
-                                                      &stream, entryCount, WideToUtf8(tmp).c_str());
-        if (streamCtx.stmt) {
-            sqlite3_finalize(streamCtx.stmt);
-            streamCtx.stmt = nullptr;
-        }
-        if (ezrc != 0) {
-            SetErr(err, Utf8ToWString(ezdb_error_message(ezrc)));
-            DeleteFileW(tmp.c_str());
-            sqlite3_close(sdb);
-            sdb = nullptr;
-            return false;
-        }
-        sqlite3_close(sdb);
-        sdb = nullptr;
-        Ezdb* validate = nullptr;
-        ezrc = ezdb_open(WideToUtf8(tmp).c_str(), &validate);
-        if (ezrc != 0) {
-            SetErr(err, Utf8ToWString(ezdb_error_message(ezrc)));
-            DeleteFileW(tmp.c_str());
-            return false;
-        }
-        const bool countOk = ezdb_count(validate) == archives.size() &&
-                             ezdb_entry_count(validate) == entryCount;
-        ezdb_close(validate);
-        if (!countOk) {
-            SetErr(err, L"sqlite import validation count mismatch");
-            DeleteFileW(tmp.c_str());
-            return false;
-        }
-        if (!meta.empty()) {
-            FILE* metaFile = _wfopen(metaTmp.c_str(), L"wb");
-            if (!metaFile) {
-                SetErr(err, LastErrorText(L"fopen meta"));
-                DeleteFileW(tmp.c_str());
-                return false;
-            }
-            for (const auto& kv : meta) {
-                fprintf(metaFile, "%s\t%s\n", kv.first.c_str(), kv.second.c_str());
-            }
-            if (fclose(metaFile) != 0) {
-                SetErr(err, L"close meta failed");
-                DeleteFileW(tmp.c_str());
-                DeleteFileW(metaTmp.c_str());
-                return false;
-            }
-        }
-        if (!MoveReplace(tmp, ezdbPath, err)) {
-            DeleteFileW(metaTmp.c_str());
-            return false;
-        }
-        if (!meta.empty() && !MoveReplace(metaTmp, ezdbPath + L".meta", err)) return false;
-        return true;
-    }
-
-sqlite_fail:
-    SetErr(err, sdb ? Utf8ToWString(sqlite3_errmsg(sdb)) : L"sqlite import failed");
-    if (stmt) sqlite3_finalize(stmt);
-    if (sdb) sqlite3_close(sdb);
-    return false;
-}
-
-int SqliteEntryStreamReset(void* userData)
-{
-    auto* ctx = static_cast<SqliteEntryStreamContext*>(userData);
-    if (!ctx || !ctx->db) return -1;
-    if (ctx->stmt) {
-        sqlite3_finalize(ctx->stmt);
-        ctx->stmt = nullptr;
-    }
-    static const char kSql[] =
-        "SELECT archive_id, entry_path, entry_raw_path, compressed_size, original_size, modified_time "
-        "FROM entries ORDER BY id";
-    return sqlite3_prepare_v2(ctx->db, kSql, -1, &ctx->stmt, nullptr) == SQLITE_OK ? 0 : -1;
-}
-
-int SqliteEntryStreamNext(void* userData, EzdbEntryRecord* outRecord)
-{
-    auto* ctx = static_cast<SqliteEntryStreamContext*>(userData);
-    if (!ctx || !ctx->stmt || !ctx->idMap || !outRecord) return -1;
-    const int rc = sqlite3_step(ctx->stmt);
-    if (rc != SQLITE_ROW) return -1;
-
-    const int sqliteArchiveId = sqlite3_column_int(ctx->stmt, 0);
-    const unsigned char* entryPath = sqlite3_column_text(ctx->stmt, 1);
-    if (sqliteArchiveId < 0 || sqliteArchiveId > ctx->maxArchiveId ||
-        static_cast<size_t>(sqliteArchiveId) >= ctx->idMap->size() ||
-        (*ctx->idMap)[sqliteArchiveId] == UINT32_MAX || !entryPath) {
-        return -1;
-    }
-
-    *outRecord = {};
-    outRecord->archive_id = (*ctx->idMap)[sqliteArchiveId];
-    outRecord->entry_path = reinterpret_cast<const char*>(entryPath);
-    const void* raw = sqlite3_column_blob(ctx->stmt, 2);
-    const int rawLen = sqlite3_column_bytes(ctx->stmt, 2);
-    if (raw && rawLen > 0) {
-        outRecord->entry_raw_path = raw;
-        outRecord->entry_raw_path_len = static_cast<uint32_t>(rawLen);
-    }
-    outRecord->compressed_size = static_cast<int64_t>(sqlite3_column_int64(ctx->stmt, 3));
-    outRecord->original_size = static_cast<uint64_t>(sqlite3_column_int64(ctx->stmt, 4));
-    outRecord->modified_time = static_cast<uint64_t>(sqlite3_column_int64(ctx->stmt, 5));
-    return 0;
 }
 
 ArchiveFile_t ArchiveFromEzdb(const EzdbArchiveResult& result)
@@ -534,24 +309,9 @@ public:
 
     bool OpenOrCreate(const std::wstring& path, std::wstring* err) override
     {
-        if (!FileExistsW(path)) {
-            const std::wstring sqlitePath = ReplaceExtension(path, L".db");
-            if (FileExistsW(sqlitePath)) {
-                if (!ImportSQLiteToEzdb(sqlitePath, path, err)) return false;
-            } else if (!BuildEmptyEzdb(path, err)) {
-                return false;
-            }
-        }
         if (Open(path, err)) return true;
-
-        const std::wstring sqlitePath = ReplaceExtension(path, L".db");
-        if (FileExistsW(sqlitePath) && ImportSQLiteToEzdb(sqlitePath, path, err)) {
-            return Open(path, err);
-        }
-        if (BuildEmptyEzdb(path, err)) {
-            return Open(path, err);
-        }
-        return false;
+        if (!BuildEmptyEzdb(path, err)) return false;
+        return Open(path, err);
     }
 
     void Close() override
@@ -1091,5 +851,5 @@ std::unique_ptr<IndexStore> CreateEzdbIndexStore()
 
 std::unique_ptr<IndexStore> CreateIndexStore()
 {
-    return CreateSQLiteIndexStore();
+    return CreateEzdbIndexStore();
 }
