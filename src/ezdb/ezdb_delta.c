@@ -13,6 +13,120 @@
 
 /* --- Bulk write mode helpers --- */
 
+/* --- Memory-backed entry stream with range support (for parallel index build) --- */
+
+typedef struct MemoryStreamCtx {
+    const EzdbEntryRecord* entries;
+    uint32_t entry_count;
+    uint32_t pos;
+    uint32_t range_end;
+    const uint32_t* archive_bases;
+    const uint32_t* archive_counts;
+    uint32_t archive_count;
+} MemoryStreamCtx;
+
+typedef struct MemoryRangeCtx {
+    const EzdbEntryRecord* entries;
+    uint32_t start;
+    uint32_t end;
+    uint32_t pos;
+} MemoryRangeCtx;
+
+static int mem_stream_next(void* user_data, EzdbEntryRecord* out)
+{
+    MemoryStreamCtx* c = (MemoryStreamCtx*)user_data;
+    if (c->pos >= c->range_end) return EZDB_ERR_NOT_FOUND;
+    *out = c->entries[c->pos++];
+    return EZDB_OK;
+}
+
+static int mem_stream_reset(void* user_data)
+{
+    MemoryStreamCtx* c = (MemoryStreamCtx*)user_data;
+    c->pos = 0;
+    c->range_end = c->entry_count;
+    return EZDB_OK;
+}
+
+static int mem_stream_reset_range(void* user_data, uint32_t archive_begin, uint32_t archive_end)
+{
+    MemoryStreamCtx* c = (MemoryStreamCtx*)user_data;
+    if (archive_begin >= c->archive_count || archive_end <= archive_begin) {
+        c->pos = c->entry_count;
+        c->range_end = c->entry_count;
+        return EZDB_OK;
+    }
+    uint32_t real_end = (archive_end <= c->archive_count) ? archive_end : c->archive_count;
+    c->pos = c->archive_bases[archive_begin];
+    c->range_end = c->archive_bases[real_end - 1u] + c->archive_counts[real_end - 1u];
+    return EZDB_OK;
+}
+
+static int range_stream_next(void* user_data, EzdbEntryRecord* out)
+{
+    MemoryRangeCtx* c = (MemoryRangeCtx*)user_data;
+    if (c->pos >= c->end) return EZDB_ERR_NOT_FOUND;
+    *out = c->entries[c->pos++];
+    return EZDB_OK;
+}
+
+static int range_stream_reset(void* user_data)
+{
+    MemoryRangeCtx* c = (MemoryRangeCtx*)user_data;
+    c->pos = c->start;
+    return EZDB_OK;
+}
+
+static int mem_stream_open_range(void* user_data, uint32_t archive_begin, uint32_t archive_end, EzdbEntryStream* out)
+{
+    MemoryStreamCtx* c = (MemoryStreamCtx*)user_data;
+    if (!out) return EZDB_ERR_ARG;
+    MemoryRangeCtx* rc = (MemoryRangeCtx*)calloc(1, sizeof(*rc));
+    if (!rc) return EZDB_ERR_MEMORY;
+    rc->entries = c->entries;
+    if (archive_begin >= c->archive_count || archive_end <= archive_begin) {
+        rc->start = 0;
+        rc->end = 0;
+        rc->pos = 0;
+    } else {
+        uint32_t real_end = (archive_end <= c->archive_count) ? archive_end : c->archive_count;
+        rc->start = c->archive_bases[archive_begin];
+        rc->end = c->archive_bases[real_end - 1u] + c->archive_counts[real_end - 1u];
+        rc->pos = rc->start;
+    }
+    memset(out, 0, sizeof(*out));
+    out->user_data = rc;
+    out->reset = range_stream_reset;
+    out->next = range_stream_next;
+    return EZDB_OK;
+}
+
+static void mem_stream_close_range(EzdbEntryStream* stream)
+{
+    if (stream && stream->user_data) {
+        free(stream->user_data);
+        stream->user_data = NULL;
+    }
+}
+
+static int cmp_entry_by_archive_id(const void* a, const void* b)
+{
+    uint32_t id_a = ((const EzdbEntryRecord*)a)->archive_id;
+    uint32_t id_b = ((const EzdbEntryRecord*)b)->archive_id;
+    return (id_a > id_b) - (id_a < id_b);
+}
+
+static void bulk_free_entries(EzdbEntryRecord* be, char** bep, void** berp, uint32_t ec)
+{
+    for (uint32_t i = 0; i < ec; ++i) {
+        if (bep && bep[i]) free(bep[i]);
+        if (berp && berp[i]) free(berp[i]);
+    }
+    free(be);
+    free(bep);
+    free(berp);
+}
+
 static void ezdb_bulk_free(Ezdb* db)
 {
     if (!db) return;
@@ -752,14 +866,66 @@ int ezdb_commit_write(Ezdb* db)
             }
         }
 
-        /* Build to temp file */
+        /* Sort entries by archive_id (required for parallel index build) */
+        if (ec > 1 && bc > 0) {
+            qsort(be, ec, sizeof(EzdbEntryRecord), cmp_entry_by_archive_id);
+        }
+
+        /* Build per-archive entry bases/counts for range-based stream access */
+        uint32_t* archive_bases = NULL;
+        uint32_t* archive_counts = NULL;
+        if (ec > 0 && bc > 0) {
+            archive_bases = (uint32_t*)calloc(bc, sizeof(uint32_t));
+            archive_counts = (uint32_t*)calloc(bc, sizeof(uint32_t));
+            if (!archive_bases || !archive_counts) { free(archive_bases); free(archive_counts); rc = EZDB_ERR_MEMORY; goto bulk_cleanup; }
+            for (uint32_t i = 0; i < ec; ) {
+                uint32_t aid = be[i].archive_id;
+                uint32_t start = i;
+                while (i < ec && be[i].archive_id == aid) ++i;
+                if (aid < bc) {
+                    archive_bases[aid] = start;
+                    archive_counts[aid] = i - start;
+                }
+            }
+        }
+
+        /* Build to temp file via stream with parallel index threads */
         size_t db_path_len = strlen(db->path);
         char* tmp_path = (char*)malloc(db_path_len + 11u);
-        if (!tmp_path) { rc = EZDB_ERR_MEMORY; goto bulk_cleanup; }
+        if (!tmp_path) { free(archive_bases); free(archive_counts); rc = EZDB_ERR_MEMORY; goto bulk_cleanup; }
         sprintf(tmp_path, "%s.bulk.tmp", db->path);
         remove(tmp_path);
 
-        rc = ezdb_build_snapshot(ba, bc, be, ec, tmp_path);
+        if (ec > 0 && archive_bases && archive_counts) {
+            MemoryStreamCtx mctx;
+            mctx.entries = be;
+            mctx.entry_count = ec;
+            mctx.pos = 0;
+            mctx.range_end = ec;
+            mctx.archive_bases = archive_bases;
+            mctx.archive_counts = archive_counts;
+            mctx.archive_count = bc;
+
+            EzdbEntryStream ez_stream;
+            memset(&ez_stream, 0, sizeof(ez_stream));
+            ez_stream.user_data = &mctx;
+            ez_stream.reset = mem_stream_reset;
+            ez_stream.reset_range = mem_stream_reset_range;
+            ez_stream.next = mem_stream_next;
+            ez_stream.open_range = mem_stream_open_range;
+            ez_stream.close_range = mem_stream_close_range;
+
+            EzdbBuildOptions opts;
+            memset(&opts, 0, sizeof(opts));
+            opts.flags = EZDB_BUILD_DEFAULT_FLAGS;
+            opts.index_threads = (bc > 1 && ec > 100000) ? 6u : 1u;
+            rc = ezdb_build_snapshot_stream_entries_ex(ba, bc, &ez_stream, ec, tmp_path, &opts);
+        } else {
+            rc = ezdb_build_snapshot(ba, bc, NULL, 0, tmp_path);
+        }
+
+        free(archive_bases);
+        free(archive_counts);
 
         /* Swap: close old, rename temp, reopen into same struct */
         if (rc == EZDB_OK) {
@@ -791,11 +957,7 @@ int ezdb_commit_write(Ezdb* db)
     bulk_cleanup:
         for (uint32_t i = 0; i < bc; ++i) { if (bap && bap[i]) free(bap[i]); }
         free(ba); free(bap); free(baim);
-        for (uint32_t i = 0; i < ec; ++i) {
-            if (bep && bep[i]) free(bep[i]);
-            if (berp && berp[i]) free(berp[i]);
-        }
-        free(be); free(bep); free(berp);
+        bulk_free_entries(be, bep, berp, ec);
         return rc;
     }
 
