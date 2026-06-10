@@ -11,15 +11,18 @@ typedef struct Ezdb Ezdb;
 
 /* ===== 压缩包记录 ===== */
 
-/* 表示一个压缩包文件（如 .zip / .7z），包含 NTFS 文件系统级别的标识信息 */
-typedef struct EzdbArchiveRecord {
+/* 表示一个磁盘上的普通文件，包含 NTFS 文件系统级别的标识信息 */
+typedef struct EzdbFileRecord {
     char drive_letter;          /* 所在驱动器盘符（如 'C'） */
     uint64_t file_ref_number;   /* NTFS 文件引用编号，用于唯一标识文件 */
     int64_t usn;                /* NTFS USN（Update Sequence Number）日志序号 */
     const char* file_path;      /* 压缩包完整路径 */
     uint64_t file_size;         /* 压缩包文件大小 */
     uint64_t modified_time;     /* 压缩包最后修改时间 */
-} EzdbArchiveRecord;
+} EzdbFileRecord;
+
+// 表示一个压缩包文件（如 .zip / .7z / .rar）
+typedef EzdbFileRecord EzdbArchiveRecord;
 
 /* ===== 压缩包内部条目记录 ===== */
 

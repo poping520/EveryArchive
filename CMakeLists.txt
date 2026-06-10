@@ -46,6 +46,29 @@ if(MSVC)
     target_compile_options(ezdb PRIVATE /utf-8)
 endif()
 
+add_library(edb STATIC
+        src/edb/edb.c
+        src/edb/edb_build.c
+        src/edb/edb_format.c
+        src/edb/edb_postings.c
+        src/edb/edb_search.c
+        src/edb/edb_util.c
+)
+
+target_include_directories(edb PUBLIC
+        src/edb
+)
+
+target_include_directories(edb PRIVATE
+        external/zlib
+)
+
+target_link_libraries(edb PUBLIC zlibstatic)
+
+if(MSVC)
+    target_compile_options(edb PRIVATE /utf-8)
+endif()
+
 add_executable(EveryZip WIN32
         src/resource.h
         src/strings.rc

@@ -10,6 +10,18 @@ if(MSVC)
     target_compile_options(EzdbBench PRIVATE /utf-8)
 endif()
 
+add_executable(EdbBench
+        edb_bench.c
+        zip_cd_scanner.c
+        zip_cd_scanner.h
+)
+
+target_link_libraries(EdbBench PRIVATE edb minizip psapi)
+
+if(MSVC)
+    target_compile_options(EdbBench PRIVATE /utf-8)
+endif()
+
 add_executable(ListAllFiles
         list_all_files.c
 )
